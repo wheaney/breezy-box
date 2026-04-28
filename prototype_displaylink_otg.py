@@ -135,6 +135,14 @@ def parse_args() -> argparse.Namespace:
         help="Decode and log status without opening the 3D viewport.",
     )
     parser.add_argument(
+        "--allow-root-viewport",
+        action="store_true",
+        help=(
+            "Allow viewport creation while running as root. This is disabled by default because "
+            "KDE Plasma, especially on Wayland, commonly blocks root GUI OpenGL contexts."
+        ),
+    )
+    parser.add_argument(
         "--setup-only",
         action="store_true",
         help="Only configure the gadget and exit.",
@@ -172,22 +180,33 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--product-id",
-        default=None,
-        help="Optional USB product ID. A fallback is used if configfs needs one.",
+        default="0x0104",
+        help="USB product ID to write into idProduct.",
+    )
+    parser.add_argument(
+        "--max-power",
+        type=int,
+        default=250,
+        help="MaxPower value for the gadget configuration, in mA.",
+    )
+    parser.add_argument(
+        "--configuration-label",
+        default="DisplayLink",
+        help="Configuration string written under configs/c.1/strings/0x409/configuration.",
     )
     parser.add_argument(
         "--manufacturer",
-        default="Breezy Box",
+        default="DisplayLink",
         help="Optional manufacturer string descriptor.",
     )
     parser.add_argument(
         "--product",
-        default="DisplayLink OTG Prototype",
+        default="DisplayLink Adapter",
         help="Optional product string descriptor.",
     )
     parser.add_argument(
         "--serial-number",
-        default="breezy-box-prototype",
+        default="DEADBEEF0001",
         help="Optional serial number string descriptor.",
     )
     parser.add_argument(
@@ -277,10 +296,9 @@ class GadgetConfig:
 
 def setup_displaylink_acm_gadget(config: GadgetConfig) -> None:
     require_root()
+    load_kernel_module("libcomposite")
     if not config.root.exists():
         raise GadgetError(f"Configfs gadget root does not exist: {config.root}")
-
-    load_kernel_module("libcomposite")
 
     config.gadget_dir.mkdir(exist_ok=True)
     write_text_file(config.gadget_dir / "idVendor", config.vendor_id)
@@ -309,7 +327,11 @@ def setup_displaylink_acm_gadget(config: GadgetConfig) -> None:
     write_text_file(config.gadget_strings_dir / "product", config.product)
     write_text_file(config.gadget_strings_dir / "serialnumber", config.serial_number)
 
-    link_target = os.path.relpath(config.function_dir, config.config_dir)
+    # Configfs resolves the symlink target path when the link is created.
+    # The shell recipe worked because it was run from inside the gadget
+    # directory first; this script may run from anywhere, so use the absolute
+    # configfs path for the function item.
+    link_target = str(config.function_dir)
     ensure_symlink(config.function_link, link_target)
 
     current_udc = read_text_file(config.gadget_dir / "UDC") if (config.gadget_dir / "UDC").exists() else ""
@@ -686,12 +708,12 @@ def make_iterator_factory(args: argparse.Namespace) -> Optional[Callable[[thread
 
 
 VERTEX_SHADER_SOURCE = """
-#version 330 core
+#version 120
 
-in vec3 position;
-in vec2 texcoord;
+attribute vec3 position;
+attribute vec2 texcoord;
 
-out vec2 uv;
+varying vec2 uv;
 
 uniform mat4 projection;
 uniform mat4 view;
@@ -705,210 +727,405 @@ void main() {
 
 
 FRAGMENT_SHADER_SOURCE = """
-#version 330 core
+#version 120
 
-in vec2 uv;
-out vec4 frag_color;
+varying vec2 uv;
 
 uniform sampler2D frame_texture;
 uniform float blank_factor;
 
 void main() {
-    vec3 color = texture(frame_texture, uv).rgb;
-    frag_color = vec4(color * blank_factor, 1.0);
+    vec3 color = texture2D(frame_texture, uv).rgb;
+    gl_FragColor = vec4(color * blank_factor, 1.0);
 }
 """
 
 
 def run_viewport(state: DisplayLinkState, stop_event: threading.Event, args: argparse.Namespace) -> None:
+    display_name = os.environ.get("DISPLAY")
+    wayland_display = os.environ.get("WAYLAND_DISPLAY")
+    xauthority = os.environ.get("XAUTHORITY")
+
+    if os.geteuid() == 0 and not args.allow_root_viewport:
+        raise RuntimeError(
+            "Viewport rendering is running as root. KDE Plasma sessions, especially Wayland sessions, "
+            "commonly reject root OpenGL windows and fail to create a usable GL context. "
+            "Run the gadget setup as root first, then run the viewer as your logged-in desktop user. "
+            "Recommended split: 'sudo python3 prototype_displaylink_otg.py --setup-only' and then "
+            "'python3 prototype_displaylink_otg.py --no-gadget-setup'. If you intentionally want to try a root viewport, "
+            "pass --allow-root-viewport and preserve your display environment. "
+            f"Current environment: DISPLAY={display_name!r}, WAYLAND_DISPLAY={wayland_display!r}, XAUTHORITY={xauthority!r}."
+        )
+
+    if not display_name and not wayland_display:
+        raise RuntimeError(
+            "No desktop display session is visible to this process. A viewport requires either DISPLAY or WAYLAND_DISPLAY. "
+            f"Current environment: DISPLAY={display_name!r}, WAYLAND_DISPLAY={wayland_display!r}, XAUTHORITY={xauthority!r}."
+        )
+
     try:
-        import pyglet
-        from pyglet.gl import (
+        import pygame
+        from pygame.locals import DOUBLEBUF, OPENGL, QUIT
+
+        from OpenGL.GL import (
+            GL_ARRAY_BUFFER,
+            GL_COLOR_BUFFER_BIT,
+            GL_COMPILE_STATUS,
+            GL_DEPTH_BUFFER_BIT,
+            GL_DEPTH_TEST,
+            GL_ELEMENT_ARRAY_BUFFER,
+            GL_FALSE,
+            GL_FLOAT,
+            GL_FRAGMENT_SHADER,
             GL_LINEAR,
+            GL_LINK_STATUS,
             GL_RGB,
+            GL_STATIC_DRAW,
             GL_TEXTURE0,
             GL_TEXTURE_2D,
             GL_TEXTURE_MAG_FILTER,
             GL_TEXTURE_MIN_FILTER,
             GL_TRIANGLES,
+            GL_TRUE,
+            GL_UNPACK_ALIGNMENT,
+            GL_UNSIGNED_INT,
             GL_UNSIGNED_SHORT_5_6_5,
-            GLuint,
+            GL_VERTEX_SHADER,
             glActiveTexture,
+            glAttachShader,
+            glBindAttribLocation,
+            glBindBuffer,
             glBindTexture,
+            glBufferData,
+            glClear,
             glClearColor,
+            glCompileShader,
+            glCreateProgram,
+            glCreateShader,
+            glDeleteShader,
+            glDisableVertexAttribArray,
+            glDrawElements,
             glEnable,
+            glEnableVertexAttribArray,
+            glGenBuffers,
             glGenTextures,
+            glGetAttribLocation,
+            glGetProgramInfoLog,
+            glGetProgramiv,
+            glGetShaderInfoLog,
+            glGetShaderiv,
+            glGetString,
+            glGetUniformLocation,
+            glLinkProgram,
             glPixelStorei,
+            glShaderSource,
             glTexImage2D,
             glTexParameteri,
             glTexSubImage2D,
+            glUniform1f,
+            glUniform1i,
+            glUniformMatrix4fv,
+            glUseProgram,
+            glVertexAttribPointer,
+            glViewport,
+            GL_VERSION,
+            GL_SHADING_LANGUAGE_VERSION,
         )
-        from pyglet.graphics.shader import Shader, ShaderProgram
-        from pyglet.math import Mat4, Vec3
     except ModuleNotFoundError as exc:  # pragma: no cover - depends on local environment
         raise RuntimeError(
-            "pyglet is required for viewport rendering. Install it with 'pip install pyglet'."
+            "Viewport import failed while using interpreter "
+            f"{sys.executable}. Missing module: {exc.name!r}. "
+            "Install both pygame and PyOpenGL into the same interpreter environment."
+        ) from exc
+    except ImportError as exc:  # pragma: no cover - depends on local environment
+        raise RuntimeError(
+            "Viewport import failed even though pygame/PyOpenGL were found, while using interpreter "
+            f"{sys.executable}: {exc}. This usually means an SDL or OpenGL runtime dependency is missing."
         ) from exc
 
-    pyglet.options["shadow_window"] = False
+    def perspective_matrix(fov_degrees: float, aspect: float, z_near: float, z_far: float) -> tuple[float, ...]:
+        f = 1.0 / math.tan(math.radians(fov_degrees) / 2.0)
+        return (
+            f / aspect,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            f,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            (z_far + z_near) / (z_near - z_far),
+            -1.0,
+            0.0,
+            0.0,
+            (2.0 * z_far * z_near) / (z_near - z_far),
+            0.0,
+        )
 
-    class DisplayViewportWindow(pyglet.window.Window):
-        def __init__(self) -> None:
-            super().__init__(
-                width=args.window_width,
-                height=args.window_height,
-                caption="Breezy Box DisplayLink Prototype",
-                resizable=True,
-                vsync=True,
-            )
-            glClearColor(0.06, 0.08, 0.11, 1.0)
-            glEnable(pyglet.gl.GL_DEPTH_TEST)
-
-            self.program = ShaderProgram(
-                Shader(VERTEX_SHADER_SOURCE, "vertex"),
-                Shader(FRAGMENT_SHADER_SOURCE, "fragment"),
-            )
-
-            self.vertex_list = self.program.vertex_list_indexed(
-                4,
-                GL_TRIANGLES,
-                [0, 1, 2, 0, 2, 3],
-                position=(
-                    "f",
-                    [
-                        -1.0,
-                        -0.5625,
-                        0.0,
-                        1.0,
-                        -0.5625,
-                        0.0,
-                        1.0,
-                        0.5625,
-                        0.0,
-                        -1.0,
-                        0.5625,
-                        0.0,
-                    ],
-                ),
-                texcoord=("f", [0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0]),
-            )
-
-            self.texture_id = GLuint()
-            glGenTextures(1, ctypes.byref(self.texture_id))
-            glBindTexture(GL_TEXTURE_2D, self.texture_id)
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
-            glPixelStorei(pyglet.gl.GL_UNPACK_ALIGNMENT, 1)
-
-            width, height, pixels, version = state.framebuffer.snapshot()
-            self.texture_size = (0, 0)
-            self.frame_version = -1
-            self.status_label = pyglet.text.Label(
-                "",
-                x=12,
-                y=self.height - 12,
-                anchor_x="left",
-                anchor_y="top",
-                multiline=True,
-                width=max(200, self.width - 24),
-            )
-            self.projection = Mat4.perspective_projection(
-                aspect=self.width / self.height,
-                z_near=0.1,
-                z_far=100.0,
-                fov=60.0,
-            )
-            self.view = Mat4.from_translation(Vec3(0.0, 0.0, -3.0))
-            self._upload_texture(width, height, pixels)
-            self.frame_version = version
-
-        def _upload_texture(self, width: int, height: int, pixel_bytes: bytes) -> None:
-            glActiveTexture(GL_TEXTURE0)
-            glBindTexture(GL_TEXTURE_2D, self.texture_id)
-            buffer_view = (ctypes.c_ubyte * len(pixel_bytes)).from_buffer_copy(pixel_bytes)
-            if self.texture_size != (width, height):
-                glTexImage2D(
-                    GL_TEXTURE_2D,
-                    0,
-                    GL_RGB,
-                    width,
-                    height,
-                    0,
-                    GL_RGB,
-                    GL_UNSIGNED_SHORT_5_6_5,
-                    buffer_view,
+    def multiply_mat4(left: tuple[float, ...], right: tuple[float, ...]) -> tuple[float, ...]:
+        result = [0.0] * 16
+        for row in range(4):
+            for col in range(4):
+                result[row * 4 + col] = sum(
+                    left[row * 4 + idx] * right[idx * 4 + col] for idx in range(4)
                 )
-                self.texture_size = (width, height)
-            else:
-                glTexSubImage2D(
-                    GL_TEXTURE_2D,
-                    0,
-                    0,
-                    0,
-                    width,
-                    height,
-                    GL_RGB,
-                    GL_UNSIGNED_SHORT_5_6_5,
-                    buffer_view,
-                )
+        return tuple(result)
 
-        def on_resize(self, width: int, height: int) -> None:
-            super().on_resize(width, height)
-            safe_height = max(1, height)
-            self.projection = Mat4.perspective_projection(
-                aspect=width / safe_height,
-                z_near=0.1,
-                z_far=100.0,
-                fov=60.0,
+    def translation_matrix(x_pos: float, y_pos: float, z_pos: float) -> tuple[float, ...]:
+        return (
+            1.0, 0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+            x_pos, y_pos, z_pos, 1.0,
+        )
+
+    def rotation_x_matrix(angle: float) -> tuple[float, ...]:
+        sine = math.sin(angle)
+        cosine = math.cos(angle)
+        return (
+            1.0, 0.0, 0.0, 0.0,
+            0.0, cosine, sine, 0.0,
+            0.0, -sine, cosine, 0.0,
+            0.0, 0.0, 0.0, 1.0,
+        )
+
+    def rotation_y_matrix(angle: float) -> tuple[float, ...]:
+        sine = math.sin(angle)
+        cosine = math.cos(angle)
+        return (
+            cosine, 0.0, -sine, 0.0,
+            0.0, 1.0, 0.0, 0.0,
+            sine, 0.0, cosine, 0.0,
+            0.0, 0.0, 0.0, 1.0,
+        )
+
+    def mat4_to_ctypes(matrix: tuple[float, ...]) -> ctypes.Array[ctypes.c_float]:
+        return (ctypes.c_float * 16)(*matrix)
+
+    def compile_shader(source: str, shader_type: int) -> int:
+        shader = glCreateShader(shader_type)
+        glShaderSource(shader, source)
+        glCompileShader(shader)
+        status = glGetShaderiv(shader, GL_COMPILE_STATUS)
+        if status != GL_TRUE:
+            shader_kind = "vertex" if shader_type == GL_VERTEX_SHADER else "fragment"
+            raise RuntimeError(
+                f"{shader_kind} shader compilation failed: {glGetShaderInfoLog(shader).decode('utf-8', errors='replace')}"
             )
-            self.status_label.y = height - 12
-            self.status_label.width = max(200, width - 24)
+        return shader
 
-        def on_close(self) -> None:
-            stop_event.set()
-            super().on_close()
+    def link_program(vertex_shader: int, fragment_shader: int) -> int:
+        program = glCreateProgram()
+        glAttachShader(program, vertex_shader)
+        glAttachShader(program, fragment_shader)
+        glBindAttribLocation(program, 0, b"position")
+        glBindAttribLocation(program, 1, b"texcoord")
+        glLinkProgram(program)
+        status = glGetProgramiv(program, GL_LINK_STATUS)
+        if status != GL_TRUE:
+            raise RuntimeError(
+                f"shader program link failed: {glGetProgramInfoLog(program).decode('utf-8', errors='replace')}"
+            )
+        return program
 
-        def on_draw(self) -> None:
-            self.clear()
+    def create_window_with_fallbacks() -> pygame.Surface:
+        attempts: list[str] = []
+        templates = [
+            ("gl2.1 depth24", (2, 1, 24)),
+            ("gl2.1 depth16", (2, 1, 16)),
+            ("gl2.1 depth0", (2, 1, 0)),
+            ("gl1.5 depth16", (1, 5, 16)),
+            ("gl1.5 depth0", (1, 5, 0)),
+        ]
 
-            width, height, pixels, version = state.framebuffer.snapshot()
-            if version != self.frame_version or self.texture_size != (width, height):
-                self._upload_texture(width, height, pixels)
-                self.frame_version = version
+        pygame.init()
+        for description, (major, minor, depth_size) in templates:
+            try:
+                pygame.display.quit()
+                pygame.display.init()
+                pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MAJOR_VERSION, major)
+                pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MINOR_VERSION, minor)
+                pygame.display.gl_set_attribute(pygame.GL_DOUBLEBUFFER, 1)
+                pygame.display.gl_set_attribute(pygame.GL_DEPTH_SIZE, depth_size)
+                LOGGER.info("Trying viewport config: %s", description)
+                surface = pygame.display.set_mode(
+                    (args.window_width, args.window_height),
+                    OPENGL | DOUBLEBUF,
+                )
+                return surface
+            except pygame.error as exc:
+                attempts.append(f"{description}: {exc}")
+
+        raise RuntimeError(
+            "pygame found a display server but could not create an OpenGL context with any fallback config. "
+            f"Current environment: DISPLAY={display_name!r}, WAYLAND_DISPLAY={wayland_display!r}, XAUTHORITY={xauthority!r}. "
+            f"Attempts: {'; '.join(attempts)}"
+        )
+
+    surface = create_window_with_fallbacks()
+    pygame.display.set_caption("Breezy Box DisplayLink Prototype")
+
+    version = glGetString(GL_VERSION)
+    shader_version = glGetString(GL_SHADING_LANGUAGE_VERSION)
+    LOGGER.info(
+        "Viewport OpenGL: version=%s glsl=%s",
+        version.decode("utf-8", errors="replace") if version else "unknown",
+        shader_version.decode("utf-8", errors="replace") if shader_version else "unknown",
+    )
+
+    glClearColor(0.06, 0.08, 0.11, 1.0)
+    glEnable(GL_DEPTH_TEST)
+
+    vertex_shader = compile_shader(VERTEX_SHADER_SOURCE, GL_VERTEX_SHADER)
+    fragment_shader = compile_shader(FRAGMENT_SHADER_SOURCE, GL_FRAGMENT_SHADER)
+    program = link_program(vertex_shader, fragment_shader)
+    glDeleteShader(vertex_shader)
+    glDeleteShader(fragment_shader)
+
+    vertex_data = (ctypes.c_float * 20)(
+        -1.0, -0.5625, 0.0, 0.0, 0.0,
+         1.0, -0.5625, 0.0, 1.0, 0.0,
+         1.0,  0.5625, 0.0, 1.0, 1.0,
+        -1.0,  0.5625, 0.0, 0.0, 1.0,
+    )
+    index_data = (ctypes.c_uint * 6)(0, 1, 2, 0, 2, 3)
+
+    vertex_buffer = glGenBuffers(1)
+    index_buffer = glGenBuffers(1)
+
+    glBindBuffer(GL_ARRAY_BUFFER, vertex_buffer)
+    glBufferData(GL_ARRAY_BUFFER, ctypes.sizeof(vertex_data), vertex_data, GL_STATIC_DRAW)
+
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, index_buffer)
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, ctypes.sizeof(index_data), index_data, GL_STATIC_DRAW)
+
+    position_attrib = glGetAttribLocation(program, b"position")
+    texcoord_attrib = glGetAttribLocation(program, b"texcoord")
+    projection_uniform = glGetUniformLocation(program, b"projection")
+    view_uniform = glGetUniformLocation(program, b"view")
+    model_uniform = glGetUniformLocation(program, b"model")
+    texture_uniform = glGetUniformLocation(program, b"frame_texture")
+    blank_uniform = glGetUniformLocation(program, b"blank_factor")
+
+    texture_id = glGenTextures(1)
+    glBindTexture(GL_TEXTURE_2D, texture_id)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1)
+
+    texture_size = (0, 0)
+    frame_version = -1
+    last_caption_update = 0.0
+
+    def upload_texture(width: int, height: int, pixel_bytes: bytes) -> tuple[int, int]:
+        glActiveTexture(GL_TEXTURE0)
+        glBindTexture(GL_TEXTURE_2D, texture_id)
+        if texture_size != (width, height):
+            glTexImage2D(
+                GL_TEXTURE_2D,
+                0,
+                GL_RGB,
+                width,
+                height,
+                0,
+                GL_RGB,
+                GL_UNSIGNED_SHORT_5_6_5,
+                pixel_bytes,
+            )
+            return (width, height)
+
+        glTexSubImage2D(
+            GL_TEXTURE_2D,
+            0,
+            0,
+            0,
+            width,
+            height,
+            GL_RGB,
+            GL_UNSIGNED_SHORT_5_6_5,
+            pixel_bytes,
+        )
+        return texture_size
+
+    width, height, pixels, version_id = state.framebuffer.snapshot()
+    texture_size = upload_texture(width, height, pixels)
+    frame_version = version_id
+
+    viewport_width = args.window_width
+    viewport_height = args.window_height
+    projection = perspective_matrix(60.0, viewport_width / max(1, viewport_height), 0.1, 100.0)
+    view = translation_matrix(0.0, 0.0, -3.0)
+
+    clock = pygame.time.Clock()
+    try:
+        while not stop_event.is_set():
+            if pygame.get_init():
+                for event in pygame.event.get():
+                    if event.type == QUIT:
+                        stop_event.set()
+
+            if stop_event.is_set():
+                break
+
+            if pygame.display.get_surface() is None:
+                raise RuntimeError("pygame display surface disappeared during viewport rendering")
+
+            width, height, pixels, version_id = state.framebuffer.snapshot()
+            if version_id != frame_version or texture_size != (width, height):
+                texture_size = upload_texture(width, height, pixels)
+                frame_version = version_id
 
             angle = time.monotonic() * 0.35
-            model = (
-                Mat4.from_translation(Vec3(0.0, 0.0, 0.0))
-                @ Mat4.from_rotation(angle, Vec3(0.0, 1.0, 0.0))
-                @ Mat4.from_rotation(-0.2, Vec3(1.0, 0.0, 0.0))
+            model = multiply_mat4(
+                multiply_mat4(translation_matrix(0.0, 0.0, 0.0), rotation_y_matrix(angle)),
+                rotation_x_matrix(-0.2),
             )
 
-            self.program.use()
-            self.program["projection"] = self.projection
-            self.program["view"] = self.view
-            self.program["model"] = model
-            self.program["frame_texture"] = 0
-            self.program["blank_factor"] = 0.2 if state.blank_mode == 0x07 else 1.0
+            glViewport(0, 0, viewport_width, viewport_height)
+            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+            glUseProgram(program)
+            glUniformMatrix4fv(projection_uniform, 1, GL_FALSE, mat4_to_ctypes(projection))
+            glUniformMatrix4fv(view_uniform, 1, GL_FALSE, mat4_to_ctypes(view))
+            glUniformMatrix4fv(model_uniform, 1, GL_FALSE, mat4_to_ctypes(model))
+            glUniform1i(texture_uniform, 0)
+            glUniform1f(blank_uniform, 0.2 if state.blank_mode == 0x07 else 1.0)
 
             glActiveTexture(GL_TEXTURE0)
-            glBindTexture(GL_TEXTURE_2D, self.texture_id)
-            self.vertex_list.draw(GL_TRIANGLES)
+            glBindTexture(GL_TEXTURE_2D, texture_id)
+            glBindBuffer(GL_ARRAY_BUFFER, vertex_buffer)
+            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, index_buffer)
 
-            self.status_label.text = (
-                "Breezy Box DisplayLink OTG Prototype\n"
-                f"{state.status_line()}\n"
-                f"base16=0x{state.base16:06x} pixel_clock={state.pixel_clock_5khz * 5} kHz"
+            stride = 5 * ctypes.sizeof(ctypes.c_float)
+            glEnableVertexAttribArray(position_attrib)
+            glVertexAttribPointer(position_attrib, 3, GL_FLOAT, GL_FALSE, stride, ctypes.c_void_p(0))
+            glEnableVertexAttribArray(texcoord_attrib)
+            glVertexAttribPointer(
+                texcoord_attrib,
+                2,
+                GL_FLOAT,
+                GL_FALSE,
+                stride,
+                ctypes.c_void_p(3 * ctypes.sizeof(ctypes.c_float)),
             )
-            self.status_label.draw()
+            glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, ctypes.c_void_p(0))
+            glDisableVertexAttribArray(position_attrib)
+            glDisableVertexAttribArray(texcoord_attrib)
 
-    window = DisplayViewportWindow()
+            now = time.monotonic()
+            if now - last_caption_update >= 0.5:
+                pygame.display.set_caption(
+                    "Breezy Box DisplayLink Prototype | "
+                    f"{state.status_line()} | "
+                    f"base16=0x{state.base16:06x} pclk={state.pixel_clock_5khz * 5}kHz"
+                )
+                last_caption_update = now
 
-    def tick(_delta: float) -> None:
-        if stop_event.is_set():
-            window.close()
-
-    pyglet.clock.schedule_interval(tick, 1 / 30)
-    pyglet.app.run()
+            pygame.display.flip()
+            clock.tick(60)
+    finally:
+        pygame.quit()
 
 
 def run_headless_loop(pump: Optional[InputPump], state: DisplayLinkState, stop_event: threading.Event) -> None:
@@ -934,6 +1151,8 @@ def build_gadget_config(args: argparse.Namespace) -> GadgetConfig:
         manufacturer=args.manufacturer,
         product=args.product,
         serial_number=args.serial_number,
+        max_power_ma=args.max_power,
+        configuration_label=args.configuration_label,
     )
 
 
@@ -942,7 +1161,8 @@ def main() -> int:
     configure_logging(args.verbose)
 
     state = DisplayLinkState(args.width, args.height)
-    state.framebuffer.fill_test_pattern()
+    if args.source == "demo":
+        state.framebuffer.fill_test_pattern()
 
     config = build_gadget_config(args)
     gadget_configured = False
@@ -962,6 +1182,10 @@ def main() -> int:
     if iterator_factory is not None:
         pump = InputPump("displaylink-input", iterator_factory, decoder, stop_event)
         pump.start()
+        LOGGER.info(
+            "Waiting for incoming transport data on source=%s. Until bytes arrive, the viewport will stay blank.",
+            args.source,
+        )
     else:
         LOGGER.info("Demo mode enabled: showing the test pattern until the window closes.")
 
