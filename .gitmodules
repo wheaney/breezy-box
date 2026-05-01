@@ -1,0 +1,3 @@
+[submodule "udl_sink"]
+	path = modules/udl_sink
+	url = git@github.com:wheaney/udl_sink.git

@@ -19,6 +19,8 @@
 
 #include <usbg/usbg.h>
 
+#include "udl_sink.h"
+
 #define DISPLAYLINK_VENDOR_ID 0x17e9
 #define DISPLAYLINK_PRODUCT_ID 0x0104
 #define DISPLAYLINK_LANG 0x0409
@@ -37,6 +39,20 @@
 #define FUNCTIONFS_SUSPEND 5
 #define FUNCTIONFS_RESUME 6
 
+#define UDL_MSG_BULK 0xafU
+#define UDL_CMD_WRITEREG 0x20U
+#define UDL_CMD_WRITERAW8 0x60U
+#define UDL_CMD_WRITERL8 0x61U
+#define UDL_CMD_WRITECOPY8 0x62U
+#define UDL_CMD_WRITERLX8 0x63U
+#define UDL_CMD_WRITERAW16 0x68U
+#define UDL_CMD_WRITERL16 0x69U
+#define UDL_CMD_WRITECOPY16 0x6aU
+#define UDL_CMD_WRITERLX16 0x6bU
+#define UDL_MAX_COMMAND_PIXELS 256U
+#define DEFAULT_DECODE_WIDTH 1920U
+#define DEFAULT_DECODE_HEIGHT 1080U
+
 struct options {
 	const char *configfs_root;
 	const char *gadget_name;
@@ -49,9 +65,12 @@ struct options {
 	const char *udc_name;
 	uint16_t vendor_id;
 	uint16_t product_id;
+	uint32_t decode_width;
+	uint32_t decode_height;
 	uint8_t max_power_units;
 	bool cleanup_existing;
 	bool bind_gadget;
+	bool decode_stream;
 	bool stay_alive;
 	bool verbose;
 };
@@ -95,6 +114,29 @@ struct __attribute__((packed)) displaylink_descriptors {
 	struct usb_ss_ep_comp_descriptor ss_in_comp;
 };
 
+enum udl_stream_parse_result {
+	UDL_STREAM_PARSE_COMPLETE,
+	UDL_STREAM_PARSE_NEED_MORE,
+	UDL_STREAM_PARSE_INVALID,
+};
+
+struct udl_decode_runtime {
+	struct udl_sink sink;
+	uint16_t *framebuffer_rgb565;
+	uint8_t *pending;
+	size_t pending_len;
+	size_t pending_capacity;
+	uint64_t bulk_packets;
+	uint64_t bulk_bytes;
+	uint64_t decoded_commands;
+	uint64_t decode_errors;
+	uint64_t dropped_bytes;
+	uint32_t width;
+	uint32_t height;
+	bool enabled;
+	bool verbose;
+};
+
 static volatile sig_atomic_t stop_requested = 0;
 
 static void usage(const char *argv0)
@@ -114,6 +156,9 @@ static void usage(const char *argv0)
 		"  --udc NAME              Bind to a specific UDC instead of the default\n"
 		"  --vendor-id HEX         USB vendor ID (default: 0x17e9)\n"
 		"  --product-id HEX        USB product ID (default: 0x0104)\n"
+		"  --no-decode             Leave bulk traffic undecoded and only log packet sizes\n"
+		"  --decode-width PIXELS   Sink storage width for decoded traffic (default: 1920)\n"
+		"  --decode-height PIXELS  Sink storage height for decoded traffic (default: 1080)\n"
 		"  --verbose               Log control and bulk traffic\n",
 		argv0);
 }
@@ -144,6 +189,20 @@ static int parse_hex16(const char *text, uint16_t *value)
 		return -1;
 
 	*value = (uint16_t)parsed;
+	return 0;
+}
+
+static int parse_u32(const char *text, uint32_t *value)
+{
+	char *end = NULL;
+	unsigned long parsed;
+
+	errno = 0;
+	parsed = strtoul(text, &end, 0);
+	if (errno != 0 || !end || *end != '\0' || parsed > 0xffffffffUL)
+		return -1;
+
+	*value = (uint32_t)parsed;
 	return 0;
 }
 
@@ -327,6 +386,327 @@ static int write_ffs_descriptors(int ep0_fd)
 	return 0;
 }
 
+static uint32_t udl_count_from_byte(uint8_t value)
+{
+	return value == 0u ? UDL_MAX_COMMAND_PIXELS : (uint32_t)value;
+}
+
+static enum udl_stream_parse_result udl_parse_writerlx_length(const uint8_t *command,
+							      size_t length,
+							      size_t bytes_per_pixel,
+							      size_t *command_len_out)
+{
+	uint32_t produced = 0u;
+	const uint32_t total_pixels = udl_count_from_byte(command[5]);
+	size_t offset = 6u;
+
+	if (length < 7u)
+		return UDL_STREAM_PARSE_NEED_MORE;
+
+	while (produced < total_pixels) {
+		uint32_t raw_count;
+		size_t raw_bytes;
+		uint32_t repeat_count;
+
+		if (offset >= length)
+			return UDL_STREAM_PARSE_NEED_MORE;
+
+		raw_count = udl_count_from_byte(command[offset]);
+		offset += 1u;
+		if (raw_count > total_pixels - produced)
+			return UDL_STREAM_PARSE_INVALID;
+
+		raw_bytes = (size_t)raw_count * bytes_per_pixel;
+		if (length - offset < raw_bytes)
+			return UDL_STREAM_PARSE_NEED_MORE;
+
+		offset += raw_bytes;
+		produced += raw_count;
+		if (produced == total_pixels)
+			break;
+
+		if (offset >= length)
+			return UDL_STREAM_PARSE_NEED_MORE;
+
+		repeat_count = command[offset];
+		offset += 1u;
+		if (repeat_count == 0u || repeat_count > total_pixels - produced)
+			return UDL_STREAM_PARSE_INVALID;
+
+		produced += repeat_count;
+	}
+
+	*command_len_out = offset;
+	return UDL_STREAM_PARSE_COMPLETE;
+}
+
+static enum udl_stream_parse_result udl_next_command_length(const uint8_t *command,
+						    size_t length,
+						    size_t *command_len_out)
+{
+	uint32_t pixel_count;
+	size_t command_len;
+
+	if (length < 2u)
+		return UDL_STREAM_PARSE_NEED_MORE;
+	if (command[0] != UDL_MSG_BULK)
+		return UDL_STREAM_PARSE_INVALID;
+
+	switch (command[1]) {
+	case UDL_CMD_WRITEREG:
+		if (length < 4u)
+			return UDL_STREAM_PARSE_NEED_MORE;
+		*command_len_out = 4u;
+		return UDL_STREAM_PARSE_COMPLETE;
+	case UDL_CMD_WRITERAW8:
+		if (length < 6u)
+			return UDL_STREAM_PARSE_NEED_MORE;
+		pixel_count = udl_count_from_byte(command[5]);
+		command_len = 6u + (size_t)pixel_count;
+		break;
+	case UDL_CMD_WRITERL8:
+		command_len = 7u;
+		break;
+	case UDL_CMD_WRITECOPY8:
+		command_len = 9u;
+		break;
+	case UDL_CMD_WRITERLX8:
+		return udl_parse_writerlx_length(command, length, 1u, command_len_out);
+	case UDL_CMD_WRITERAW16:
+		if (length < 6u)
+			return UDL_STREAM_PARSE_NEED_MORE;
+		pixel_count = udl_count_from_byte(command[5]);
+		command_len = 6u + ((size_t)pixel_count * 2u);
+		break;
+	case UDL_CMD_WRITERL16:
+		command_len = 8u;
+		break;
+	case UDL_CMD_WRITECOPY16:
+		command_len = 9u;
+		break;
+	case UDL_CMD_WRITERLX16:
+		return udl_parse_writerlx_length(command, length, 2u, command_len_out);
+	default:
+		return UDL_STREAM_PARSE_INVALID;
+	}
+
+	if (length < command_len)
+		return UDL_STREAM_PARSE_NEED_MORE;
+
+	*command_len_out = command_len;
+	return UDL_STREAM_PARSE_COMPLETE;
+}
+
+static int udl_decoder_reserve_pending(struct udl_decode_runtime *decoder, size_t additional)
+{
+	size_t needed;
+	size_t new_capacity;
+	uint8_t *new_pending;
+
+	if (SIZE_MAX - decoder->pending_len < additional)
+		return -1;
+
+	needed = decoder->pending_len + additional;
+	if (needed <= decoder->pending_capacity)
+		return 0;
+
+	new_capacity = decoder->pending_capacity ? decoder->pending_capacity : 65536u;
+	while (new_capacity < needed) {
+		if (new_capacity > SIZE_MAX / 2u) {
+			new_capacity = needed;
+			break;
+		}
+		new_capacity *= 2u;
+	}
+
+	new_pending = realloc(decoder->pending, new_capacity);
+	if (!new_pending)
+		return -1;
+
+	decoder->pending = new_pending;
+	decoder->pending_capacity = new_capacity;
+	return 0;
+}
+
+static void udl_decoder_consume(struct udl_decode_runtime *decoder, size_t count)
+{
+	if (count >= decoder->pending_len) {
+		decoder->pending_len = 0u;
+		return;
+	}
+
+	memmove(decoder->pending, decoder->pending + count, decoder->pending_len - count);
+	decoder->pending_len -= count;
+}
+
+static void udl_decoder_report_success(struct udl_decode_runtime *decoder,
+					       size_t command_len,
+					       const struct udl_sink_damage *damage)
+{
+	if (!decoder->verbose)
+		return;
+
+	if (damage && damage->touched) {
+		fprintf(stderr,
+			"decoded command #%llu len=%zu damage=(%u,%u)-(%u,%u) pixels=%u mode=%ux%u depth=%u\n",
+			(unsigned long long)decoder->decoded_commands,
+			command_len,
+			damage->x1,
+			damage->y1,
+			damage->x2,
+			damage->y2,
+			damage->pixel_count,
+			(unsigned int)udl_sink_get_hpixels(&decoder->sink),
+			(unsigned int)udl_sink_get_vpixels(&decoder->sink),
+			(unsigned int)udl_sink_get_color_depth(&decoder->sink));
+	} else {
+		fprintf(stderr,
+			"decoded command #%llu len=%zu mode=%ux%u depth=%u\n",
+			(unsigned long long)decoder->decoded_commands,
+			command_len,
+			(unsigned int)udl_sink_get_hpixels(&decoder->sink),
+			(unsigned int)udl_sink_get_vpixels(&decoder->sink),
+			(unsigned int)udl_sink_get_color_depth(&decoder->sink));
+	}
+}
+
+static int udl_decoder_init(struct udl_decode_runtime *decoder, const struct options *opts)
+{
+	size_t pixel_count;
+
+	memset(decoder, 0, sizeof(*decoder));
+	decoder->enabled = opts->decode_stream;
+	decoder->verbose = opts->verbose;
+	decoder->width = opts->decode_width;
+	decoder->height = opts->decode_height;
+
+	if (!decoder->enabled)
+		return 0;
+
+	if (decoder->width == 0u || decoder->height == 0u)
+		return -1;
+	if ((size_t)decoder->height > SIZE_MAX / (size_t)decoder->width)
+		return -1;
+
+	pixel_count = (size_t)decoder->width * (size_t)decoder->height;
+	decoder->framebuffer_rgb565 = calloc(pixel_count, sizeof(*decoder->framebuffer_rgb565));
+	if (!decoder->framebuffer_rgb565)
+		return -1;
+
+	udl_sink_init(&decoder->sink,
+		      decoder->framebuffer_rgb565,
+		      decoder->width,
+		      decoder->height,
+		      decoder->width);
+	return 0;
+}
+
+static void udl_decoder_destroy(struct udl_decode_runtime *decoder)
+{
+	if (!decoder)
+		return;
+
+	udl_sink_destroy(&decoder->sink);
+	free(decoder->framebuffer_rgb565);
+	free(decoder->pending);
+	decoder->framebuffer_rgb565 = NULL;
+	decoder->pending = NULL;
+	decoder->pending_len = 0u;
+	decoder->pending_capacity = 0u;
+}
+
+static void udl_decoder_print_summary(const struct udl_decode_runtime *decoder)
+{
+	if (!decoder || !decoder->enabled)
+		return;
+
+	fprintf(stderr,
+		"UDL decode summary: bulk_packets=%llu bulk_bytes=%llu commands=%llu errors=%llu dropped=%llu configured=%ux%u signaled=%ux%u depth=%u\n",
+		(unsigned long long)decoder->bulk_packets,
+		(unsigned long long)decoder->bulk_bytes,
+		(unsigned long long)decoder->decoded_commands,
+		(unsigned long long)decoder->decode_errors,
+		(unsigned long long)decoder->dropped_bytes,
+		decoder->width,
+		decoder->height,
+		(unsigned int)udl_sink_get_hpixels(&decoder->sink),
+		(unsigned int)udl_sink_get_vpixels(&decoder->sink),
+		(unsigned int)udl_sink_get_color_depth(&decoder->sink));
+}
+
+static int udl_decoder_feed(struct udl_decode_runtime *decoder, const uint8_t *data, size_t length)
+{
+	if (!decoder || !decoder->enabled || !data || length == 0u)
+		return 0;
+
+	decoder->bulk_packets += 1u;
+	decoder->bulk_bytes += length;
+
+	if (udl_decoder_reserve_pending(decoder, length) != 0) {
+		fprintf(stderr, "Unable to grow UDL pending buffer\n");
+		return -1;
+	}
+
+	memcpy(decoder->pending + decoder->pending_len, data, length);
+	decoder->pending_len += length;
+
+	while (decoder->pending_len > 0u) {
+		uint8_t *sync;
+		size_t command_len = 0u;
+		enum udl_stream_parse_result parse_result;
+		struct udl_sink_damage damage;
+		enum udl_sink_result decode_result;
+
+		sync = memchr(decoder->pending, UDL_MSG_BULK, decoder->pending_len);
+		if (!sync) {
+			decoder->dropped_bytes += decoder->pending_len;
+			decoder->pending_len = 0u;
+			break;
+		}
+		if (sync != decoder->pending) {
+			size_t skipped = (size_t)(sync - decoder->pending);
+			decoder->dropped_bytes += skipped;
+			udl_decoder_consume(decoder, skipped);
+		}
+
+		if (decoder->pending_len < 2u)
+			break;
+		if (decoder->pending[1] == UDL_MSG_BULK) {
+			udl_decoder_consume(decoder, 1u);
+			continue;
+		}
+
+		parse_result = udl_next_command_length(decoder->pending, decoder->pending_len, &command_len);
+		if (parse_result == UDL_STREAM_PARSE_NEED_MORE)
+			break;
+		if (parse_result == UDL_STREAM_PARSE_INVALID) {
+			decoder->decode_errors += 1u;
+			if (decoder->verbose)
+				fprintf(stderr, "Invalid UDL command framing at opcode 0x%02x, resyncing\n", decoder->pending[1]);
+			udl_decoder_consume(decoder, 1u);
+			continue;
+		}
+
+		udl_sink_clear_damage(&damage);
+		decode_result = udl_sink_decode_buffer(&decoder->sink, decoder->pending, command_len, &damage);
+		if (decode_result != UDL_SINK_OK) {
+			decoder->decode_errors += 1u;
+			fprintf(stderr,
+				"UDL decode error for opcode 0x%02x: %s\n",
+				decoder->pending[1],
+				udl_sink_result_string(decode_result));
+			udl_decoder_consume(decoder, command_len);
+			continue;
+		}
+
+		decoder->decoded_commands += 1u;
+		udl_decoder_report_success(decoder, command_len, &damage);
+		udl_decoder_consume(decoder, command_len);
+	}
+
+	return 0;
+}
+
 static const char *event_name(uint8_t type)
 {
 	switch (type) {
@@ -388,7 +768,10 @@ static int handle_setup_request(int ep0_fd, const struct usb_ctrlrequest *setup,
 	return 0;
 }
 
-static int run_displaylink_loop(int ep0_fd, int ep_out_fd, bool verbose)
+static int run_displaylink_loop(int ep0_fd,
+				int ep_out_fd,
+				bool verbose,
+				struct udl_decode_runtime *decoder)
 {
 	struct pollfd pollfds[2];
 	uint8_t bulk_buffer[65536];
@@ -429,16 +812,21 @@ static int run_displaylink_loop(int ep0_fd, int ep_out_fd, bool verbose)
 				if (errno != EAGAIN)
 					perror("read ep1 bulk");
 			} else if (read_len > 0) {
-				fprintf(stderr, "bulk OUT %zd bytes", read_len);
-				if (verbose) {
+				if (verbose || !decoder || !decoder->enabled) {
+					fprintf(stderr, "bulk OUT %zd bytes", read_len);
 					size_t prefix = (size_t)read_len < 16 ? (size_t)read_len : 16U;
 					size_t i;
-					fprintf(stderr, " [");
-					for (i = 0; i < prefix; i++)
-						fprintf(stderr, "%s%02x", i ? " " : "", bulk_buffer[i]);
-					fprintf(stderr, "]");
+					if (verbose) {
+						fprintf(stderr, " [");
+						for (i = 0; i < prefix; i++)
+							fprintf(stderr, "%s%02x", i ? " " : "", bulk_buffer[i]);
+						fprintf(stderr, "]");
+					}
+					fprintf(stderr, "\n");
 				}
-				fprintf(stderr, "\n");
+				if (decoder && decoder->enabled &&
+				    udl_decoder_feed(decoder, bulk_buffer, (size_t)read_len) != 0)
+					return -1;
 			}
 		}
 	}
@@ -459,9 +847,12 @@ static void default_options(struct options *opts)
 	opts->serial = "DEADBEEF0001";
 	opts->vendor_id = DISPLAYLINK_VENDOR_ID;
 	opts->product_id = DISPLAYLINK_PRODUCT_ID;
+	opts->decode_width = DEFAULT_DECODE_WIDTH;
+	opts->decode_height = DEFAULT_DECODE_HEIGHT;
 	opts->max_power_units = 125;
 	opts->cleanup_existing = true;
 	opts->bind_gadget = true;
+	opts->decode_stream = true;
 	opts->stay_alive = true;
 	opts->verbose = false;
 }
@@ -471,6 +862,7 @@ static int parse_args(int argc, char **argv, struct options *opts)
 	static const struct option long_options[] = {
 		{ "cleanup-existing", no_argument, NULL, 'c' },
 		{ "no-bind", no_argument, NULL, 'n' },
+		{ "no-decode", no_argument, NULL, 'd' },
 		{ "no-stay-alive", no_argument, NULL, 'x' },
 		{ "gadget-name", required_argument, NULL, 'g' },
 		{ "ffs-instance", required_argument, NULL, 'f' },
@@ -482,19 +874,24 @@ static int parse_args(int argc, char **argv, struct options *opts)
 		{ "udc", required_argument, NULL, 'u' },
 		{ "vendor-id", required_argument, NULL, 'v' },
 		{ "product-id", required_argument, NULL, 'p' },
+		{ "decode-width", required_argument, NULL, 'W' },
+		{ "decode-height", required_argument, NULL, 'H' },
 		{ "verbose", no_argument, NULL, 'V' },
 		{ "help", no_argument, NULL, 'h' },
 		{ NULL, 0, NULL, 0 },
 	};
 	int opt;
 
-	while ((opt = getopt_long(argc, argv, "cnxg:f:m:l:M:P:S:u:v:p:Vh", long_options, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "cndxg:f:m:l:M:P:S:u:v:p:W:H:Vh", long_options, NULL)) != -1) {
 		switch (opt) {
 		case 'c':
 			opts->cleanup_existing = true;
 			break;
 		case 'n':
 			opts->bind_gadget = false;
+			break;
+		case 'd':
+			opts->decode_stream = false;
 			break;
 		case 'x':
 			opts->stay_alive = false;
@@ -531,6 +928,14 @@ static int parse_args(int argc, char **argv, struct options *opts)
 			if (parse_hex16(optarg, &opts->product_id) != 0)
 				return -1;
 			break;
+		case 'W':
+			if (parse_u32(optarg, &opts->decode_width) != 0)
+				return -1;
+			break;
+		case 'H':
+			if (parse_u32(optarg, &opts->decode_height) != 0)
+				return -1;
+			break;
 		case 'V':
 			opts->verbose = true;
 			break;
@@ -557,6 +962,7 @@ int main(int argc, char **argv)
 	usbg_config *config = NULL;
 	usbg_function *ffs = NULL;
 	usbg_udc *udc = NULL;
+	struct udl_decode_runtime decoder;
 	int ep0_fd = -1;
 	int ep_out_fd = -1;
 	int ep_in_fd = -1;
@@ -566,6 +972,13 @@ int main(int argc, char **argv)
 	default_options(&opts);
 	if (parse_args(argc, argv, &opts) != 0) {
 		usage(argv[0]);
+		return EXIT_FAILURE;
+	}
+	if (udl_decoder_init(&decoder, &opts) != 0) {
+		fprintf(stderr,
+			"Unable to initialize UDL decoder for %ux%u storage\n",
+			opts.decode_width,
+			opts.decode_height);
 		return EXIT_FAILURE;
 	}
 
@@ -675,13 +1088,15 @@ int main(int argc, char **argv)
 
 	if (opts.stay_alive && opts.bind_gadget) {
 		fprintf(stdout, "Entering FunctionFS event loop. Press Ctrl+C to stop.\n");
-		if (run_displaylink_loop(ep0_fd, ep_out_fd, opts.verbose) != 0)
+		if (run_displaylink_loop(ep0_fd, ep_out_fd, opts.verbose, &decoder) != 0)
 			goto out;
 	}
 
 	ret = EXIT_SUCCESS;
 
 out:
+	udl_decoder_print_summary(&decoder);
+	udl_decoder_destroy(&decoder);
 	if (ep_in_fd >= 0)
 		close(ep_in_fd);
 	if (ep_out_fd >= 0)

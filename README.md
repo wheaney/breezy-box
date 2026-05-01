@@ -53,6 +53,18 @@ We need a new component that will use a libcomposite integration to create the d
 
 This component would also be responsible for decoding the damage data coming in over the DisplayLink protocol and updating a DRM buffer with the latest textures for use in the 3D rendering. Although I've listed this as its own component, this would most likely live as a separate thread in the DRM/KMS rendering application, in order to have simpler access to shared memory for rendering.
 
+Current prototype status:
+The FunctionFS gadget prototype in `displaylink_gadget_ffs.c` now links against the `modules/udl_sink` submodule and incrementally decodes real bulk OUT traffic into the sink-side UDL decoder. That transport path is intentionally narrow: it handles USB chunk reassembly and command framing so split bulk reads can still be decoded, but it does not yet expose rendered output beyond the in-memory decoded framebuffer and status logging.
+
+Build notes:
+
+```sh
+git submodule update --init --recursive
+make
+```
+
+The resulting `displaylink_gadget_ffs` binary accepts `--decode-width` and `--decode-height` to size the sink storage and `--no-decode` to fall back to raw bulk logging while debugging the USB transport.
+
 ## Limitations
 
 The decision to go with DisplayLink has a couple repurcussions that mainly impact streaming and gaming. Since Breezy Box is intended to be a productivity device, the simplicity that DisplayLink offers this design seems worth that tradeoff.
