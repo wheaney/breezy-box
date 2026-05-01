@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import errno
 import logging
 import math
 import os
@@ -69,9 +70,58 @@ UDL_BLANKMODE_NAMES = {
     0x07: "powerdown",
 }
 
+USB_DIR_IN = 0x80
+
+USB_DT_INTERFACE = 0x04
+USB_DT_ENDPOINT = 0x05
+USB_DT_SS_ENDPOINT_COMP = 0x30
+
+USB_CLASS_VENDOR_SPEC = 0xFF
+USB_ENDPOINT_XFER_BULK = 0x02
+
+FUNCTIONFS_DESCRIPTORS_MAGIC = 1
+FUNCTIONFS_DESCRIPTORS_MAGIC_V2 = 3
+FUNCTIONFS_STRINGS_MAGIC = 2
+FUNCTIONFS_HAS_FS_DESC = 1
+FUNCTIONFS_HAS_HS_DESC = 2
+FUNCTIONFS_HAS_SS_DESC = 4
+
+FUNCTIONFS_BIND = 0
+FUNCTIONFS_UNBIND = 1
+FUNCTIONFS_ENABLE = 2
+FUNCTIONFS_DISABLE = 3
+FUNCTIONFS_SETUP = 4
+FUNCTIONFS_SUSPEND = 5
+FUNCTIONFS_RESUME = 6
+
+FUNCTIONFS_EVENT_NAMES = {
+    FUNCTIONFS_BIND: "bind",
+    FUNCTIONFS_UNBIND: "unbind",
+    FUNCTIONFS_ENABLE: "enable",
+    FUNCTIONFS_DISABLE: "disable",
+    FUNCTIONFS_SETUP: "setup",
+    FUNCTIONFS_SUSPEND: "suspend",
+    FUNCTIONFS_RESUME: "resume",
+}
+
 
 class GadgetError(RuntimeError):
     """Raised when configfs gadget setup fails."""
+
+
+@dataclass
+class FunctionFSRuntime:
+    mount_path: Path
+    ep0_fd: int
+    ep_out_fd: int
+    ep_in_fd: int
+
+    def close(self) -> None:
+        for file_descriptor in (self.ep_in_fd, self.ep_out_fd, self.ep0_fd):
+            try:
+                os.close(file_descriptor)
+            except OSError:
+                pass
 
 
 def parse_args() -> argparse.Namespace:
@@ -84,7 +134,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--source",
-        choices=("tty", "file", "stdin", "demo"),
+        choices=("tty", "ffs", "file", "stdin", "demo"),
         default="tty",
         help="Where to read the incoming byte stream from.",
     )
@@ -98,6 +148,17 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=Path("/dev/ttyGS0"),
         help="Gadget-side tty device exposed by the ACM function.",
+    )
+    parser.add_argument(
+        "--ffs-name",
+        default="displaylink",
+        help="FunctionFS instance name for the experimental vendor-bulk gadget mode.",
+    )
+    parser.add_argument(
+        "--ffs-mount",
+        type=Path,
+        default=Path("/dev/ffs-displaylink"),
+        help="Mount point for the experimental FunctionFS instance.",
     )
     parser.add_argument(
         "--chunk-size",
@@ -174,6 +235,14 @@ def parse_args() -> argparse.Namespace:
         help="UDC name to bind the gadget to.",
     )
     parser.add_argument(
+        "--max-speed",
+        default="high-speed",
+        help=(
+            "Value written to the gadget max_speed attribute before binding. "
+            "Use high-speed to keep DWC3 boards off the SuperSpeed path while debugging FunctionFS."
+        ),
+    )
+    parser.add_argument(
         "--vendor-id",
         default="0x17e9",
         help="USB vendor ID to write into idVendor.",
@@ -248,6 +317,25 @@ def ensure_symlink(link_path: Path, target: str) -> None:
     os.symlink(target, link_path)
 
 
+def ensure_configfs_function_link(config: GadgetConfig) -> None:
+    link_path = config.function_link
+    target = f"functions/{config.function_name}"
+
+    if link_path.is_symlink():
+        if os.readlink(link_path) == target:
+            return
+        link_path.unlink()
+    elif link_path.exists():
+        raise GadgetError(f"Expected symlink at {link_path}, found another entry.")
+
+    previous_cwd = Path.cwd()
+    try:
+        os.chdir(config.gadget_dir)
+        subprocess.run(["ln", "-s", target, f"configs/{config.config_name}"], check=True)
+    finally:
+        os.chdir(previous_cwd)
+
+
 def load_kernel_module(module_name: str) -> None:
     LOGGER.info("Loading kernel module %s", module_name)
     subprocess.run(["modprobe", module_name], check=True)
@@ -263,6 +351,7 @@ class GadgetConfig:
     manufacturer: str
     product: str
     serial_number: str
+    max_speed: str = "high-speed"
     max_power_ma: int = 250
     configuration_label: str = "DisplayLink"
     language: str = "0x409"
@@ -294,13 +383,26 @@ class GadgetConfig:
         return self.config_dir / self.function_name
 
 
-def setup_displaylink_acm_gadget(config: GadgetConfig) -> None:
+def setup_displaylink_gadget_base(config: GadgetConfig) -> None:
     require_root()
     load_kernel_module("libcomposite")
+    if config.function_name.startswith("ffs."):
+        load_kernel_module("usb_f_fs")
     if not config.root.exists():
         raise GadgetError(f"Configfs gadget root does not exist: {config.root}")
 
     config.gadget_dir.mkdir(exist_ok=True)
+    ensure_gadget_starts_unbound(config)
+
+    max_speed_file = config.gadget_dir / "max_speed"
+    if max_speed_file.exists():
+        configure_gadget_max_speed(config, max_speed_file)
+    else:
+        LOGGER.warning(
+            "Gadget %s does not expose a max_speed attribute; leaving controller speed defaults unchanged.",
+            config.gadget_name,
+        )
+
     write_text_file(config.gadget_dir / "idVendor", config.vendor_id)
 
     product_id = config.product_id
@@ -327,22 +429,79 @@ def setup_displaylink_acm_gadget(config: GadgetConfig) -> None:
     write_text_file(config.gadget_strings_dir / "product", config.product)
     write_text_file(config.gadget_strings_dir / "serialnumber", config.serial_number)
 
-    # Configfs resolves the symlink target path when the link is created.
-    # The shell recipe worked because it was run from inside the gadget
-    # directory first; this script may run from anywhere, so use the absolute
-    # configfs path for the function item.
-    link_target = str(config.function_dir)
-    ensure_symlink(config.function_link, link_target)
+    if not config.function_name.startswith("ffs."):
+        ensure_configfs_function_link(config)
 
+
+def ensure_gadget_starts_unbound(config: GadgetConfig) -> None:
+    udc_file = config.gadget_dir / "UDC"
+    if not udc_file.exists():
+        return
+
+    current_udc = read_text_file(udc_file)
+    if not current_udc:
+        LOGGER.debug("Gadget %s already starts unbound", config.gadget_name)
+        return
+
+    LOGGER.info(
+        "Unbinding gadget %s from %s before reconfiguration",
+        config.gadget_name,
+        current_udc,
+    )
+    write_text_file(udc_file, "")
+
+
+def configure_gadget_max_speed(config: GadgetConfig, max_speed_file: Path) -> None:
+    current_speed = read_text_file(max_speed_file)
+    if current_speed == config.max_speed:
+        LOGGER.info("Gadget %s already has max_speed=%s", config.gadget_name, current_speed)
+        return
+
+    LOGGER.info(
+        "Setting gadget %s max_speed from %s to %s",
+        config.gadget_name,
+        current_speed or "<unset>",
+        config.max_speed,
+    )
+    try:
+        write_text_file(max_speed_file, config.max_speed)
+    except OSError as exc:
+        if exc.errno == errno.EINVAL:
+            LOGGER.warning(
+                "Gadget %s rejected max_speed=%s via %s: %s. Leaving current value %s in place.",
+                config.gadget_name,
+                config.max_speed,
+                max_speed_file,
+                exc,
+                current_speed or "<unset>",
+            )
+            return
+        raise
+
+
+def bind_displaylink_gadget(config: GadgetConfig) -> None:
     current_udc = read_text_file(config.gadget_dir / "UDC") if (config.gadget_dir / "UDC").exists() else ""
     if current_udc and current_udc != config.udc_name:
         LOGGER.info("Rebinding gadget from %s to %s", current_udc, config.udc_name)
         write_text_file(config.gadget_dir / "UDC", "")
 
     write_text_file(config.gadget_dir / "UDC", config.udc_name)
+
+
+def setup_displaylink_acm_gadget(config: GadgetConfig) -> None:
+    setup_displaylink_gadget_base(config)
+    bind_displaylink_gadget(config)
     LOGGER.warning(
         "The ACM function mirrors the shell steps, but stock DisplayLink drivers "
         "expect a vendor-defined interface class with bulk/control endpoints, not CDC ACM."
+    )
+
+
+def setup_displaylink_ffs_gadget(config: GadgetConfig) -> None:
+    setup_displaylink_gadget_base(config)
+    LOGGER.info(
+        "Configured experimental FunctionFS gadget %s. It will bind after userspace writes descriptors.",
+        config.function_name,
     )
 
 
@@ -448,6 +607,10 @@ class DisplayLinkState:
         self.base8 = 0
         self.pixel_clock_5khz = 0
         self.blank_mode = 0x00
+        self.usb_setup_events = 0
+        self.usb_bulk_packets = 0
+        self.usb_enable_events = 0
+        self.usb_disable_events = 0
 
     def set_register(self, register: int, value: int) -> None:
         self.registers[register] = value & 0xFF
@@ -484,7 +647,7 @@ class DisplayLinkState:
         return (
             f"bytes={self.bytes_received} commands={self.commands_decoded} "
             f"errors={self.decode_errors} mode={self.framebuffer.width}x{self.framebuffer.height} "
-            f"depth={self.color_depth} blank={blank}"
+            f"depth={self.color_depth} blank={blank} usb_setup={self.usb_setup_events} bulk_pkts={self.usb_bulk_packets}"
         )
 
 
@@ -693,6 +856,342 @@ def iter_stdin_chunks(chunk_size: int, stop_event: threading.Event) -> Iterator[
         if not data:
             return
         yield data
+
+
+def is_mountpoint(path: Path) -> bool:
+    return os.path.ismount(path)
+
+
+def ensure_functionfs_mounted(instance_name: str, mount_path: Path) -> None:
+    require_root()
+    mount_path.mkdir(parents=True, exist_ok=True)
+    if is_mountpoint(mount_path):
+        LOGGER.info("Unmounting existing FunctionFS mount at %s", mount_path)
+        subprocess.run(["umount", str(mount_path)], check=True)
+    subprocess.run(["mount", "-t", "functionfs", instance_name, str(mount_path)], check=True)
+
+
+def build_functionfs_descriptors_v2() -> bytes:
+    fs_interface = struct.pack(
+        "<BBBBBBBBB",
+        9,
+        USB_DT_INTERFACE,
+        0,
+        0,
+        2,
+        USB_CLASS_VENDOR_SPEC,
+        0,
+        0,
+        1,
+    )
+    fs_out_endpoint = struct.pack(
+        "<BBBBHB",
+        7,
+        USB_DT_ENDPOINT,
+        0x01,
+        USB_ENDPOINT_XFER_BULK,
+        64,
+        0,
+    )
+    fs_in_endpoint = struct.pack(
+        "<BBBBHB",
+        7,
+        USB_DT_ENDPOINT,
+        0x82,
+        USB_ENDPOINT_XFER_BULK,
+        64,
+        0,
+    )
+    hs_out_endpoint = struct.pack(
+        "<BBBBHB",
+        7,
+        USB_DT_ENDPOINT,
+        0x01,
+        USB_ENDPOINT_XFER_BULK,
+        512,
+        0,
+    )
+    hs_in_endpoint = struct.pack(
+        "<BBBBHB",
+        7,
+        USB_DT_ENDPOINT,
+        0x82,
+        USB_ENDPOINT_XFER_BULK,
+        512,
+        0,
+    )
+    ss_out_endpoint = struct.pack(
+        "<BBBBHB",
+        7,
+        USB_DT_ENDPOINT,
+        0x01,
+        USB_ENDPOINT_XFER_BULK,
+        1024,
+        0,
+    )
+    ss_out_companion = struct.pack(
+        "<BBBBH",
+        6,
+        USB_DT_SS_ENDPOINT_COMP,
+        0,
+        0,
+        0,
+    )
+    ss_in_endpoint = struct.pack(
+        "<BBBBHB",
+        7,
+        USB_DT_ENDPOINT,
+        0x82,
+        USB_ENDPOINT_XFER_BULK,
+        1024,
+        0,
+    )
+    ss_in_companion = struct.pack(
+        "<BBBBH",
+        6,
+        USB_DT_SS_ENDPOINT_COMP,
+        0,
+        0,
+        0,
+    )
+
+    flags = FUNCTIONFS_HAS_FS_DESC | FUNCTIONFS_HAS_HS_DESC | FUNCTIONFS_HAS_SS_DESC
+    payload = b"".join(
+        (
+            fs_interface,
+            fs_out_endpoint,
+            fs_in_endpoint,
+            fs_interface,
+            hs_out_endpoint,
+            hs_in_endpoint,
+            fs_interface,
+            ss_out_endpoint,
+            ss_out_companion,
+            ss_in_endpoint,
+            ss_in_companion,
+        )
+    )
+    count_fields = struct.pack("<III", 3, 3, 5)
+    header_prefix = struct.pack("<III", FUNCTIONFS_DESCRIPTORS_MAGIC_V2, 0, flags)
+    total_length = len(header_prefix) + len(count_fields) + len(payload)
+    return b"".join(
+        (
+            struct.pack("<III", FUNCTIONFS_DESCRIPTORS_MAGIC_V2, total_length, flags),
+            count_fields,
+            payload,
+        )
+    )
+
+def build_functionfs_strings() -> bytes:
+    interface_name = b"DisplayLink Debug Interface\x00"
+    total_length = 18 + len(interface_name)
+    return b"".join(
+        (
+            struct.pack("<IIII", FUNCTIONFS_STRINGS_MAGIC, total_length, 1, 1),
+            struct.pack("<H", 0x0409),
+            interface_name,
+        )
+    )
+
+
+def open_functionfs_runtime(args: argparse.Namespace) -> FunctionFSRuntime:
+    ensure_functionfs_mounted(args.ffs_name, args.ffs_mount)
+
+    ep0_path = args.ffs_mount / "ep0"
+    ep0_fd = os.open(ep0_path, os.O_RDWR)
+    try:
+        os.write(ep0_fd, build_functionfs_descriptors_v2())
+        os.write(ep0_fd, build_functionfs_strings())
+    except OSError:
+        os.close(ep0_fd)
+        raise
+
+    ep_out_path = args.ffs_mount / "ep1"
+    ep_in_path = args.ffs_mount / "ep2"
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        if ep_out_path.exists() and ep_in_path.exists():
+            break
+        time.sleep(0.05)
+    else:
+        os.close(ep0_fd)
+        raise GadgetError(f"FunctionFS endpoints did not appear under {args.ffs_mount} after descriptor registration.")
+
+    ep_out_fd = os.open(ep_out_path, os.O_RDONLY | os.O_NONBLOCK)
+    ep_in_fd = os.open(ep_in_path, os.O_RDWR | os.O_NONBLOCK)
+    return FunctionFSRuntime(
+        mount_path=args.ffs_mount,
+        ep0_fd=ep0_fd,
+        ep_out_fd=ep_out_fd,
+        ep_in_fd=ep_in_fd,
+    )
+
+
+def describe_functionfs_configfs_state(config: GadgetConfig) -> str:
+    if not config.function_dir.exists():
+        return f"{config.function_dir} is missing"
+
+    entries = sorted(path.name for path in config.function_dir.iterdir())
+    ready_file = config.function_dir / "ready"
+    if ready_file.exists():
+        ready_value = read_text_file(ready_file)
+        return f"entries={entries}, ready={ready_value}"
+
+    return f"entries={entries}, ready=<missing>"
+
+
+def wait_for_functionfs_ready(
+    config: GadgetConfig,
+    mount_path: Optional[Path] = None,
+    timeout_seconds: float = 5.0,
+) -> None:
+    ready_file = config.function_dir / "ready"
+    if not ready_file.exists():
+        state_summary = describe_functionfs_configfs_state(config)
+        raise GadgetError(
+            f"FunctionFS configfs ABI is incomplete for {config.function_name}: {state_summary}. "
+            f"This kernel exposes usb_f_fs but does not provide the documented ready attribute, "
+            f"so --source=ffs cannot become linkable on this board (mount={mount_path})."
+        )
+
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if ready_file.exists() and read_text_file(ready_file) == "1":
+            return
+        time.sleep(0.05)
+    ready_value = read_text_file(ready_file) if ready_file.exists() else "<missing>"
+    raise GadgetError(
+        f"FunctionFS function {config.function_name} did not become ready within {timeout_seconds:.1f}s "
+        f"(ready={ready_value}, mount={mount_path}, {describe_functionfs_configfs_state(config)})"
+    )
+
+
+def prepare_functionfs_runtime(args: argparse.Namespace, config: GadgetConfig) -> FunctionFSRuntime:
+    last_error: Optional[BaseException] = None
+
+    runtime: Optional[FunctionFSRuntime] = None
+    descriptor_mode = "v2"
+    try:
+        LOGGER.info("Registering FunctionFS descriptors using %s format", descriptor_mode)
+        runtime = open_functionfs_runtime(args)
+        wait_for_functionfs_ready(config, args.ffs_mount)
+        return runtime
+    except (GadgetError, OSError) as exc:
+        last_error = exc
+        if runtime is not None:
+            runtime.close()
+        LOGGER.warning("FunctionFS %s registration failed: %s", descriptor_mode, exc)
+
+    raise GadgetError(f"FunctionFS registration failed for {config.function_name}: {last_error}")
+
+
+class FunctionFSEventPump(threading.Thread):
+    def __init__(self, runtime: FunctionFSRuntime, state: DisplayLinkState, stop_event: threading.Event) -> None:
+        super().__init__(name="displaylink-ffs-ep0", daemon=True)
+        self.runtime = runtime
+        self.state = state
+        self.stop_event = stop_event
+        self.error: Optional[BaseException] = None
+
+    def run(self) -> None:
+        try:
+            while not self.stop_event.is_set():
+                try:
+                    event_data = os.read(self.runtime.ep0_fd, 12)
+                except OSError as exc:
+                    if exc.errno in (errno.EAGAIN, errno.EINTR):
+                        continue
+                    if self.stop_event.is_set():
+                        return
+                    raise
+
+                if len(event_data) < 12:
+                    if self.stop_event.is_set():
+                        return
+                    continue
+
+                request_type, request, value, index, length, event_type = struct.unpack(
+                    "<BBHHHB3x",
+                    event_data,
+                )
+                if event_type == FUNCTIONFS_SETUP:
+                    self.state.usb_setup_events += 1
+                    LOGGER.info(
+                        "FunctionFS setup: bmRequestType=0x%02x bRequest=0x%02x wValue=0x%04x wIndex=0x%04x wLength=%d",
+                        request_type,
+                        request,
+                        value,
+                        index,
+                        length,
+                    )
+                    self._handle_setup_request(request_type, request, length)
+                else:
+                    if event_type == FUNCTIONFS_ENABLE:
+                        self.state.usb_enable_events += 1
+                    elif event_type == FUNCTIONFS_DISABLE:
+                        self.state.usb_disable_events += 1
+                    LOGGER.info("FunctionFS event: %s", FUNCTIONFS_EVENT_NAMES.get(event_type, f"unknown-{event_type}"))
+        except BaseException as exc:  # pragma: no cover - surfaced to main thread
+            self.error = exc
+            self.stop_event.set()
+
+    def _handle_setup_request(self, request_type: int, request: int, length: int) -> None:
+        if request_type & USB_DIR_IN:
+            try:
+                os.write(self.runtime.ep0_fd, bytes(length))
+            except OSError as exc:
+                LOGGER.warning(
+                    "Failed to write %d-byte control IN response for bRequest=0x%02x: %s",
+                    length,
+                    request,
+                    exc,
+                )
+            return
+
+        if length <= 0:
+            return
+
+        try:
+            payload = os.read(self.runtime.ep0_fd, length)
+        except OSError as exc:
+            LOGGER.warning(
+                "Failed to read %d-byte control OUT payload for bRequest=0x%02x: %s",
+                length,
+                request,
+                exc,
+            )
+            return
+
+        if payload:
+            LOGGER.info("FunctionFS control OUT payload (%d bytes): %s", len(payload), payload[:32].hex())
+
+
+def iter_ffs_chunks(
+    runtime: FunctionFSRuntime,
+    chunk_size: int,
+    stop_event: threading.Event,
+    state: DisplayLinkState,
+) -> Iterator[bytes]:
+    selector = selectors.DefaultSelector()
+    selector.register(runtime.ep_out_fd, selectors.EVENT_READ)
+    try:
+        while not stop_event.is_set():
+            ready = selector.select(timeout=0.1)
+            if not ready:
+                continue
+            try:
+                data = os.read(runtime.ep_out_fd, chunk_size)
+            except BlockingIOError:
+                continue
+            except OSError as exc:
+                if exc.errno == errno.EAGAIN:
+                    continue
+                raise
+            if data:
+                state.usb_bulk_packets += 1
+                yield data
+    finally:
+        selector.close()
 
 
 def make_iterator_factory(args: argparse.Namespace) -> Optional[Callable[[threading.Event], Iterator[bytes]]]:
@@ -1151,8 +1650,10 @@ def build_gadget_config(args: argparse.Namespace) -> GadgetConfig:
         manufacturer=args.manufacturer,
         product=args.product,
         serial_number=args.serial_number,
+        max_speed=args.max_speed,
         max_power_ma=args.max_power,
         configuration_label=args.configuration_label,
+        function_name=f"ffs.{args.ffs_name}" if args.source == "ffs" else "acm.usb0",
     )
 
 
@@ -1160,16 +1661,33 @@ def main() -> int:
     args = parse_args()
     configure_logging(args.verbose)
 
+    if args.setup_only and args.source == "ffs":
+        raise GadgetError(
+            "--setup-only is not supported with --source=ffs because FunctionFS requires the userspace daemon to stay alive."
+        )
+
     state = DisplayLinkState(args.width, args.height)
     if args.source == "demo":
         state.framebuffer.fill_test_pattern()
 
     config = build_gadget_config(args)
     gadget_configured = False
+    ffs_runtime: Optional[FunctionFSRuntime] = None
+    ffs_event_pump: Optional[FunctionFSEventPump] = None
 
     if not args.no_gadget_setup:
-        setup_displaylink_acm_gadget(config)
-        gadget_configured = True
+        if args.source == "ffs":
+            setup_displaylink_ffs_gadget(config)
+        else:
+            setup_displaylink_acm_gadget(config)
+            gadget_configured = True
+
+    if args.source == "ffs":
+        ffs_runtime = prepare_functionfs_runtime(args, config)
+        if not args.no_gadget_setup:
+            ensure_configfs_function_link(config)
+            bind_displaylink_gadget(config)
+            gadget_configured = True
 
     if args.setup_only:
         return 0
@@ -1178,6 +1696,15 @@ def main() -> int:
     stop_event = threading.Event()
     pump: Optional[InputPump] = None
     iterator_factory = make_iterator_factory(args)
+
+    if ffs_runtime is not None:
+        iterator_factory = lambda stop_event: iter_ffs_chunks(ffs_runtime, args.chunk_size, stop_event, state)
+        ffs_event_pump = FunctionFSEventPump(ffs_runtime, state, stop_event)
+        ffs_event_pump.start()
+        LOGGER.info(
+            "FunctionFS transport active at %s. Watching ep0 for setup events and ep1 for bulk OUT traffic.",
+            args.ffs_mount,
+        )
 
     if iterator_factory is not None:
         pump = InputPump("displaylink-input", iterator_factory, decoder, stop_event)
@@ -1197,11 +1724,17 @@ def main() -> int:
 
         if pump and pump.error:
             raise pump.error
+        if ffs_event_pump and ffs_event_pump.error:
+            raise ffs_event_pump.error
         return 0
     finally:
         stop_event.set()
         if pump:
             pump.join(timeout=1.0)
+        if ffs_event_pump:
+            ffs_event_pump.join(timeout=1.0)
+        if ffs_runtime:
+            ffs_runtime.close()
         if args.unbind_on_exit and gadget_configured:
             unbind_displaylink_gadget(config)
 
