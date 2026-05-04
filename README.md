@@ -56,6 +56,8 @@ This component would also be responsible for decoding the damage data coming in 
 Current prototype status:
 The FunctionFS gadget prototype in `displaylink_gadget_ffs.c` now links against the `modules/udl_sink` submodule and incrementally decodes real bulk OUT traffic into the sink-side UDL decoder. That transport path is intentionally narrow: it handles USB chunk reassembly and command framing so split bulk reads can still be decoded, and it can now write the decoded frame to an inspectable binary PPM image on exit.
 
+There is now also a parallel GadgetFS prototype in `displaylink_gadget_gadgetfs.c`. Unlike the FunctionFS version, it owns the device-level ep0 control path in userspace and can answer the specific UDL probe requests the Linux host driver cares about: the vendor firmware descriptor, the standard channel-select vendor request, and per-byte EDID reads. This is intended as the next experiment for full old-DisplayLink impersonation.
+
 Build notes:
 
 ```sh
@@ -64,6 +66,12 @@ make
 ```
 
 The resulting `displaylink_gadget_ffs` binary accepts `--decode-width` and `--decode-height` to size the sink storage, `--no-decode` to fall back to raw bulk logging while debugging the USB transport, and `--dump-image out.ppm` to snapshot the latest decoded frame when the process exits.
+
+The `displaylink_gadget_gadgetfs` prototype is a separate binary for boards where `gadgetfs` is available. It mounts `gadgetfs`, opens the UDC device node under `/dev/gadget`, configures bulk endpoints, and feeds the host's UDL bulk traffic into the same sink-side decoder. Example:
+
+```sh
+sudo ./displaylink_gadget_gadgetfs --device-name fe800000.usb --verbose --dump-image /tmp/udl.ppm
+```
 
 ## Limitations
 
