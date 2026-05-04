@@ -58,6 +58,7 @@ struct options {
 	const char *gadget_name;
 	const char *ffs_instance;
 	const char *mount_path;
+	const char *dump_image_path;
 	const char *config_label;
 	const char *manufacturer;
 	const char *product;
@@ -123,6 +124,7 @@ enum udl_stream_parse_result {
 struct udl_decode_runtime {
 	struct udl_sink sink;
 	uint16_t *framebuffer_rgb565;
+	uint32_t *framebuffer_xrgb8888;
 	uint8_t *pending;
 	size_t pending_len;
 	size_t pending_capacity;
@@ -133,6 +135,7 @@ struct udl_decode_runtime {
 	uint64_t dropped_bytes;
 	uint32_t width;
 	uint32_t height;
+	const char *dump_image_path;
 	bool enabled;
 	bool verbose;
 };
@@ -159,6 +162,7 @@ static void usage(const char *argv0)
 		"  --no-decode             Leave bulk traffic undecoded and only log packet sizes\n"
 		"  --decode-width PIXELS   Sink storage width for decoded traffic (default: 1920)\n"
 		"  --decode-height PIXELS  Sink storage height for decoded traffic (default: 1080)\n"
+		"  --dump-image PATH       Write a binary PPM snapshot of the decoded frame on exit\n"
 		"  --verbose               Log control and bulk traffic\n",
 		argv0);
 }
@@ -579,6 +583,7 @@ static int udl_decoder_init(struct udl_decode_runtime *decoder, const struct opt
 	decoder->verbose = opts->verbose;
 	decoder->width = opts->decode_width;
 	decoder->height = opts->decode_height;
+	decoder->dump_image_path = opts->dump_image_path;
 
 	if (!decoder->enabled)
 		return 0;
@@ -592,12 +597,21 @@ static int udl_decoder_init(struct udl_decode_runtime *decoder, const struct opt
 	decoder->framebuffer_rgb565 = calloc(pixel_count, sizeof(*decoder->framebuffer_rgb565));
 	if (!decoder->framebuffer_rgb565)
 		return -1;
+	if (decoder->dump_image_path) {
+		decoder->framebuffer_xrgb8888 = calloc(pixel_count, sizeof(*decoder->framebuffer_xrgb8888));
+		if (!decoder->framebuffer_xrgb8888)
+			return -1;
+	}
 
 	udl_sink_init(&decoder->sink,
 		      decoder->framebuffer_rgb565,
 		      decoder->width,
 		      decoder->height,
 		      decoder->width);
+	if (decoder->framebuffer_xrgb8888)
+		udl_sink_attach_xrgb8888_output(&decoder->sink,
+					       decoder->framebuffer_xrgb8888,
+					       decoder->width);
 	return 0;
 }
 
@@ -608,11 +622,98 @@ static void udl_decoder_destroy(struct udl_decode_runtime *decoder)
 
 	udl_sink_destroy(&decoder->sink);
 	free(decoder->framebuffer_rgb565);
+	free(decoder->framebuffer_xrgb8888);
 	free(decoder->pending);
 	decoder->framebuffer_rgb565 = NULL;
+	decoder->framebuffer_xrgb8888 = NULL;
 	decoder->pending = NULL;
 	decoder->pending_len = 0u;
 	decoder->pending_capacity = 0u;
+}
+
+static uint32_t udl_decoder_visible_width(const struct udl_decode_runtime *decoder)
+{
+	const uint16_t signaled_width = udl_sink_get_hpixels(&decoder->sink);
+
+	if (signaled_width != 0u && signaled_width <= decoder->width)
+		return signaled_width;
+
+	return decoder->width;
+}
+
+static uint32_t udl_decoder_visible_height(const struct udl_decode_runtime *decoder)
+{
+	const uint16_t signaled_height = udl_sink_get_vpixels(&decoder->sink);
+
+	if (signaled_height != 0u && signaled_height <= decoder->height)
+		return signaled_height;
+
+	return decoder->height;
+}
+
+static int udl_decoder_dump_image(const struct udl_decode_runtime *decoder)
+{
+	FILE *file;
+	uint8_t *row_buffer;
+	const uint32_t width = udl_decoder_visible_width(decoder);
+	const uint32_t height = udl_decoder_visible_height(decoder);
+	uint32_t row;
+
+	if (!decoder || !decoder->enabled || !decoder->dump_image_path || !decoder->framebuffer_xrgb8888)
+		return 0;
+	if (width == 0u || height == 0u)
+		return 0;
+
+	file = fopen(decoder->dump_image_path, "wb");
+	if (!file) {
+		perror(decoder->dump_image_path);
+		return -1;
+	}
+
+	if (fprintf(file, "P6\n%u %u\n255\n", width, height) < 0) {
+		perror("write PPM header");
+		fclose(file);
+		return -1;
+	}
+
+	row_buffer = malloc((size_t)width * 3u);
+	if (!row_buffer) {
+		fprintf(stderr, "Unable to allocate row buffer for image dump\n");
+		fclose(file);
+		return -1;
+	}
+
+	for (row = 0; row < height; ++row) {
+		const uint32_t *src = decoder->framebuffer_xrgb8888 + ((size_t)row * decoder->width);
+		uint32_t column;
+
+		for (column = 0; column < width; ++column) {
+			const uint32_t pixel = src[column];
+			row_buffer[(size_t)column * 3u] = (uint8_t)(pixel >> 16);
+			row_buffer[(size_t)column * 3u + 1u] = (uint8_t)(pixel >> 8);
+			row_buffer[(size_t)column * 3u + 2u] = (uint8_t)pixel;
+		}
+
+		if (fwrite(row_buffer, 1u, (size_t)width * 3u, file) != (size_t)width * 3u) {
+			perror("write PPM pixels");
+			free(row_buffer);
+			fclose(file);
+			return -1;
+		}
+	}
+
+	free(row_buffer);
+	if (fclose(file) != 0) {
+		perror("close PPM image");
+		return -1;
+	}
+
+	fprintf(stderr,
+		"Wrote decoded framebuffer snapshot to %s (%ux%u)\n",
+		decoder->dump_image_path,
+		width,
+		height);
+	return 0;
 }
 
 static void udl_decoder_print_summary(const struct udl_decode_runtime *decoder)
@@ -864,6 +965,7 @@ static int parse_args(int argc, char **argv, struct options *opts)
 		{ "no-bind", no_argument, NULL, 'n' },
 		{ "no-decode", no_argument, NULL, 'd' },
 		{ "no-stay-alive", no_argument, NULL, 'x' },
+		{ "dump-image", required_argument, NULL, 'o' },
 		{ "gadget-name", required_argument, NULL, 'g' },
 		{ "ffs-instance", required_argument, NULL, 'f' },
 		{ "mount-path", required_argument, NULL, 'm' },
@@ -882,7 +984,7 @@ static int parse_args(int argc, char **argv, struct options *opts)
 	};
 	int opt;
 
-	while ((opt = getopt_long(argc, argv, "cndxg:f:m:l:M:P:S:u:v:p:W:H:Vh", long_options, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "cndxo:g:f:m:l:M:P:S:u:v:p:W:H:Vh", long_options, NULL)) != -1) {
 		switch (opt) {
 		case 'c':
 			opts->cleanup_existing = true;
@@ -895,6 +997,9 @@ static int parse_args(int argc, char **argv, struct options *opts)
 			break;
 		case 'x':
 			opts->stay_alive = false;
+			break;
+		case 'o':
+			opts->dump_image_path = optarg;
 			break;
 		case 'g':
 			opts->gadget_name = optarg;
@@ -972,6 +1077,10 @@ int main(int argc, char **argv)
 	default_options(&opts);
 	if (parse_args(argc, argv, &opts) != 0) {
 		usage(argv[0]);
+		return EXIT_FAILURE;
+	}
+	if (opts.dump_image_path && !opts.decode_stream) {
+		fprintf(stderr, "--dump-image requires decoding to remain enabled\n");
 		return EXIT_FAILURE;
 	}
 	if (udl_decoder_init(&decoder, &opts) != 0) {
@@ -1095,6 +1204,8 @@ int main(int argc, char **argv)
 	ret = EXIT_SUCCESS;
 
 out:
+	if (udl_decoder_dump_image(&decoder) != 0)
+		ret = EXIT_FAILURE;
 	udl_decoder_print_summary(&decoder);
 	udl_decoder_destroy(&decoder);
 	if (ep_in_fd >= 0)
