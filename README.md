@@ -58,6 +58,8 @@ The FunctionFS gadget prototype in `displaylink_gadget_ffs.c` now links against 
 
 There is now also a parallel GadgetFS prototype in `displaylink_gadget_gadgetfs.c`. Unlike the FunctionFS version, it owns the device-level ep0 control path in userspace and can answer the specific UDL probe requests the Linux host driver cares about: the vendor firmware descriptor, the standard channel-select vendor request, and per-byte EDID reads. This is intended as the next experiment for full old-DisplayLink impersonation.
 
+There is also now a Raw Gadget fallback prototype in `displaylink_gadget_raw_gadget.c`. This exists because GadgetFS handles standard `GET_DESCRIPTOR` requests in-kernel and does not delegate unknown descriptor types like DisplayLink's `0x5f` vendor descriptor back to userspace. The Raw Gadget version owns ep0 completely, so it can answer that descriptor request directly and log every subsequent control transfer. The current Raw Gadget cut is intentionally control-plane first: it enables the bulk OUT endpoint during `SET_CONFIGURATION`, but it does not yet consume bulk traffic.
+
 Build notes:
 
 ```sh
@@ -80,6 +82,18 @@ The `displaylink_gadget_gadgetfs` prototype is a separate binary for boards wher
 
 ```sh
 sudo ./displaylink_gadget_gadgetfs --device-name fe800000.usb --verbose --dump-image /tmp/udl.ppm
+```
+
+The `displaylink_gadget_raw_gadget` prototype is the current fallback for boards where `raw_gadget` is available and the host needs to fetch the DisplayLink vendor descriptor through ep0. It auto-detects the first UDC when possible; otherwise pass both the UDC driver and device names explicitly. Example:
+
+```sh
+sudo ./displaylink_gadget_raw_gadget --udc-device fe800000.usb --verbose
+```
+
+If auto-detection does not find the correct driver name, rerun with both values, for example:
+
+```sh
+sudo ./displaylink_gadget_raw_gadget --udc-driver fe800000.usb --udc-device fe800000.usb --verbose
 ```
 
 ## Limitations

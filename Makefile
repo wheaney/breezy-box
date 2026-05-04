@@ -16,7 +16,10 @@ FFS_SOURCES := displaylink_gadget_ffs.c $(UDL_SINK_DIR)/src/udl_sink.c
 GADGETFS_TARGET := displaylink_gadget_gadgetfs
 GADGETFS_SOURCES := displaylink_gadget_gadgetfs.c $(UDL_SINK_DIR)/src/udl_sink.c
 
-TARGETS := $(FFS_TARGET) $(GADGETFS_TARGET)
+RAW_GADGET_TARGET := displaylink_gadget_raw_gadget
+RAW_GADGET_SOURCES := displaylink_gadget_raw_gadget.c
+
+TARGETS := $(FFS_TARGET) $(GADGETFS_TARGET) $(RAW_GADGET_TARGET)
 
 CPPFLAGS += -I$(UDL_SINK_DIR)/include
 
@@ -38,6 +41,9 @@ $(FFS_TARGET): check-ffs-deps $(FFS_SOURCES)
 
 $(GADGETFS_TARGET): $(GADGETFS_SOURCES)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $(GADGETFS_SOURCES)
+
+$(RAW_GADGET_TARGET): $(RAW_GADGET_SOURCES)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $(RAW_GADGET_SOURCES)
 
 clean:
 	rm -f $(TARGETS)
