@@ -61,16 +61,18 @@ There is now also a parallel GadgetFS prototype in `displaylink_gadget_gadgetfs.
 Build notes:
 
 ```sh
-sudo apt install build-essential pkg-config libusbgx-dev
+sudo apt install build-essential pkg-config libusbgx-dev libconfig-dev
 git submodule update --init --recursive
 make
 ```
 
-If `libusbgx` is already installed but `pkg-config` is not available, the FunctionFS target can also be linked explicitly with:
+If `libusbgx` is installed but its pkg-config metadata is not discoverable on the target distro, the FunctionFS target now falls back to `-lusbgx` automatically. You can still force that path manually with:
 
 ```sh
 make USBG_LIBS=-lusbgx
 ```
+
+On some Armbian/Debian installs, `libusbgx.pc` is present but `pkg-config libusbgx` still fails until `libconfig-dev` is installed, because `libusbgx.pc` declares `libconfig` as a pkg-config dependency.
 
 The resulting `displaylink_gadget_ffs` binary accepts `--decode-width` and `--decode-height` to size the sink storage, `--no-decode` to fall back to raw bulk logging while debugging the USB transport, and `--dump-image out.ppm` to snapshot the latest decoded frame when the process exits.
 

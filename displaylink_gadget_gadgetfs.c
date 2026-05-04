@@ -1526,9 +1526,6 @@ int main(int argc, char **argv)
 		goto out;
 	}
 
-	if (discover_bulk_endpoints(&runtime, opts.mount_path) != 0)
-		goto out;
-
 	if (snprintf(path, sizeof(path), "%s/%s", opts.mount_path, runtime.device_name) >= (int)sizeof(path))
 		goto out;
 	runtime.ep0_fd = open(path, O_RDWR);
@@ -1538,6 +1535,8 @@ int main(int argc, char **argv)
 	}
 
 	if (write_device_descriptors(runtime.ep0_fd, &opts, &runtime) != 0)
+		goto out;
+	if (discover_bulk_endpoints(&runtime, opts.mount_path) != 0)
 		goto out;
 	if (configure_bulk_endpoints(&runtime, opts.mount_path) != 0)
 		goto out;

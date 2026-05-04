@@ -3,8 +3,11 @@ PKG_CONFIG ?= pkg-config
 USBG_PKG ?= libusbgx
 CPPFLAGS ?=
 CFLAGS ?= -O2 -g -std=c11 -Wall -Wextra -Wpedantic
-USBG_CFLAGS ?= $(shell $(PKG_CONFIG) --cflags $(USBG_PKG) 2>/dev/null)
-USBG_LIBS ?= $(shell $(PKG_CONFIG) --libs $(USBG_PKG) 2>/dev/null)
+USBG_PKG_CFLAGS := $(shell $(PKG_CONFIG) --cflags $(USBG_PKG) 2>/dev/null)
+USBG_PKG_LIBS := $(shell $(PKG_CONFIG) --libs $(USBG_PKG) 2>/dev/null)
+USBG_FALLBACK_LIBS ?= -lusbgx
+USBG_CFLAGS ?= $(USBG_PKG_CFLAGS)
+USBG_LIBS ?= $(if $(strip $(USBG_PKG_LIBS)),$(USBG_PKG_LIBS),$(USBG_FALLBACK_LIBS))
 UDL_SINK_DIR := modules/udl_sink
 
 FFS_TARGET := displaylink_gadget_ffs
@@ -20,18 +23,14 @@ CPPFLAGS += -I$(UDL_SINK_DIR)/include
 all: $(TARGETS)
 
 check-ffs-deps:
-	@if [ -n "$(strip $(USBG_LIBS))" ]; then \
+	@printf '%s\n' '#include <usbg/usbg.h>' 'int main(void) { return 0; }' | \
+		$(CC) $(CPPFLAGS) $(CFLAGS) $(USBG_CFLAGS) -x c - -o /dev/null $(USBG_LIBS) >/dev/null 2>&1 && \
 		exit 0; \
-	fi; \
-	if ! command -v $(PKG_CONFIG) >/dev/null 2>&1; then \
-		echo "error: $(PKG_CONFIG) was not found. Install a pkg-config provider and libusbgx development files:" >&2; \
-		echo "  sudo apt install build-essential pkg-config libusbgx-dev" >&2; \
-		echo "Or override USBG_LIBS manually, for example: make USBG_LIBS=-lusbgx" >&2; \
-		exit 1; \
-	fi; \
-	echo "error: could not resolve $(USBG_PKG) linker flags via $(PKG_CONFIG)." >&2; \
-	echo "Install the libusbgx development package or override USBG_CFLAGS/USBG_LIBS manually." >&2; \
-	echo "  sudo apt install build-essential pkg-config libusbgx-dev" >&2; \
+	echo "error: unable to compile/link against libusbgx." >&2; \
+	echo "Tried USBG_CFLAGS='$(USBG_CFLAGS)' USBG_LIBS='$(USBG_LIBS)'" >&2; \
+	echo "Install the development packages or override USBG_CFLAGS/USBG_LIBS manually." >&2; \
+	echo "  sudo apt install build-essential pkg-config libusbgx-dev libconfig-dev" >&2; \
+	echo "  make USBG_LIBS=-lusbgx" >&2; \
 	exit 1
 
 $(FFS_TARGET): check-ffs-deps $(FFS_SOURCES)
