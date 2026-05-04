@@ -40,6 +40,8 @@
 #define UDL_MAX_COMMAND_PIXELS 256U
 #define DEFAULT_DECODE_WIDTH 1920U
 #define DEFAULT_DECODE_HEIGHT 1080U
+#define DEFAULT_GADGETFS_EP_OUT_ADDRESS 0x01U
+#define DEFAULT_GADGETFS_EP_IN_ADDRESS (USB_DIR_IN | DEFAULT_GADGETFS_EP_OUT_ADDRESS)
 
 #define GADGETFS_DEVICE_CONFIG_TAG 0u
 #define GADGETFS_ENDPOINT_CONFIG_TAG 1u
@@ -106,21 +108,18 @@ struct gadgetfs_runtime {
 	size_t vendor_descriptor_len;
 };
 
+struct __attribute__((packed)) gadgetfs_config_block {
+	struct usb_config_descriptor config;
+	struct usb_interface_descriptor interface;
+	struct usb_endpoint_descriptor source;
+	struct usb_endpoint_descriptor sink;
+};
+
 struct __attribute__((packed)) gadgetfs_descriptor_block {
 	uint32_t tag;
+	struct gadgetfs_config_block fs;
+	struct gadgetfs_config_block hs;
 	struct usb_device_descriptor device;
-	struct {
-		struct usb_config_descriptor config;
-		struct usb_interface_descriptor interface;
-		struct usb_endpoint_descriptor source;
-		struct usb_endpoint_descriptor sink;
-	} fs;
-	struct {
-		struct usb_config_descriptor config;
-		struct usb_interface_descriptor interface;
-		struct usb_endpoint_descriptor source;
-		struct usb_endpoint_descriptor sink;
-	} hs;
 };
 
 struct __attribute__((packed)) gadgetfs_endpoint_block {
@@ -910,10 +909,10 @@ static int parse_endpoint_name(const char *name, uint8_t *address_out, bool *bul
 	return 0;
 }
 
-static int choose_bulk_endpoint_name(const char *mount_path,
-					      bool want_in,
-					      char *buffer,
-					      size_t capacity)
+static int choose_endpoint_name_by_address(const char *mount_path,
+					    uint8_t wanted_address,
+					    char *buffer,
+					    size_t capacity)
 {
 	DIR *directory;
 	struct dirent *entry;
@@ -928,12 +927,10 @@ static int choose_bulk_endpoint_name(const char *mount_path,
 	while ((entry = readdir(directory)) != NULL) {
 		uint8_t address;
 		bool is_bulk;
-		bool is_in;
 
 		if (parse_endpoint_name(entry->d_name, &address, &is_bulk) != 0)
 			continue;
-		is_in = (address & USB_DIR_IN) != 0u;
-		if (is_in != want_in)
+		if (address != wanted_address)
 			continue;
 		if (first_match[0] == '\0')
 			snprintf(first_match, sizeof(first_match), "%s", entry->d_name);
@@ -950,8 +947,8 @@ static int choose_bulk_endpoint_name(const char *mount_path,
 	closedir(directory);
 	if (first_match[0] == '\0') {
 		fprintf(stderr,
-			"Unable to find a GadgetFS %s endpoint under %s\n",
-			want_in ? "IN" : "OUT",
+			"Unable to find GadgetFS endpoint 0x%02x under %s\n",
+			wanted_address,
 			mount_path);
 		return -1;
 	}
@@ -987,21 +984,21 @@ static int configure_endpoint_fd(int fd, uint8_t address)
 
 static int discover_bulk_endpoints(struct gadgetfs_runtime *runtime, const char *mount_path)
 {
-	uint8_t address;
-	bool is_bulk;
+	if (runtime->ep_in_address == 0u || runtime->ep_out_address == 0u) {
+		fprintf(stderr, "GadgetFS endpoints were not initialized before discovery\n");
+		return -1;
+	}
 
-	if (choose_bulk_endpoint_name(mount_path, true, runtime->ep_in_name, sizeof(runtime->ep_in_name)) != 0)
+	if (choose_endpoint_name_by_address(mount_path,
+					   runtime->ep_in_address,
+					   runtime->ep_in_name,
+					   sizeof(runtime->ep_in_name)) != 0)
 		return -1;
-	if (choose_bulk_endpoint_name(mount_path, false, runtime->ep_out_name, sizeof(runtime->ep_out_name)) != 0)
+	if (choose_endpoint_name_by_address(mount_path,
+					   runtime->ep_out_address,
+					   runtime->ep_out_name,
+					   sizeof(runtime->ep_out_name)) != 0)
 		return -1;
-
-	if (parse_endpoint_name(runtime->ep_in_name, &address, &is_bulk) != 0)
-		return -1;
-	runtime->ep_in_address = address;
-
-	if (parse_endpoint_name(runtime->ep_out_name, &address, &is_bulk) != 0)
-		return -1;
-	runtime->ep_out_address = address;
 
 	return 0;
 }
@@ -1035,7 +1032,7 @@ static void build_descriptor_block(struct gadgetfs_descriptor_block *block,
 					 const struct options *opts,
 					 const struct gadgetfs_runtime *runtime)
 {
-	const uint16_t total_length = (uint16_t)sizeof(block->fs);
+	const uint16_t total_length = (uint16_t)sizeof(struct gadgetfs_config_block);
 	const uint8_t source_address = runtime->ep_in_address;
 	const uint8_t sink_address = runtime->ep_out_address;
 
@@ -1502,6 +1499,8 @@ int main(int argc, char **argv)
 	runtime.ep0_fd = -1;
 	runtime.ep_in_fd = -1;
 	runtime.ep_out_fd = -1;
+	runtime.ep_in_address = DEFAULT_GADGETFS_EP_IN_ADDRESS;
+	runtime.ep_out_address = DEFAULT_GADGETFS_EP_OUT_ADDRESS;
 	runtime.verbose = opts.verbose;
 	build_default_edid(runtime.edid);
 
