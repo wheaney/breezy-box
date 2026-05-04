@@ -86,6 +86,15 @@ sudo ./displaylink_gadget_gadgetfs --device-name fe800000.usb --verbose --dump-i
 
 The `displaylink_gadget_raw_gadget` prototype is the current fallback for boards where `raw_gadget` is available and the host needs to fetch the DisplayLink vendor descriptor through ep0. It auto-detects the first UDC when possible; otherwise pass both the UDC driver and device names explicitly. Example:
 
+Before running it, make sure the Raw Gadget misc device exists. On modular kernels that usually means loading the module first:
+
+```sh
+sudo modprobe raw_gadget
+ls -l /dev/raw-gadget
+```
+
+If `/dev/raw-gadget` still does not exist after that, the current kernel likely does not expose `CONFIG_USB_RAW_GADGET`.
+
 ```sh
 sudo ./displaylink_gadget_raw_gadget --udc-device fe800000.usb --verbose
 ```

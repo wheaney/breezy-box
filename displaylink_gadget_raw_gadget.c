@@ -237,6 +237,65 @@ static const char *path_basename(const char *path)
 	return slash ? slash + 1 : path;
 }
 
+static int read_single_line_file(const char *path,
+				 char *buffer,
+				 size_t capacity)
+{
+	FILE *stream;
+
+	if (capacity == 0u)
+		return -1;
+
+	stream = fopen(path, "r");
+	if (!stream)
+		return -1;
+	if (!fgets(buffer, (int)capacity, stream)) {
+		fclose(stream);
+		return -1;
+	}
+	fclose(stream);
+
+	buffer[strcspn(buffer, "\r\n")] = '\0';
+	return 0;
+}
+
+static int read_uevent_value(const char *path,
+			     const char *key,
+			     char *buffer,
+			     size_t capacity)
+{
+	FILE *stream;
+	char line[512];
+
+	if (capacity == 0u)
+		return -1;
+
+	stream = fopen(path, "r");
+	if (!stream)
+		return -1;
+
+	while (fgets(line, sizeof(line), stream)) {
+		char *equals;
+
+		line[strcspn(line, "\r\n")] = '\0';
+		equals = strchr(line, '=');
+		if (!equals)
+			continue;
+		*equals++ = '\0';
+		if (strcmp(line, key) != 0)
+			continue;
+		if (snprintf(buffer, capacity, "%s", equals) >= (int)capacity) {
+			fclose(stream);
+			return -1;
+		}
+		fclose(stream);
+		return 0;
+	}
+
+	fclose(stream);
+	return -1;
+}
+
 static int auto_detect_udc(char *driver_buffer,
 			       size_t driver_capacity,
 			       char *device_buffer,
@@ -245,6 +304,7 @@ static int auto_detect_udc(char *driver_buffer,
 	DIR *directory;
 	struct dirent *entry;
 	int found = 0;
+	char uevent_path[512];
 	char symlink_path[512];
 	char driver_target[512];
 	ssize_t link_len;
@@ -275,6 +335,18 @@ static int auto_detect_udc(char *driver_buffer,
 		fprintf(stderr, "Unable to auto-detect a UDC under /sys/class/udc\n");
 		return -1;
 	}
+
+	if (snprintf(uevent_path,
+		     sizeof(uevent_path),
+		     "/sys/class/udc/%s/uevent",
+		     device_buffer) >= (int)sizeof(uevent_path))
+		return -1;
+
+	if (read_uevent_value(uevent_path,
+			      "USB_UDC_NAME",
+			      driver_buffer,
+			      driver_capacity) == 0)
+		return 0;
 
 	if (snprintf(symlink_path,
 		     sizeof(symlink_path),
@@ -620,6 +692,78 @@ static int raw_eps_info(int fd, struct usb_raw_eps_info *info)
 {
 	memset(info, 0, sizeof(*info));
 	return ioctl(fd, USB_RAW_IOCTL_EPS_INFO, info);
+}
+
+static void report_raw_run_failure(const char *udc_driver,
+				  const char *udc_device,
+				  int error_code)
+{
+	char function_path[512];
+	char function_name[256];
+	char uevent_path[512];
+	char gadget_name[UDC_NAME_LENGTH_MAX];
+
+	errno = error_code;
+	perror("ioctl USB_RAW_IOCTL_RUN");
+
+	if (error_code != EBUSY)
+		return;
+
+	fprintf(stderr,
+		"Raw Gadget could not bind to an available UDC. This usually means the selected UDC is already owned by another gadget driver, or the --udc-driver name did not match the kernel's UDC gadget name.\n");
+	fprintf(stderr,
+		"Requested Raw Gadget bind: udc_driver=%s udc_device=%s\n",
+		udc_driver,
+		udc_device);
+
+	if (snprintf(function_path,
+		     sizeof(function_path),
+		     "/sys/class/udc/%s/function",
+		     udc_device) < (int)sizeof(function_path) &&
+	    read_single_line_file(function_path,
+				  function_name,
+				  sizeof(function_name)) == 0 &&
+	    function_name[0] != '\0') {
+		fprintf(stderr,
+			"The UDC currently reports gadget function '%s'. Stop that owner before retrying.\n",
+			function_name);
+	}
+
+	if (snprintf(uevent_path,
+		     sizeof(uevent_path),
+		     "/sys/class/udc/%s/uevent",
+		     udc_device) < (int)sizeof(uevent_path) &&
+	    read_uevent_value(uevent_path,
+			      "USB_UDC_NAME",
+			      gadget_name,
+			      sizeof(gadget_name)) == 0 &&
+	    strcmp(gadget_name, udc_driver) != 0) {
+		fprintf(stderr,
+			"The kernel reports USB_UDC_NAME='%s' for UDC '%s'. If the controller is otherwise idle, retry with '--udc-driver %s --udc-device %s'.\n",
+			gadget_name,
+			udc_device,
+			gadget_name,
+			udc_device);
+	}
+
+	fprintf(stderr,
+		"Common competing owners here are a lingering GadgetFS process, a configfs gadget, or another legacy gadget driver.\n");
+}
+
+static void report_raw_device_open_failure(const char *path, int error_code)
+{
+	errno = error_code;
+	perror(path);
+
+	if (error_code != ENOENT)
+		return;
+
+	fprintf(stderr,
+		"Raw Gadget device node '%s' is missing. This usually means the raw_gadget module is not loaded or this kernel was built without CONFIG_USB_RAW_GADGET.\n",
+		path);
+	fprintf(stderr,
+		"Try 'sudo modprobe raw_gadget'. If that fails or '%s' still does not appear, Raw Gadget is not available on the current kernel.\n",
+		path);
 }
 
 static int choose_bulk_out_address(struct raw_runtime *runtime)
@@ -1052,14 +1196,16 @@ int main(int argc, char **argv)
 		return EXIT_FAILURE;
 	}
 
-	if (opts.udc_driver && opts.udc_device) {
-		if (snprintf(udc_driver, sizeof(udc_driver), "%s", opts.udc_driver) >= (int)sizeof(udc_driver))
-			return EXIT_FAILURE;
-		if (snprintf(udc_device, sizeof(udc_device), "%s", opts.udc_device) >= (int)sizeof(udc_device))
-			return EXIT_FAILURE;
-	} else if (auto_detect_udc(udc_driver, sizeof(udc_driver), udc_device, sizeof(udc_device)) != 0) {
+	if ((!opts.udc_driver || !opts.udc_device) &&
+	    auto_detect_udc(udc_driver, sizeof(udc_driver), udc_device, sizeof(udc_device)) != 0) {
 		return EXIT_FAILURE;
 	}
+	if (opts.udc_driver &&
+	    snprintf(udc_driver, sizeof(udc_driver), "%s", opts.udc_driver) >= (int)sizeof(udc_driver))
+		return EXIT_FAILURE;
+	if (opts.udc_device &&
+	    snprintf(udc_device, sizeof(udc_device), "%s", opts.udc_device) >= (int)sizeof(udc_device))
+		return EXIT_FAILURE;
 
 	memset(&runtime, 0, sizeof(runtime));
 	runtime.fd = -1;
@@ -1073,7 +1219,7 @@ int main(int argc, char **argv)
 
 	runtime.fd = open(opts.raw_device_path, O_RDWR);
 	if (runtime.fd < 0) {
-		perror(opts.raw_device_path);
+		report_raw_device_open_failure(opts.raw_device_path, errno);
 		goto out;
 	}
 
@@ -1082,7 +1228,7 @@ int main(int argc, char **argv)
 		goto out;
 	}
 	if (raw_run(runtime.fd) != 0) {
-		perror("ioctl USB_RAW_IOCTL_RUN");
+		report_raw_run_failure(udc_driver, udc_device, errno);
 		goto out;
 	}
 
