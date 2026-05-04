@@ -95,6 +95,7 @@ struct gadgetfs_runtime {
 	int ep0_fd;
 	int ep_in_fd;
 	int ep_out_fd;
+	const char *mount_path;
 	char device_name[256];
 	char ep_in_name[256];
 	char ep_out_name[256];
@@ -1188,6 +1189,56 @@ static int write_control_response(int ep0_fd, const void *data, uint16_t request
 	return 0;
 }
 
+static int ack_control_status_out(int ep0_fd)
+{
+	uint8_t dummy = 0u;
+
+	if (read(ep0_fd, &dummy, 0) < 0) {
+		perror("ack ep0 status OUT");
+		return -1;
+	}
+
+	return 0;
+}
+
+static void close_bulk_endpoints(struct gadgetfs_runtime *runtime)
+{
+	if (runtime->ep_out_fd >= 0) {
+		close(runtime->ep_out_fd);
+		runtime->ep_out_fd = -1;
+	}
+	if (runtime->ep_in_fd >= 0) {
+		close(runtime->ep_in_fd);
+		runtime->ep_in_fd = -1;
+	}
+	runtime->ep_in_name[0] = '\0';
+	runtime->ep_out_name[0] = '\0';
+}
+
+static int ensure_bulk_endpoints_configured(struct gadgetfs_runtime *runtime)
+{
+	if (runtime->ep_in_fd >= 0 && runtime->ep_out_fd >= 0)
+		return 0;
+	if (!runtime->mount_path) {
+		fprintf(stderr, "GadgetFS mount path is not initialized\n");
+		return -1;
+	}
+
+	close_bulk_endpoints(runtime);
+	if (discover_bulk_endpoints(runtime, runtime->mount_path) != 0)
+		return -1;
+	if (configure_bulk_endpoints(runtime, runtime->mount_path) != 0) {
+		close_bulk_endpoints(runtime);
+		return -1;
+	}
+
+	fprintf(stdout,
+		"Configured GadgetFS bulk endpoints. ep_in=%s ep_out=%s\n",
+		runtime->ep_in_name,
+		runtime->ep_out_name);
+	return 0;
+}
+
 static int handle_udl_vendor_request(struct gadgetfs_runtime *runtime,
 					     const struct usb_ctrlrequest *setup)
 {
@@ -1252,13 +1303,19 @@ static int handle_standard_request(struct gadgetfs_runtime *runtime,
 		return write_control_response(runtime->ep0_fd, buffer, length, 1u);
 	case USB_REQ_SET_CONFIGURATION:
 		runtime->current_configuration = (uint8_t)(value & 0xffu);
-		return 0;
+		if (runtime->current_configuration != 0u) {
+			if (ensure_bulk_endpoints_configured(runtime) != 0)
+				return -1;
+		} else {
+			close_bulk_endpoints(runtime);
+		}
+		return ack_control_status_out(runtime->ep0_fd);
 	case USB_REQ_GET_INTERFACE:
 		buffer[0] = 0u;
 		return write_control_response(runtime->ep0_fd, buffer, length, 1u);
 	case USB_REQ_SET_INTERFACE:
 		(void)index;
-		return 0;
+		return ack_control_status_out(runtime->ep0_fd);
 	case USB_REQ_GET_DESCRIPTOR:
 		switch ((uint8_t)(value >> 8)) {
 		case USB_DT_STRING:
@@ -1335,6 +1392,11 @@ static int handle_ep0_events(struct gadgetfs_runtime *runtime)
 				gadgetfs_event_name(events[i].type),
 				speed_name(events[i].u.speed));
 			break;
+		case GADGETFS_DISCONNECT:
+			runtime->current_configuration = 0u;
+			close_bulk_endpoints(runtime);
+			fprintf(stderr, "GadgetFS event: %s\n", gadgetfs_event_name(events[i].type));
+			break;
 		default:
 			fprintf(stderr,
 				"GadgetFS event: %s\n",
@@ -1350,13 +1412,13 @@ static int run_loop(struct gadgetfs_runtime *runtime)
 {
 	struct pollfd pollfds[2];
 
-	pollfds[0].fd = runtime->ep0_fd;
-	pollfds[0].events = POLLIN;
-	pollfds[1].fd = runtime->ep_out_fd;
-	pollfds[1].events = POLLIN;
-
 	while (!stop_requested) {
 		uint8_t bulk_buffer[65536];
+
+		pollfds[0].fd = runtime->ep0_fd;
+		pollfds[0].events = POLLIN;
+		pollfds[1].fd = runtime->ep_out_fd;
+		pollfds[1].events = runtime->ep_out_fd >= 0 ? POLLIN : 0;
 		int poll_ret = poll(pollfds, 2, 250);
 
 		if (poll_ret < 0) {
@@ -1499,6 +1561,7 @@ int main(int argc, char **argv)
 	runtime.ep0_fd = -1;
 	runtime.ep_in_fd = -1;
 	runtime.ep_out_fd = -1;
+	runtime.mount_path = opts.mount_path;
 	runtime.ep_in_address = DEFAULT_GADGETFS_EP_IN_ADDRESS;
 	runtime.ep_out_address = DEFAULT_GADGETFS_EP_OUT_ADDRESS;
 	runtime.verbose = opts.verbose;
@@ -1535,17 +1598,11 @@ int main(int argc, char **argv)
 
 	if (write_device_descriptors(runtime.ep0_fd, &opts, &runtime) != 0)
 		goto out;
-	if (discover_bulk_endpoints(&runtime, opts.mount_path) != 0)
-		goto out;
-	if (configure_bulk_endpoints(&runtime, opts.mount_path) != 0)
-		goto out;
 
 	fprintf(stdout,
-		"DisplayLink GadgetFS gadget prepared. device=%s mount=%s ep_in=%s ep_out=%s\n",
+		"DisplayLink GadgetFS gadget prepared. device=%s mount=%s awaiting SET_CONFIGURATION\n",
 		runtime.device_name,
-		opts.mount_path,
-		runtime.ep_in_name,
-		runtime.ep_out_name);
+		opts.mount_path);
 
 	if (opts.stay_alive) {
 		fprintf(stdout, "Entering GadgetFS event loop. Press Ctrl+C to stop.\n");
@@ -1561,10 +1618,7 @@ out:
 		ret = EXIT_FAILURE;
 	udl_decoder_print_summary(&runtime.decoder);
 	udl_decoder_destroy(&runtime.decoder);
-	if (runtime.ep_out_fd >= 0)
-		close(runtime.ep_out_fd);
-	if (runtime.ep_in_fd >= 0)
-		close(runtime.ep_in_fd);
+	close_bulk_endpoints(&runtime);
 	if (runtime.ep0_fd >= 0)
 		close(runtime.ep0_fd);
 	return ret;
