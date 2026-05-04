@@ -1300,6 +1300,26 @@ static int ack_control_status_out(int ep0_fd)
 	return 0;
 }
 
+static int stall_control_request(int ep0_fd, bool setup_in)
+{
+	uint8_t dummy = 0u;
+	ssize_t rc;
+
+	if (setup_in)
+		rc = read(ep0_fd, &dummy, sizeof(dummy));
+	else
+		rc = write(ep0_fd, &dummy, sizeof(dummy));
+
+	if (rc < 0) {
+		if (errno == EL2HLT)
+			return 0;
+		perror("stall ep0 request");
+		return -1;
+	}
+
+	return 0;
+}
+
 static void close_bulk_endpoints(struct gadgetfs_runtime *runtime)
 {
 	if (runtime->ep_out_fd >= 0) {
@@ -1462,8 +1482,9 @@ static int handle_setup_request(struct gadgetfs_runtime *runtime,
 		return rc;
 
 	if (runtime->verbose)
-		fprintf(stderr, "Unhandled setup request, leaving it to stall\n");
-	return 0;
+		fprintf(stderr, "Unhandled setup request, explicitly stalling ep0\n");
+	return stall_control_request(runtime->ep0_fd,
+				     (setup->bRequestType & USB_DIR_IN) != 0);
 }
 
 static int handle_ep0_events(struct gadgetfs_runtime *runtime)
