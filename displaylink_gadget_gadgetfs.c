@@ -1027,7 +1027,7 @@ static int configure_bulk_endpoints(struct gadgetfs_runtime *runtime, const char
 	char path[512];
 
 	snprintf(path, sizeof(path), "%s/%s", mount_path, runtime->ep_in_name);
-	runtime->ep_in_fd = open(path, O_RDWR);
+	runtime->ep_in_fd = open(path, O_RDWR | O_NONBLOCK);
 	if (runtime->ep_in_fd < 0) {
 		perror(path);
 		return -1;
@@ -1036,7 +1036,7 @@ static int configure_bulk_endpoints(struct gadgetfs_runtime *runtime, const char
 		return -1;
 
 	snprintf(path, sizeof(path), "%s/%s", mount_path, runtime->ep_out_name);
-	runtime->ep_out_fd = open(path, O_RDWR);
+	runtime->ep_out_fd = open(path, O_RDWR | O_NONBLOCK);
 	if (runtime->ep_out_fd < 0) {
 		perror(path);
 		return -1;
@@ -1452,6 +1452,9 @@ static int run_loop(struct gadgetfs_runtime *runtime)
 			if (handle_ep0_events(runtime) != 0)
 				return -1;
 		}
+		if (pollfds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+			fprintf(stderr, "ep0 poll revents=0x%x\n", pollfds[0].revents);
+		}
 
 		if (pollfds[1].revents & POLLIN) {
 			ssize_t read_len = read(runtime->ep_out_fd, bulk_buffer, sizeof(bulk_buffer));
@@ -1474,6 +1477,10 @@ static int run_loop(struct gadgetfs_runtime *runtime)
 				if (udl_decoder_feed(&runtime->decoder, bulk_buffer, (size_t)read_len) != 0)
 					return -1;
 			}
+		}
+		if (pollfds[1].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+			if (runtime->verbose)
+				fprintf(stderr, "bulk OUT poll revents=0x%x\n", pollfds[1].revents);
 		}
 	}
 
