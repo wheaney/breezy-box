@@ -102,6 +102,7 @@ struct gadgetfs_runtime {
 	uint8_t ep_in_address;
 	uint8_t ep_out_address;
 	uint8_t current_configuration;
+	bool bulk_endpoints_pending;
 	bool verbose;
 	struct udl_decode_runtime decoder;
 	uint8_t edid[128];
@@ -1322,9 +1323,9 @@ static int handle_standard_request(struct gadgetfs_runtime *runtime,
 	case USB_REQ_SET_CONFIGURATION:
 		runtime->current_configuration = (uint8_t)(value & 0xffu);
 		if (runtime->current_configuration != 0u) {
-			if (ensure_bulk_endpoints_configured(runtime) != 0)
-				return -1;
+			runtime->bulk_endpoints_pending = true;
 		} else {
+			runtime->bulk_endpoints_pending = false;
 			close_bulk_endpoints(runtime);
 		}
 		return ack_control_status_out(runtime->ep0_fd);
@@ -1412,6 +1413,7 @@ static int handle_ep0_events(struct gadgetfs_runtime *runtime)
 			break;
 		case GADGETFS_DISCONNECT:
 			runtime->current_configuration = 0u;
+			runtime->bulk_endpoints_pending = false;
 			close_bulk_endpoints(runtime);
 			fprintf(stderr, "GadgetFS event: %s\n", gadgetfs_event_name(events[i].type));
 			break;
@@ -1432,6 +1434,12 @@ static int run_loop(struct gadgetfs_runtime *runtime)
 
 	while (!stop_requested) {
 		uint8_t bulk_buffer[65536];
+
+		if (runtime->bulk_endpoints_pending) {
+			if (ensure_bulk_endpoints_configured(runtime) != 0)
+				return -1;
+			runtime->bulk_endpoints_pending = false;
+		}
 
 		pollfds[0].fd = runtime->ep0_fd;
 		pollfds[0].events = POLLIN;
