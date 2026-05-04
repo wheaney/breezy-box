@@ -95,6 +95,7 @@ struct gadgetfs_runtime {
 	int ep0_fd;
 	int ep_in_fd;
 	int ep_out_fd;
+	int signal_fd;
 	const char *mount_path;
 	char device_name[256];
 	char ep_in_name[256];
@@ -103,6 +104,7 @@ struct gadgetfs_runtime {
 	uint8_t ep_out_address;
 	uint8_t current_configuration;
 	bool bulk_endpoints_pending;
+	bool mounted_gadgetfs;
 	bool verbose;
 	struct udl_decode_runtime decoder;
 	uint8_t edid[128];
@@ -158,6 +160,7 @@ static const uint8_t k_std_channel[16] = {
 };
 
 static volatile sig_atomic_t stop_requested = 0;
+static int signal_pipe_fds[2] = { -1, -1 };
 
 #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
 #define host_to_le16(value) ((uint16_t)(value))
@@ -186,8 +189,14 @@ static void usage(const char *argv0)
 
 static void on_signal(int signo)
 {
+	const uint8_t byte = (uint8_t)signo;
+	int saved_errno = errno;
+
 	(void)signo;
 	stop_requested = 1;
+	if (signal_pipe_fds[1] >= 0)
+		(void)write(signal_pipe_fds[1], &byte, sizeof(byte));
+	errno = saved_errno;
 }
 
 static void install_signal_handlers(void)
@@ -196,8 +205,60 @@ static void install_signal_handlers(void)
 
 	memset(&action, 0, sizeof(action));
 	action.sa_handler = on_signal;
+	sigemptyset(&action.sa_mask);
 	sigaction(SIGINT, &action, NULL);
 	sigaction(SIGTERM, &action, NULL);
+	sigaction(SIGHUP, &action, NULL);
+	sigaction(SIGQUIT, &action, NULL);
+}
+
+static int setup_signal_pipe(struct gadgetfs_runtime *runtime)
+{
+	int flags;
+
+	if (pipe(signal_pipe_fds) != 0) {
+		perror("pipe signal wakeup");
+		return -1;
+	}
+
+	flags = fcntl(signal_pipe_fds[0], F_GETFL, 0);
+	if (flags >= 0)
+		(void)fcntl(signal_pipe_fds[0], F_SETFL, flags | O_NONBLOCK);
+	flags = fcntl(signal_pipe_fds[1], F_GETFL, 0);
+	if (flags >= 0)
+		(void)fcntl(signal_pipe_fds[1], F_SETFL, flags | O_NONBLOCK);
+	(void)fcntl(signal_pipe_fds[0], F_SETFD, FD_CLOEXEC);
+	(void)fcntl(signal_pipe_fds[1], F_SETFD, FD_CLOEXEC);
+	runtime->signal_fd = signal_pipe_fds[0];
+	return 0;
+}
+
+static void teardown_signal_pipe(struct gadgetfs_runtime *runtime)
+{
+	if (signal_pipe_fds[0] >= 0) {
+		close(signal_pipe_fds[0]);
+		signal_pipe_fds[0] = -1;
+	}
+	if (signal_pipe_fds[1] >= 0) {
+		close(signal_pipe_fds[1]);
+		signal_pipe_fds[1] = -1;
+	}
+	runtime->signal_fd = -1;
+}
+
+static void drain_signal_pipe(int fd)
+{
+	uint8_t buffer[32];
+
+	while (fd >= 0) {
+		ssize_t read_len = read(fd, buffer, sizeof(buffer));
+
+		if (read_len > 0)
+			continue;
+		if (read_len < 0 && errno == EINTR)
+			continue;
+		break;
+	}
 }
 
 static int parse_hex16(const char *text, uint16_t *value)
@@ -840,7 +901,7 @@ static void build_vendor_descriptor(struct gadgetfs_runtime *runtime)
 	runtime->vendor_descriptor_len = 12u;
 }
 
-static int mount_gadgetfs(const struct options *opts)
+static int mount_gadgetfs(const struct options *opts, struct gadgetfs_runtime *runtime)
 {
 	if (mkdir_p(opts->mount_path) != 0) {
 		perror("mkdir_p gadgetfs mount");
@@ -852,9 +913,25 @@ static int mount_gadgetfs(const struct options *opts)
 			perror("mount gadgetfs");
 			return -1;
 		}
+		runtime->mounted_gadgetfs = false;
+	} else {
+		runtime->mounted_gadgetfs = true;
 	}
 
 	return 0;
+}
+
+static void cleanup_gadgetfs_mount(struct gadgetfs_runtime *runtime)
+{
+	if (!runtime->mounted_gadgetfs || !runtime->mount_path)
+		return;
+	if (umount(runtime->mount_path) == 0)
+		return;
+	if (errno == EINVAL || errno == ENOENT)
+		return;
+	if (umount2(runtime->mount_path, MNT_DETACH) == 0)
+		return;
+	perror("umount gadgetfs");
 }
 
 static int copy_auto_detected_device_name(const char *mount_path, char *buffer, size_t capacity)
@@ -1430,7 +1507,7 @@ static int handle_ep0_events(struct gadgetfs_runtime *runtime)
 
 static int run_loop(struct gadgetfs_runtime *runtime)
 {
-	struct pollfd pollfds[2];
+	struct pollfd pollfds[3];
 
 	while (!stop_requested) {
 		uint8_t bulk_buffer[65536];
@@ -1445,7 +1522,9 @@ static int run_loop(struct gadgetfs_runtime *runtime)
 		pollfds[0].events = POLLIN;
 		pollfds[1].fd = runtime->ep_out_fd;
 		pollfds[1].events = runtime->ep_out_fd >= 0 ? POLLIN : 0;
-		int poll_ret = poll(pollfds, 2, 250);
+		pollfds[2].fd = runtime->signal_fd;
+		pollfds[2].events = runtime->signal_fd >= 0 ? POLLIN : 0;
+		int poll_ret = poll(pollfds, 3, 250);
 
 		if (poll_ret < 0) {
 			if (errno == EINTR)
@@ -1490,6 +1569,9 @@ static int run_loop(struct gadgetfs_runtime *runtime)
 			if (runtime->verbose)
 				fprintf(stderr, "bulk OUT poll revents=0x%x\n", pollfds[1].revents);
 		}
+
+		if (pollfds[2].revents & POLLIN)
+			drain_signal_pipe(runtime->signal_fd);
 	}
 
 	return 0;
@@ -1594,10 +1676,12 @@ int main(int argc, char **argv)
 	runtime.ep0_fd = -1;
 	runtime.ep_in_fd = -1;
 	runtime.ep_out_fd = -1;
+	runtime.signal_fd = -1;
 	runtime.mount_path = opts.mount_path;
 	runtime.ep_in_address = DEFAULT_GADGETFS_EP_IN_ADDRESS;
 	runtime.ep_out_address = DEFAULT_GADGETFS_EP_OUT_ADDRESS;
 	runtime.verbose = opts.verbose;
+	stop_requested = 0;
 	build_default_edid(runtime.edid);
 
 	if (udl_decoder_init(&runtime.decoder, &opts) != 0) {
@@ -1609,7 +1693,7 @@ int main(int argc, char **argv)
 	}
 	build_vendor_descriptor(&runtime);
 
-	if (mount_gadgetfs(&opts) != 0)
+	if (mount_gadgetfs(&opts, &runtime) != 0)
 		goto out;
 
 	if (opts.device_name) {
@@ -1625,7 +1709,10 @@ int main(int argc, char **argv)
 		goto out;
 	runtime.ep0_fd = open(path, O_RDWR);
 	if (runtime.ep0_fd < 0) {
-		perror(path);
+		if (errno == EBUSY)
+			fprintf(stderr, "%s: Device or resource busy (another GadgetFS process may still hold ep0)\n", path);
+		else
+			perror(path);
 		goto out;
 	}
 
@@ -1638,6 +1725,8 @@ int main(int argc, char **argv)
 		opts.mount_path);
 
 	if (opts.stay_alive) {
+		if (setup_signal_pipe(&runtime) != 0)
+			goto out;
 		fprintf(stdout, "Entering GadgetFS event loop. Press Ctrl+C to stop.\n");
 		install_signal_handlers();
 		if (run_loop(&runtime) != 0)
@@ -1654,5 +1743,7 @@ out:
 	close_bulk_endpoints(&runtime);
 	if (runtime.ep0_fd >= 0)
 		close(runtime.ep0_fd);
+	teardown_signal_pipe(&runtime);
+	cleanup_gadgetfs_mount(&runtime);
 	return ret;
 }
