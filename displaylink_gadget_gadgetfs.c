@@ -109,11 +109,20 @@ struct gadgetfs_runtime {
 	size_t vendor_descriptor_len;
 };
 
+struct __attribute__((packed)) gadgetfs_endpoint_descriptor {
+	uint8_t bLength;
+	uint8_t bDescriptorType;
+	uint8_t bEndpointAddress;
+	uint8_t bmAttributes;
+	uint16_t wMaxPacketSize;
+	uint8_t bInterval;
+};
+
 struct __attribute__((packed)) gadgetfs_config_block {
 	struct usb_config_descriptor config;
 	struct usb_interface_descriptor interface;
-	struct usb_endpoint_descriptor source;
-	struct usb_endpoint_descriptor sink;
+	struct gadgetfs_endpoint_descriptor source;
+	struct gadgetfs_endpoint_descriptor sink;
 };
 
 struct __attribute__((packed)) gadgetfs_descriptor_block {
@@ -125,9 +134,18 @@ struct __attribute__((packed)) gadgetfs_descriptor_block {
 
 struct __attribute__((packed)) gadgetfs_endpoint_block {
 	uint32_t tag;
-	struct usb_endpoint_descriptor fs;
-	struct usb_endpoint_descriptor hs;
+	struct gadgetfs_endpoint_descriptor fs;
+	struct gadgetfs_endpoint_descriptor hs;
 };
+
+_Static_assert(sizeof(struct gadgetfs_endpoint_descriptor) == USB_DT_ENDPOINT_SIZE,
+	       "GadgetFS endpoint descriptors must be 7 bytes");
+_Static_assert(sizeof(struct gadgetfs_config_block) ==
+	       USB_DT_CONFIG_SIZE + USB_DT_INTERFACE_SIZE + (2u * USB_DT_ENDPOINT_SIZE),
+	       "GadgetFS config block size must match descriptor lengths");
+_Static_assert(sizeof(struct gadgetfs_endpoint_block) ==
+	       sizeof(uint32_t) + (2u * USB_DT_ENDPOINT_SIZE),
+	       "GadgetFS endpoint block size must match endpoint descriptor lengths");
 
 static const char *const k_string_manufacturer = "DisplayLink";
 static const char *const k_string_product = "DisplayLink Adapter";
