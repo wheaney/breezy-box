@@ -61,6 +61,7 @@ struct options {
 	uint16_t product_id;
 	uint32_t decode_width;
 	uint32_t decode_height;
+	bool enable_bulk_read;
 	bool decode_stream;
 	bool stay_alive;
 	bool verbose;
@@ -104,6 +105,7 @@ struct gadgetfs_runtime {
 	uint8_t ep_out_address;
 	uint8_t current_configuration;
 	bool bulk_endpoints_pending;
+	bool enable_bulk_read;
 	bool mounted_gadgetfs;
 	bool verbose;
 	struct udl_decode_runtime decoder;
@@ -178,6 +180,7 @@ static void usage(const char *argv0)
 		"  --device-name NAME      GadgetFS device file name under the mount path\n"
 		"  --vendor-id HEX         USB vendor ID (default: 0x17e9)\n"
 		"  --product-id HEX        USB product ID (default: 0x0104)\n"
+		"  --enable-bulk-read      Read bulk OUT data after configuration (experimental)\n"
 		"  --no-stay-alive         Exit after descriptors and endpoint configuration\n"
 		"  --no-decode             Leave bulk traffic undecoded and only log packet sizes\n"
 		"  --decode-width PIXELS   Sink storage width for decoded traffic (default: 1920)\n"
@@ -1521,7 +1524,7 @@ static int run_loop(struct gadgetfs_runtime *runtime)
 		pollfds[0].fd = runtime->ep0_fd;
 		pollfds[0].events = POLLIN;
 		pollfds[1].fd = runtime->ep_out_fd;
-		pollfds[1].events = runtime->ep_out_fd >= 0 ? POLLIN : 0;
+		pollfds[1].events = (runtime->enable_bulk_read && runtime->ep_out_fd >= 0) ? POLLIN : 0;
 		pollfds[2].fd = runtime->signal_fd;
 		pollfds[2].events = runtime->signal_fd >= 0 ? POLLIN : 0;
 		int poll_ret = poll(pollfds, 3, 250);
@@ -1585,6 +1588,7 @@ static void default_options(struct options *opts)
 	opts->product_id = DISPLAYLINK_PRODUCT_ID;
 	opts->decode_width = DEFAULT_DECODE_WIDTH;
 	opts->decode_height = DEFAULT_DECODE_HEIGHT;
+	opts->enable_bulk_read = false;
 	opts->decode_stream = true;
 	opts->stay_alive = true;
 	opts->verbose = false;
@@ -1597,6 +1601,7 @@ static int parse_args(int argc, char **argv, struct options *opts)
 		{ "device-name", required_argument, NULL, 'D' },
 		{ "vendor-id", required_argument, NULL, 'v' },
 		{ "product-id", required_argument, NULL, 'p' },
+		{ "enable-bulk-read", no_argument, NULL, 'B' },
 		{ "no-stay-alive", no_argument, NULL, 'x' },
 		{ "no-decode", no_argument, NULL, 'd' },
 		{ "decode-width", required_argument, NULL, 'W' },
@@ -1608,7 +1613,7 @@ static int parse_args(int argc, char **argv, struct options *opts)
 	};
 	int opt;
 
-	while ((opt = getopt_long(argc, argv, "m:D:v:p:xdW:H:o:Vh", long_options, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "m:D:v:p:BxdW:H:o:Vh", long_options, NULL)) != -1) {
 		switch (opt) {
 		case 'm':
 			opts->mount_path = optarg;
@@ -1623,6 +1628,9 @@ static int parse_args(int argc, char **argv, struct options *opts)
 		case 'p':
 			if (parse_hex16(optarg, &opts->product_id) != 0)
 				return -1;
+			break;
+		case 'B':
+			opts->enable_bulk_read = true;
 			break;
 		case 'x':
 			opts->stay_alive = false;
@@ -1680,6 +1688,7 @@ int main(int argc, char **argv)
 	runtime.mount_path = opts.mount_path;
 	runtime.ep_in_address = DEFAULT_GADGETFS_EP_IN_ADDRESS;
 	runtime.ep_out_address = DEFAULT_GADGETFS_EP_OUT_ADDRESS;
+	runtime.enable_bulk_read = opts.enable_bulk_read;
 	runtime.verbose = opts.verbose;
 	stop_requested = 0;
 	build_default_edid(runtime.edid);
@@ -1727,6 +1736,9 @@ int main(int argc, char **argv)
 	if (opts.stay_alive) {
 		if (setup_signal_pipe(&runtime) != 0)
 			goto out;
+		if (!runtime.enable_bulk_read)
+			fprintf(stdout,
+				"Bulk OUT reads are disabled by default on GadgetFS/DWC3 to avoid unkillable hangs; use --enable-bulk-read to opt in.\n");
 		fprintf(stdout, "Entering GadgetFS event loop. Press Ctrl+C to stop.\n");
 		install_signal_handlers();
 		if (run_loop(&runtime) != 0)
