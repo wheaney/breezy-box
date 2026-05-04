@@ -1461,6 +1461,7 @@ static int handle_setup_request(struct gadgetfs_runtime *runtime,
 	const uint16_t value = le16_to_host(setup->wValue);
 	const uint16_t index = le16_to_host(setup->wIndex);
 	const uint16_t length = le16_to_host(setup->wLength);
+	const bool setup_in = (setup->bRequestType & USB_DIR_IN) != 0;
 	int rc;
 
 	if (runtime->verbose) {
@@ -1481,10 +1482,17 @@ static int handle_setup_request(struct gadgetfs_runtime *runtime,
 	if (rc <= 0)
 		return rc;
 
+	if (!setup_in && length == 0u) {
+		if (runtime->verbose) {
+			fprintf(stderr,
+				"Unhandled zero-length OUT setup, acknowledging status stage instead of stalling ep0\n");
+		}
+		return ack_control_status_out(runtime->ep0_fd);
+	}
+
 	if (runtime->verbose)
 		fprintf(stderr, "Unhandled setup request, explicitly stalling ep0\n");
-	return stall_control_request(runtime->ep0_fd,
-				     (setup->bRequestType & USB_DIR_IN) != 0);
+	return stall_control_request(runtime->ep0_fd, setup_in);
 }
 
 static int handle_ep0_events(struct gadgetfs_runtime *runtime)
