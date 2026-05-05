@@ -42,6 +42,7 @@
 
 struct options {
 	const char *raw_device_path;
+	const char *edid_path;
 	const char *udc_driver;
 	const char *udc_device;
 	uint16_t vendor_id;
@@ -124,6 +125,7 @@ static void usage(const char *argv0)
 	fprintf(stderr,
 		"Usage: %s [options]\n"
 		"  --raw-device PATH       Raw Gadget device node (default: /dev/raw-gadget)\n"
+		"  --edid-file PATH        Override the built-in 128-byte EDID with a binary blob\n"
 		"  --udc-driver NAME       UDC driver name (default: auto-detect)\n"
 		"  --udc-device NAME       UDC device name (default: auto-detect)\n"
 		"  --vendor-id HEX         USB vendor ID (default: 0x17e9)\n"
@@ -178,6 +180,7 @@ static int parse_args(int argc, char **argv, struct options *opts)
 {
 	static const struct option long_options[] = {
 		{ "raw-device", required_argument, NULL, 'r' },
+		{ "edid-file", required_argument, NULL, 'e' },
 		{ "udc-driver", required_argument, NULL, 'u' },
 		{ "udc-device", required_argument, NULL, 'd' },
 		{ "vendor-id", required_argument, NULL, 'v' },
@@ -188,10 +191,13 @@ static int parse_args(int argc, char **argv, struct options *opts)
 	};
 	int opt;
 
-	while ((opt = getopt_long(argc, argv, "r:u:d:v:p:Vh", long_options, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "r:e:u:d:v:p:Vh", long_options, NULL)) != -1) {
 		switch (opt) {
 		case 'r':
 			opts->raw_device_path = optarg;
+			break;
+		case 'e':
+			opts->edid_path = optarg;
 			break;
 		case 'u':
 			opts->udc_driver = optarg;
@@ -218,6 +224,64 @@ static int parse_args(int argc, char **argv, struct options *opts)
 		}
 	}
 
+	return 0;
+}
+
+static int load_edid_file(const char *path, uint8_t edid[128])
+{
+	int fd;
+	size_t total = 0u;
+
+	fd = open(path, O_RDONLY);
+	if (fd < 0) {
+		perror(path);
+		return -1;
+	}
+
+	while (total < 128u) {
+		ssize_t read_len = read(fd, edid + total, 128u - total);
+
+		if (read_len < 0) {
+			if (errno == EINTR)
+				continue;
+			perror(path);
+			close(fd);
+			return -1;
+		}
+		if (read_len == 0) {
+			fprintf(stderr,
+				"EDID file '%s' ended after %zu bytes; expected exactly 128 bytes.\n",
+				path,
+				total);
+			close(fd);
+			return -1;
+		}
+
+		total += (size_t)read_len;
+	}
+
+	{
+		uint8_t extra_byte;
+		ssize_t extra_len;
+
+		extra_len = read(fd, &extra_byte, sizeof(extra_byte));
+		if (extra_len < 0 && errno == EINTR)
+			extra_len = read(fd, &extra_byte, sizeof(extra_byte));
+		if (extra_len < 0) {
+			perror(path);
+			close(fd);
+			return -1;
+		}
+		if (extra_len > 0) {
+			fprintf(stderr,
+				"EDID file '%s' is larger than 128 bytes. Raw Gadget currently supports only a single base EDID block.\n",
+				path);
+			close(fd);
+			return -1;
+		}
+	}
+
+	close(fd);
 	return 0;
 }
 
@@ -715,6 +779,18 @@ static void *bulk_out_drain_thread_main(void *arg)
 	struct raw_runtime *runtime = arg;
 	struct usb_raw_bulk_io io;
 	const uint16_t handle = (uint16_t)runtime->bulk_out_handle;
+	int rc;
+
+	rc = pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
+	if (rc != 0 && runtime->verbose) {
+		errno = rc;
+		perror("pthread_setcancelstate bulk OUT drain");
+	}
+	rc = pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, NULL);
+	if (rc != 0 && runtime->verbose) {
+		errno = rc;
+		perror("pthread_setcanceltype bulk OUT drain");
+	}
 
 	if (runtime->verbose) {
 		fprintf(stderr,
@@ -910,13 +986,15 @@ static int enable_bulk_out_endpoint(struct raw_runtime *runtime)
 static void disable_bulk_out_endpoint(struct raw_runtime *runtime)
 {
 	int handle;
+	int rc;
 
 	if (runtime->bulk_out_handle < 0)
 		return;
 
 	handle = runtime->bulk_out_handle;
 	runtime->bulk_out_handle = -1;
-	if (raw_ep_disable(runtime->fd, handle) < 0 && runtime->verbose)
+	rc = raw_ep_disable(runtime->fd, handle);
+	if (rc < 0 && runtime->verbose && errno != EINVAL)
 		perror("ioctl USB_RAW_IOCTL_EP_DISABLE");
 }
 
@@ -945,7 +1023,11 @@ static void stop_bulk_out_drain_thread(struct raw_runtime *runtime)
 		int rc;
 
 		atomic_store(&runtime->bulk_out_thread_stop, true);
-		disable_bulk_out_endpoint(runtime);
+		rc = pthread_cancel(runtime->bulk_out_thread);
+		if (rc != 0 && rc != ESRCH && runtime->verbose) {
+			errno = rc;
+			perror("pthread_cancel bulk OUT drain");
+		}
 		rc = pthread_join(runtime->bulk_out_thread, NULL);
 		if (rc != 0 && runtime->verbose) {
 			errno = rc;
@@ -953,6 +1035,7 @@ static void stop_bulk_out_drain_thread(struct raw_runtime *runtime)
 		}
 		runtime->bulk_out_thread_created = false;
 		atomic_store(&runtime->bulk_out_thread_stop, false);
+		disable_bulk_out_endpoint(runtime);
 		return;
 	}
 
@@ -1327,6 +1410,8 @@ int main(int argc, char **argv)
 	runtime.verbose = opts.verbose;
 	atomic_init(&runtime.bulk_out_thread_stop, false);
 	build_default_edid(runtime.edid);
+	if (opts.edid_path && load_edid_file(opts.edid_path, runtime.edid) != 0)
+		goto out;
 	build_vendor_descriptor(&runtime);
 	build_device_descriptor(&runtime, &opts);
 	build_device_qualifier(&runtime);
@@ -1350,6 +1435,8 @@ int main(int argc, char **argv)
 	       opts.raw_device_path,
 	       udc_driver,
 	       udc_device);
+	if (opts.edid_path)
+		printf("Using EDID override from %s\n", opts.edid_path);
 	printf("Entering Raw Gadget event loop. Press Ctrl+C to stop.\n");
 	printf("This control-plane prototype enables the DisplayLink vendor descriptor/channel/EDID path and drains bulk OUT traffic, but it does not yet decode or render the stream.\n");
 

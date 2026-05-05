@@ -99,6 +99,12 @@ If `/dev/raw-gadget` still does not exist after that, the current kernel likely 
 sudo ./displaylink_gadget_raw_gadget --udc-device fe800000.usb --verbose
 ```
 
+If you want to test the host against a real monitor identity instead of the built-in synthetic EDID, pass a 128-byte base EDID blob directly:
+
+```sh
+sudo ./displaylink_gadget_raw_gadget --udc-device fe800000.usb --edid-file /path/to/monitor.edid --verbose
+```
+
 If auto-detection does not find the correct driver name, rerun with both values, for example:
 
 ```sh
