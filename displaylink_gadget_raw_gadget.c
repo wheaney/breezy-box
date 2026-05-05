@@ -231,6 +231,7 @@ static int load_edid_file(const char *path, uint8_t edid[128])
 {
 	int fd;
 	size_t total = 0u;
+	bool has_extra_bytes = false;
 
 	fd = open(path, O_RDONLY);
 	if (fd < 0) {
@@ -272,16 +273,26 @@ static int load_edid_file(const char *path, uint8_t edid[128])
 			close(fd);
 			return -1;
 		}
-		if (extra_len > 0) {
-			fprintf(stderr,
-				"EDID file '%s' is larger than 128 bytes. Raw Gadget currently supports only a single base EDID block.\n",
-				path);
-			close(fd);
-			return -1;
-		}
+		has_extra_bytes = extra_len > 0;
 	}
 
 	close(fd);
+
+	if (has_extra_bytes || edid[126] != 0u) {
+		fprintf(stderr,
+			"EDID file '%s' contains extension data. Raw Gadget currently serves only the first 128-byte base block, so extension blocks will be ignored.\n",
+			path);
+		edid[126] = 0u;
+		{
+			uint32_t sum = 0u;
+			size_t index;
+
+			for (index = 0u; index < 127u; ++index)
+				sum += edid[index];
+			edid[127] = (uint8_t)((256u - (sum & 0xffu)) & 0xffu);
+		}
+	}
+
 	return 0;
 }
 
