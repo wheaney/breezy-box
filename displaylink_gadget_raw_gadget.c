@@ -7,7 +7,9 @@
 #include <getopt.h>
 #include <linux/usb/ch9.h>
 #include <linux/usb/raw_gadget.h>
+#include <pthread.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -36,6 +38,7 @@
 #define UDL_EDID_INDEX 0x00a1U
 
 #define EP0_BUFFER_SIZE 512u
+#define BULK_OUT_BUFFER_SIZE 16384u
 
 struct options {
 	const char *raw_device_path;
@@ -71,13 +74,21 @@ struct usb_raw_control_io {
 	uint8_t data[EP0_BUFFER_SIZE];
 };
 
+struct usb_raw_bulk_io {
+	struct usb_raw_ep_io inner;
+	uint8_t data[BULK_OUT_BUFFER_SIZE];
+};
+
 struct raw_runtime {
 	int fd;
 	uint8_t current_configuration;
 	int bulk_out_handle;
+	pthread_t bulk_out_thread;
 	uint8_t bulk_out_address;
 	bool bulk_out_address_valid;
+	bool bulk_out_thread_created;
 	bool verbose;
+	atomic_bool bulk_out_thread_stop;
 	struct usb_device_descriptor device_descriptor;
 	struct usb_qualifier_descriptor qualifier_descriptor;
 	uint8_t edid[128];
@@ -663,6 +674,11 @@ static int raw_ep0_write(int fd, struct usb_raw_control_io *io)
 	return ioctl(fd, USB_RAW_IOCTL_EP0_WRITE, io);
 }
 
+static int raw_ep_read(int fd, struct usb_raw_ep_io *io)
+{
+	return ioctl(fd, USB_RAW_IOCTL_EP_READ, io);
+}
+
 static int raw_ep0_stall(int fd)
 {
 	return ioctl(fd, USB_RAW_IOCTL_EP0_STALL, 0);
@@ -692,6 +708,45 @@ static int raw_eps_info(int fd, struct usb_raw_eps_info *info)
 {
 	memset(info, 0, sizeof(*info));
 	return ioctl(fd, USB_RAW_IOCTL_EPS_INFO, info);
+}
+
+static void *bulk_out_drain_thread_main(void *arg)
+{
+	struct raw_runtime *runtime = arg;
+	struct usb_raw_bulk_io io;
+	const uint16_t handle = (uint16_t)runtime->bulk_out_handle;
+
+	if (runtime->verbose) {
+		fprintf(stderr,
+			"Raw Gadget bulk OUT drain thread started: handle=%u address=0x%02x\n",
+			(unsigned int)handle,
+			runtime->bulk_out_address);
+	}
+
+	while (!stop_requested && !atomic_load(&runtime->bulk_out_thread_stop)) {
+		int rc;
+
+		memset(&io, 0, sizeof(io));
+		io.inner.ep = handle;
+		io.inner.length = sizeof(io.data);
+
+		rc = raw_ep_read(runtime->fd, &io.inner);
+		if (rc < 0) {
+			if (errno == EINTR && !stop_requested)
+				continue;
+			if (!stop_requested && !atomic_load(&runtime->bulk_out_thread_stop) && runtime->verbose)
+				perror("ioctl USB_RAW_IOCTL_EP_READ");
+			break;
+		}
+
+		if (runtime->verbose)
+			fprintf(stderr, "bulk OUT transferred %d bytes\n", rc);
+	}
+
+	if (runtime->verbose)
+		fprintf(stderr, "Raw Gadget bulk OUT drain thread stopped\n");
+
+	return NULL;
 }
 
 static void report_raw_run_failure(const char *udc_driver,
@@ -780,6 +835,9 @@ static int choose_bulk_out_address(struct raw_runtime *runtime)
 
 	for (i = 0; i < count; ++i) {
 		const struct usb_raw_ep_info *ep = &info.eps[i];
+		const uint8_t candidate_address = (ep->addr == USB_RAW_EP_ADDR_ANY)
+			? DEFAULT_BULK_OUT_ADDRESS
+			: (uint8_t)ep->addr;
 
 		if (runtime->verbose) {
 			fprintf(stderr,
@@ -795,15 +853,26 @@ static int choose_bulk_out_address(struct raw_runtime *runtime)
 
 		if (!ep->caps.type_bulk || !ep->caps.dir_out)
 			continue;
+		if (candidate_address != DEFAULT_BULK_OUT_ADDRESS) {
+			if (runtime->verbose) {
+				fprintf(stderr,
+					"Skipping bulk OUT endpoint %s at address 0x%02x because the Linux udl driver submits render URBs to endpoint 0x%02x.\n",
+					(const char *)ep->name,
+					candidate_address,
+					DEFAULT_BULK_OUT_ADDRESS);
+			}
+			continue;
+		}
 
-		runtime->bulk_out_address = (ep->addr == USB_RAW_EP_ADDR_ANY)
-			? DEFAULT_BULK_OUT_ADDRESS
-			: (uint8_t)ep->addr;
+		runtime->bulk_out_address = candidate_address;
 		runtime->bulk_out_address_valid = true;
 		return 0;
 	}
 
-	fprintf(stderr, "Unable to find a bulk OUT endpoint from Raw Gadget endpoint info\n");
+	fprintf(stderr,
+		"Unable to find a Raw Gadget bulk OUT endpoint at address 0x%02x. The Linux udl driver submits bulk writes to endpoint 0x%02x, so this UDC layout is not compatible with the current spoofing path.\n",
+		DEFAULT_BULK_OUT_ADDRESS,
+		DEFAULT_BULK_OUT_ADDRESS);
 	return -1;
 }
 
@@ -840,18 +909,60 @@ static int enable_bulk_out_endpoint(struct raw_runtime *runtime)
 
 static void disable_bulk_out_endpoint(struct raw_runtime *runtime)
 {
+	int handle;
+
 	if (runtime->bulk_out_handle < 0)
 		return;
 
-	if (raw_ep_disable(runtime->fd, runtime->bulk_out_handle) < 0 && runtime->verbose)
-		perror("ioctl USB_RAW_IOCTL_EP_DISABLE");
+	handle = runtime->bulk_out_handle;
 	runtime->bulk_out_handle = -1;
+	if (raw_ep_disable(runtime->fd, handle) < 0 && runtime->verbose)
+		perror("ioctl USB_RAW_IOCTL_EP_DISABLE");
+}
+
+static int start_bulk_out_drain_thread(struct raw_runtime *runtime)
+{
+	int rc;
+
+	if (runtime->bulk_out_thread_created)
+		return 0;
+
+	atomic_store(&runtime->bulk_out_thread_stop, false);
+	rc = pthread_create(&runtime->bulk_out_thread, NULL, bulk_out_drain_thread_main, runtime);
+	if (rc != 0) {
+		errno = rc;
+		perror("pthread_create bulk OUT drain");
+		return -1;
+	}
+
+	runtime->bulk_out_thread_created = true;
+	return 0;
+}
+
+static void stop_bulk_out_drain_thread(struct raw_runtime *runtime)
+{
+	if (runtime->bulk_out_thread_created) {
+		int rc;
+
+		atomic_store(&runtime->bulk_out_thread_stop, true);
+		disable_bulk_out_endpoint(runtime);
+		rc = pthread_join(runtime->bulk_out_thread, NULL);
+		if (rc != 0 && runtime->verbose) {
+			errno = rc;
+			perror("pthread_join bulk OUT drain");
+		}
+		runtime->bulk_out_thread_created = false;
+		atomic_store(&runtime->bulk_out_thread_stop, false);
+		return;
+	}
+
+	disable_bulk_out_endpoint(runtime);
 }
 
 static void reset_configuration_state(struct raw_runtime *runtime)
 {
 	runtime->current_configuration = 0u;
-	disable_bulk_out_endpoint(runtime);
+	stop_bulk_out_drain_thread(runtime);
 }
 
 static int prepare_standard_request(struct raw_runtime *runtime,
@@ -959,8 +1070,10 @@ static int prepare_standard_request(struct raw_runtime *runtime,
 				perror("ioctl USB_RAW_IOCTL_CONFIGURE");
 				return -1;
 			}
+			if (start_bulk_out_drain_thread(runtime) != 0)
+				return -1;
 		} else {
-			disable_bulk_out_endpoint(runtime);
+			stop_bulk_out_drain_thread(runtime);
 		}
 		io->inner.length = 0u;
 		*action = CONTROL_ACTION_READ;
@@ -1212,6 +1325,7 @@ int main(int argc, char **argv)
 	runtime.bulk_out_handle = -1;
 	runtime.bulk_out_address = DEFAULT_BULK_OUT_ADDRESS;
 	runtime.verbose = opts.verbose;
+	atomic_init(&runtime.bulk_out_thread_stop, false);
 	build_default_edid(runtime.edid);
 	build_vendor_descriptor(&runtime);
 	build_device_descriptor(&runtime, &opts);
@@ -1237,7 +1351,7 @@ int main(int argc, char **argv)
 	       udc_driver,
 	       udc_device);
 	printf("Entering Raw Gadget event loop. Press Ctrl+C to stop.\n");
-	printf("This control-plane prototype enables the DisplayLink vendor descriptor/channel/EDID path and a bulk OUT endpoint, but it does not yet consume bulk transfers.\n");
+	printf("This control-plane prototype enables the DisplayLink vendor descriptor/channel/EDID path and drains bulk OUT traffic, but it does not yet decode or render the stream.\n");
 
 	install_signal_handlers();
 	if (run_loop(&runtime) != 0)
@@ -1246,7 +1360,7 @@ int main(int argc, char **argv)
 	ret = EXIT_SUCCESS;
 
 out:
-	disable_bulk_out_endpoint(&runtime);
+	stop_bulk_out_drain_thread(&runtime);
 	if (runtime.fd >= 0)
 		close(runtime.fd);
 	return ret;

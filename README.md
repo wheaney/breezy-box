@@ -58,7 +58,7 @@ The FunctionFS gadget prototype in `displaylink_gadget_ffs.c` now links against 
 
 There is now also a parallel GadgetFS prototype in `displaylink_gadget_gadgetfs.c`. Unlike the FunctionFS version, it owns the device-level ep0 control path in userspace and can answer the specific UDL probe requests the Linux host driver cares about: the vendor firmware descriptor, the standard channel-select vendor request, and per-byte EDID reads. This is intended as the next experiment for full old-DisplayLink impersonation.
 
-There is also now a Raw Gadget fallback prototype in `displaylink_gadget_raw_gadget.c`. This exists because GadgetFS handles standard `GET_DESCRIPTOR` requests in-kernel and does not delegate unknown descriptor types like DisplayLink's `0x5f` vendor descriptor back to userspace. The Raw Gadget version owns ep0 completely, so it can answer that descriptor request directly and log every subsequent control transfer. The current Raw Gadget cut is intentionally control-plane first: it enables the bulk OUT endpoint during `SET_CONFIGURATION`, but it does not yet consume bulk traffic.
+There is also now a Raw Gadget fallback prototype in `displaylink_gadget_raw_gadget.c`. This exists because GadgetFS handles standard `GET_DESCRIPTOR` requests in-kernel and does not delegate unknown descriptor types like DisplayLink's `0x5f` vendor descriptor back to userspace. The Raw Gadget version owns ep0 completely, so it can answer that descriptor request directly and log every subsequent control transfer. The current Raw Gadget cut is still control-plane first, but it now drains bulk OUT traffic after `SET_CONFIGURATION` so the host is not left writing into an unserviced endpoint. It still does not decode or render the stream.
 
 Build notes:
 
