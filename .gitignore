@@ -2,3 +2,4 @@ __pycache__/
 displaylink_gadget_ffs
 displaylink_gadget_gadgetfs
 displaylink_gadget_raw_gadget
+host-display-*/

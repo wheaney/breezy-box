@@ -111,6 +111,22 @@ If auto-detection does not find the correct driver name, rerun with both values,
 sudo ./displaylink_gadget_raw_gadget --udc-driver fe800000.usb --udc-device fe800000.usb --verbose
 ```
 
+When the remaining issue is on the host side rather than in the gadget itself, there is also a small capture helper that dumps the relevant DRM and Mutter state into one directory. This is useful when a hotplug reproduces the `No available CRTC ... not found` path and you want one repeatable bundle instead of rerunning ad hoc commands:
+
+```sh
+./capture_host_display_state.sh --driver udl
+```
+
+That capture includes `modetest -M udl`, Mutter `DisplayConfig.GetResources`, `DisplayConfig.GetCurrentState`, a filtered user journal excerpt, `/dev/dri` listings, and basic DRM sysfs connector state.
+
+When the missing piece is the root-only kernel side, there is also a companion helper that captures DRM debugfs state and filtered kernel logs into a second bundle:
+
+```sh
+sudo ./capture_root_display_state.sh --driver udl
+```
+
+That root capture includes `/sys/kernel/debug/dri/*/{state,summary,clients,framebuffer,name}` where available, filtered kernel journal output, `dmesg`, `modetest -M udl`, and matching DRM sysfs connector state.
+
 ## Limitations
 
 The decision to go with DisplayLink has a couple repurcussions that mainly impact streaming and gaming. Since Breezy Box is intended to be a productivity device, the simplicity that DisplayLink offers this design seems worth that tradeoff.

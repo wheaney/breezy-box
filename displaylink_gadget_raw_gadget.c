@@ -18,6 +18,7 @@
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
 #define DISPLAYLINK_VENDOR_ID 0x17e9
@@ -29,6 +30,7 @@
 #define DEFAULT_DISPLAY_HEIGHT 1080u
 #define DEFAULT_BULK_OUT_ADDRESS 0x01u
 #define DEFAULT_RAW_DEVICE_PATH "/dev/raw-gadget"
+#define UDC_SOFT_RECONNECT_SETTLE_USEC 250000u
 
 #define UDL_VENDOR_DESCRIPTOR_TYPE 0x5fU
 #define UDL_VENDOR_DESCRIPTOR_VERSION 0x0001U
@@ -345,6 +347,34 @@ static int read_single_line_file(const char *path,
 	return 0;
 }
 
+static int write_single_line_file(const char *path, const char *value)
+{
+	int fd;
+	const size_t length = strlen(value);
+	size_t written = 0u;
+
+	fd = open(path, O_WRONLY | O_CLOEXEC);
+	if (fd < 0)
+		return -1;
+
+	while (written < length) {
+		ssize_t rc = write(fd, value + written, length - written);
+
+		if (rc < 0) {
+			if (errno == EINTR)
+				continue;
+			close(fd);
+			return -1;
+		}
+		written += (size_t)rc;
+	}
+
+	if (close(fd) < 0)
+		return -1;
+
+	return 0;
+}
+
 static int read_uevent_value(const char *path,
 			     const char *key,
 			     char *buffer,
@@ -455,6 +485,75 @@ static int auto_detect_udc(char *driver_buffer,
 		return -1;
 
 	return 0;
+}
+
+static int set_udc_soft_connect(const char *udc_device,
+				const char *command,
+				bool verbose,
+				bool ignore_unsupported)
+{
+	char path[512];
+	int saved_errno;
+
+	if (snprintf(path,
+		     sizeof(path),
+		     "/sys/class/udc/%s/soft_connect",
+		     udc_device) >= (int)sizeof(path)) {
+		errno = ENAMETOOLONG;
+		return -1;
+	}
+
+	if (write_single_line_file(path, command) == 0)
+		return 0;
+
+	saved_errno = errno;
+	if (ignore_unsupported &&
+	    (saved_errno == ENOENT || saved_errno == ENOTDIR || saved_errno == EOPNOTSUPP)) {
+		if (verbose) {
+			fprintf(stderr,
+				"UDC soft_connect is unavailable on %s, skipping '%s'\n",
+				udc_device,
+				command);
+		}
+		return 0;
+	}
+
+	errno = saved_errno;
+	if (verbose) {
+		fprintf(stderr,
+			"Failed to write '%s' to %s\n",
+			command,
+			path);
+		perror("soft_connect");
+	}
+	return -1;
+}
+
+static void sleep_microseconds(unsigned int microseconds)
+{
+	struct timespec delay;
+
+	delay.tv_sec = (time_t)(microseconds / 1000000u);
+	delay.tv_nsec = (long)((microseconds % 1000000u) * 1000u);
+	while (nanosleep(&delay, &delay) != 0) {
+		if (errno != EINTR)
+			break;
+	}
+}
+
+static void force_udc_soft_reconnect(const char *udc_device, bool verbose)
+{
+	if (verbose) {
+		fprintf(stderr,
+			"Forcing a UDC soft reconnect on %s so the host sees a fresh attach\n",
+			udc_device);
+	}
+
+	if (set_udc_soft_connect(udc_device, "disconnect", verbose, true) != 0)
+		return;
+
+	sleep_microseconds(UDC_SOFT_RECONNECT_SETTLE_USEC);
+	(void)set_udc_soft_connect(udc_device, "connect", verbose, true);
 }
 
 static uint16_t encode_manufacturer_id(char first, char second, char third)
@@ -1033,6 +1132,8 @@ static int start_bulk_out_drain_thread(struct raw_runtime *runtime)
 	return 0;
 }
 
+static void reset_configuration_state(struct raw_runtime *runtime);
+
 static void stop_bulk_out_drain_thread(struct raw_runtime *runtime)
 {
 	if (runtime->bulk_out_thread_created) {
@@ -1056,6 +1157,22 @@ static void stop_bulk_out_drain_thread(struct raw_runtime *runtime)
 	}
 
 	disable_bulk_out_endpoint(runtime);
+}
+
+static void shutdown_raw_gadget(struct raw_runtime *runtime,
+				const char *udc_device)
+{
+	stop_bulk_out_drain_thread(runtime);
+	if (runtime->fd >= 0) {
+		reset_configuration_state(runtime);
+		(void)set_udc_soft_connect(udc_device,
+					  "disconnect",
+					  runtime->verbose,
+					  true);
+		sleep_microseconds(UDC_SOFT_RECONNECT_SETTLE_USEC);
+		close(runtime->fd);
+		runtime->fd = -1;
+	}
 }
 
 static void reset_configuration_state(struct raw_runtime *runtime)
@@ -1320,7 +1437,9 @@ static int run_loop(struct raw_runtime *runtime)
 
 		switch ((enum usb_raw_event_type)event.inner.type) {
 		case USB_RAW_EVENT_CONNECT:
-			fprintf(stderr, "Raw Gadget event: %s\n", event_name(event.inner.type));
+			fprintf(stderr,
+				"Raw Gadget event: %s (UDC bound; waiting for host enumeration)\n",
+				event_name(event.inner.type));
 			if (handle_connect(runtime) != 0)
 				return -1;
 			break;
@@ -1431,6 +1550,7 @@ int main(int argc, char **argv)
 	build_vendor_descriptor(&runtime);
 	build_device_descriptor(&runtime, &opts);
 	build_device_qualifier(&runtime);
+	install_signal_handlers();
 
 	runtime.fd = open(opts.raw_device_path, O_RDWR);
 	if (runtime.fd < 0) {
@@ -1446,6 +1566,7 @@ int main(int argc, char **argv)
 		report_raw_run_failure(udc_driver, udc_device, errno);
 		goto out;
 	}
+	force_udc_soft_reconnect(udc_device, runtime.verbose);
 
 	printf("DisplayLink Raw Gadget prepared. raw=%s udc_driver=%s udc_device=%s\n",
 	       opts.raw_device_path,
@@ -1456,15 +1577,12 @@ int main(int argc, char **argv)
 	printf("Entering Raw Gadget event loop. Press Ctrl+C to stop.\n");
 	printf("This control-plane prototype enables the DisplayLink vendor descriptor/channel/EDID path and drains bulk OUT traffic, but it does not yet decode or render the stream.\n");
 
-	install_signal_handlers();
 	if (run_loop(&runtime) != 0)
 		goto out;
 
 	ret = EXIT_SUCCESS;
 
 out:
-	stop_bulk_out_drain_thread(&runtime);
-	if (runtime.fd >= 0)
-		close(runtime.fd);
+	shutdown_raw_gadget(&runtime, udc_device);
 	return ret;
 }
