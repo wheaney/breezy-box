@@ -832,9 +832,14 @@ static void build_default_edid(uint8_t edid[128])
 	edid[21] = 0xa0;
 	edid[22] = 0x5a;
 	edid[23] = 0x78;
-	edid[24] = 0x0a;
-	for (index = 25u; index <= 34u; ++index)
-		edid[index] = 0x00;
+	edid[24] = 0x0f;
+	{
+		static const uint8_t chromaticity[10] = {
+			0xee, 0x91, 0xa3, 0x54, 0x4c,
+			0x99, 0x26, 0x0f, 0x50, 0x54,
+		};
+		memcpy(&edid[25], chromaticity, sizeof(chromaticity));
+	}
 	for (index = 35u; index <= 37u; ++index)
 		edid[index] = 0x00;
 	for (index = 38u; index < 54u; ++index)

@@ -1,0 +1,79 @@
+opened device `DisplayLink` on driver `udl` (version 0.0.1 at 0)
+Encoders:
+id	crtc	type	possible crtcs	possible clones	
+37	36	DAC	0x00000001	0x00000001
+
+Connectors:
+id	encoder	status		name		size (mm)	modes	encoders
+38	37	connected	VGA-1          	1600x900		1	37
+  modes:
+	index name refresh (Hz) hdisp hss hse htot vdisp vss vse vtot
+  #0 1920x1080 60.00 1920 2008 2052 2200 1080 1084 1089 1125 148500 flags: phsync, pvsync; type: preferred, driver
+  props:
+	1 EDID:
+		flags: immutable blob
+		blobs:
+
+		value:
+			00ffffffffffff000858010001000000
+			0122010381a05a780a00000000000000
+			00000000000001010101010101010101
+			010101010101023a801871382d40582c
+			450040846300001e000000fc00427265
+			657a7920426f780a2020000000fd0032
+			461e460f000a20202020202000000010
+			000000000000000000000000000000b6
+	2 DPMS:
+		flags: enum
+		enums: On=0 Standby=1 Suspend=2 Off=3
+		value: 0
+	5 link-status:
+		flags: enum
+		enums: Good=0 Bad=1
+		value: 0
+	6 non-desktop:
+		flags: immutable range
+		values: 0 1
+		value: 0
+	4 TILE:
+		flags: immutable blob
+		blobs:
+
+		value:
+
+CRTCs:
+id	fb	pos	size
+36	40	(0,0)	(1920x1080)
+  #0 1920x1080 60.00 1920 2008 2052 2200 1080 1084 1089 1125 148500 flags: phsync, pvsync; type: preferred, driver
+  props:
+	24 VRR_ENABLED:
+		flags: range
+		values: 0 1
+		value: 0
+	25 PASSIVE_VRR_DISABLED:
+		flags: range
+		values: 0 1
+		value: 0
+
+Planes:
+id	crtc	fb	CRTC x,y	x,y	gamma size	possible crtcs
+34	36	40	0,0		0,0	0       	0x00000001
+  formats: RG16 XR24
+  props:
+	8 type:
+		flags: immutable enum
+		enums: Overlay=0 Primary=1 Cursor=2
+		value: 1
+	31 IN_FORMATS:
+		flags: immutable blob
+		blobs:
+
+		value:
+			01000000000000000200000018000000
+			01000000200000005247313658523234
+			03000000000000000000000000000000
+			0000000000000000
+		in_formats blob decoded:
+			 RG16:  LINEAR(0x0)
+			 XR24:  LINEAR(0x0)
+
