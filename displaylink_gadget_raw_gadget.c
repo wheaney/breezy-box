@@ -84,6 +84,7 @@ struct usb_raw_bulk_io {
 
 struct raw_runtime {
 	int fd;
+	const char *udc_device;
 	uint8_t current_configuration;
 	int bulk_out_handle;
 	pthread_t bulk_out_thread;
@@ -529,6 +530,23 @@ static int set_udc_soft_connect(const char *udc_device,
 	return -1;
 }
 
+static int read_udc_state(const char *udc_device,
+			  char *buffer,
+			  size_t capacity)
+{
+	char path[512];
+
+	if (snprintf(path,
+		     sizeof(path),
+		     "/sys/class/udc/%s/state",
+		     udc_device) >= (int)sizeof(path)) {
+		errno = ENAMETOOLONG;
+		return -1;
+	}
+
+	return read_single_line_file(path, buffer, capacity);
+}
+
 static void sleep_microseconds(unsigned int microseconds)
 {
 	struct timespec delay;
@@ -554,6 +572,33 @@ static void force_udc_soft_reconnect(const char *udc_device, bool verbose)
 
 	sleep_microseconds(UDC_SOFT_RECONNECT_SETTLE_USEC);
 	(void)set_udc_soft_connect(udc_device, "connect", verbose, true);
+}
+
+static void prime_udc_attach_state(const char *udc_device, bool verbose)
+{
+	char state[128];
+
+	if (read_udc_state(udc_device, state, sizeof(state)) != 0) {
+		if (verbose)
+			perror("read /sys/class/udc/.../state");
+		force_udc_soft_reconnect(udc_device, verbose);
+		return;
+	}
+
+	if (strcmp(state, "not attached") == 0) {
+		fprintf(stderr,
+			"UDC %s is armed and idle; leaving soft_connect unchanged so it can wait for a future host attach.\n",
+			udc_device);
+		return;
+	}
+
+	if (verbose) {
+		fprintf(stderr,
+			"UDC %s is already in state '%s'; forcing a soft reconnect so the current host sees a fresh attach.\n",
+			udc_device,
+			state);
+	}
+	force_udc_soft_reconnect(udc_device, verbose);
 }
 
 static uint16_t encode_manufacturer_id(char first, char second, char third)
@@ -1181,6 +1226,28 @@ static void reset_configuration_state(struct raw_runtime *runtime)
 	stop_bulk_out_drain_thread(runtime);
 }
 
+static void log_udc_wait_state(struct raw_runtime *runtime, const char *reason)
+{
+	char state[128];
+
+	if (!runtime->udc_device)
+		return;
+
+	if (read_udc_state(runtime->udc_device, state, sizeof(state)) == 0) {
+		fprintf(stderr,
+			"%s; returning to pre-plug wait state on %s (udc_state=%s)\n",
+			reason,
+			runtime->udc_device,
+			state);
+		return;
+	}
+
+	fprintf(stderr,
+		"%s; returning to pre-plug wait state on %s\n",
+		reason,
+		runtime->udc_device);
+}
+
 static int prepare_standard_request(struct raw_runtime *runtime,
 				    const struct usb_ctrlrequest *setup,
 				    enum control_action *action,
@@ -1417,6 +1484,7 @@ static int handle_connect(struct raw_runtime *runtime)
 	fprintf(stderr,
 		"Raw Gadget selected bulk OUT endpoint address 0x%02x\n",
 		runtime->bulk_out_address);
+	log_udc_wait_state(runtime, "Host attach detected");
 	return 0;
 }
 
@@ -1447,6 +1515,10 @@ static int run_loop(struct raw_runtime *runtime)
 		case USB_RAW_EVENT_DISCONNECT:
 			fprintf(stderr, "Raw Gadget event: %s\n", event_name(event.inner.type));
 			reset_configuration_state(runtime);
+			log_udc_wait_state(runtime,
+				event.inner.type == USB_RAW_EVENT_RESET
+					? "USB bus reset handled"
+					: "Host disconnect handled");
 			break;
 		case USB_RAW_EVENT_SUSPEND:
 		case USB_RAW_EVENT_RESUME:
@@ -1540,6 +1612,7 @@ int main(int argc, char **argv)
 
 	memset(&runtime, 0, sizeof(runtime));
 	runtime.fd = -1;
+	runtime.udc_device = udc_device;
 	runtime.bulk_out_handle = -1;
 	runtime.bulk_out_address = DEFAULT_BULK_OUT_ADDRESS;
 	runtime.verbose = opts.verbose;
@@ -1566,7 +1639,7 @@ int main(int argc, char **argv)
 		report_raw_run_failure(udc_driver, udc_device, errno);
 		goto out;
 	}
-	force_udc_soft_reconnect(udc_device, runtime.verbose);
+	prime_udc_attach_state(udc_device, runtime.verbose);
 
 	printf("DisplayLink Raw Gadget prepared. raw=%s udc_driver=%s udc_device=%s\n",
 	       opts.raw_device_path,
