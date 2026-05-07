@@ -49,6 +49,7 @@ struct options {
 	const char *udc_device;
 	uint16_t vendor_id;
 	uint16_t product_id;
+	bool startup_soft_reconnect;
 	bool verbose;
 };
 
@@ -133,6 +134,7 @@ static void usage(const char *argv0)
 		"  --udc-device NAME       UDC device name (default: auto-detect)\n"
 		"  --vendor-id HEX         USB vendor ID (default: 0x17e9)\n"
 		"  --product-id HEX        USB product ID (default: 0x0104)\n"
+		"  --no-startup-reconnect  Do not force a startup soft disconnect/connect pulse\n"
 		"  --verbose               Log control requests and endpoint discovery\n",
 		argv0);
 }
@@ -176,6 +178,7 @@ static void default_options(struct options *opts)
 	opts->raw_device_path = DEFAULT_RAW_DEVICE_PATH;
 	opts->vendor_id = DISPLAYLINK_VENDOR_ID;
 	opts->product_id = DISPLAYLINK_PRODUCT_ID;
+	opts->startup_soft_reconnect = true;
 	opts->verbose = false;
 }
 
@@ -188,13 +191,14 @@ static int parse_args(int argc, char **argv, struct options *opts)
 		{ "udc-device", required_argument, NULL, 'd' },
 		{ "vendor-id", required_argument, NULL, 'v' },
 		{ "product-id", required_argument, NULL, 'p' },
+		{ "no-startup-reconnect", no_argument, NULL, 'n' },
 		{ "verbose", no_argument, NULL, 'V' },
 		{ "help", no_argument, NULL, 'h' },
 		{ NULL, 0, NULL, 0 },
 	};
 	int opt;
 
-	while ((opt = getopt_long(argc, argv, "r:e:u:d:v:p:Vh", long_options, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "r:e:u:d:v:p:nVh", long_options, NULL)) != -1) {
 		switch (opt) {
 		case 'r':
 			opts->raw_device_path = optarg;
@@ -215,6 +219,9 @@ static int parse_args(int argc, char **argv, struct options *opts)
 		case 'p':
 			if (parse_hex16(optarg, &opts->product_id) != 0)
 				return -1;
+			break;
+		case 'n':
+			opts->startup_soft_reconnect = false;
 			break;
 		case 'V':
 			opts->verbose = true;
@@ -1248,6 +1255,28 @@ static void log_udc_wait_state(struct raw_runtime *runtime, const char *reason)
 		runtime->udc_device);
 }
 
+static void log_udc_state(struct raw_runtime *runtime, const char *reason)
+{
+	char state[128];
+
+	if (!runtime->udc_device)
+		return;
+
+	if (read_udc_state(runtime->udc_device, state, sizeof(state)) == 0) {
+		fprintf(stderr,
+			"%s on %s (udc_state=%s)\n",
+			reason,
+			runtime->udc_device,
+			state);
+		return;
+	}
+
+	fprintf(stderr,
+		"%s on %s\n",
+		reason,
+		runtime->udc_device);
+}
+
 static int prepare_standard_request(struct raw_runtime *runtime,
 				    const struct usb_ctrlrequest *setup,
 				    enum control_action *action,
@@ -1484,7 +1513,8 @@ static int handle_connect(struct raw_runtime *runtime)
 	fprintf(stderr,
 		"Raw Gadget selected bulk OUT endpoint address 0x%02x\n",
 		runtime->bulk_out_address);
-	log_udc_wait_state(runtime, "Host attach detected");
+	log_udc_state(runtime,
+		      "Raw Gadget connect event observed (UDC session active, not proof of host enumeration)");
 	return 0;
 }
 
@@ -1639,7 +1669,10 @@ int main(int argc, char **argv)
 		report_raw_run_failure(udc_driver, udc_device, errno);
 		goto out;
 	}
-	prime_udc_attach_state(udc_device, runtime.verbose);
+	if (opts.startup_soft_reconnect)
+		force_udc_soft_reconnect(udc_device, runtime.verbose);
+	else
+		prime_udc_attach_state(udc_device, runtime.verbose);
 
 	printf("DisplayLink Raw Gadget prepared. raw=%s udc_driver=%s udc_device=%s\n",
 	       opts.raw_device_path,
