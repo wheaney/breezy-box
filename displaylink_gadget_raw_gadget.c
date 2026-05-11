@@ -21,6 +21,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <SDL2/SDL.h>
+
 #include "udl_sink.h"
 
 #define DISPLAYLINK_VENDOR_ID 0x17e9
@@ -54,7 +56,9 @@ struct options {
 	uint16_t product_id;
 	uint32_t decode_width;
 	uint32_t decode_height;
+	uint32_t window_scale;
 	bool decode_stream;
+	bool show_window;
 	bool startup_soft_reconnect;
 	bool verbose;
 };
@@ -69,8 +73,15 @@ struct udl_decode_runtime {
 	uint32_t width;
 	uint32_t height;
 	const char *dump_image_path;
+	pthread_t viewer_thread;
+	pthread_mutex_t framebuffer_mutex;
+	atomic_bool viewer_thread_stop;
+	bool viewer_thread_created;
+	bool framebuffer_mutex_initialized;
 	bool enabled;
+	bool viewer_enabled;
 	bool verbose;
+	uint32_t window_scale;
 };
 
 struct __attribute__((packed)) gadget_endpoint_descriptor {
@@ -139,6 +150,9 @@ static const uint8_t k_std_channel[16] = {
 
 static volatile sig_atomic_t stop_requested = 0;
 
+static uint32_t udl_decoder_visible_width(const struct udl_decode_runtime *decoder);
+static uint32_t udl_decoder_visible_height(const struct udl_decode_runtime *decoder);
+
 #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
 #define host_to_le16(value) ((uint16_t)(value))
 #else
@@ -158,6 +172,8 @@ static void usage(const char *argv0)
 		"  --product-id HEX        USB product ID (default: 0x0104)\n"
 		"  --decode-width PIXELS   Sink storage width for decoded traffic (default: 1920)\n"
 		"  --decode-height PIXELS  Sink storage height for decoded traffic (default: 1080)\n"
+		"  --show-window           Display the decoded framebuffer in a live SDL2 window\n"
+		"  --window-scale FACTOR   Integer scale factor for the SDL2 viewer window (default: 1)\n"
 		"  --no-decode             Leave bulk traffic undecoded and only drain the endpoint\n"
 		"  --no-startup-reconnect  Do not force a startup soft disconnect/connect pulse\n"
 		"  --verbose               Log control requests and endpoint discovery\n",
@@ -219,6 +235,7 @@ static void default_options(struct options *opts)
 	opts->product_id = DISPLAYLINK_PRODUCT_ID;
 	opts->decode_width = DEFAULT_DISPLAY_WIDTH;
 	opts->decode_height = DEFAULT_DISPLAY_HEIGHT;
+	opts->window_scale = 1u;
 	opts->decode_stream = true;
 	opts->startup_soft_reconnect = true;
 	opts->verbose = false;
@@ -236,6 +253,8 @@ static int parse_args(int argc, char **argv, struct options *opts)
 		{ "product-id", required_argument, NULL, 'p' },
 		{ "decode-width", required_argument, NULL, 'W' },
 		{ "decode-height", required_argument, NULL, 'H' },
+		{ "show-window", no_argument, NULL, 's' },
+		{ "window-scale", required_argument, NULL, 'S' },
 		{ "no-decode", no_argument, NULL, 'x' },
 		{ "no-startup-reconnect", no_argument, NULL, 'n' },
 		{ "verbose", no_argument, NULL, 'V' },
@@ -244,7 +263,7 @@ static int parse_args(int argc, char **argv, struct options *opts)
 	};
 	int opt;
 
-	while ((opt = getopt_long(argc, argv, "r:e:o:u:d:v:p:W:H:xnVh", long_options, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "r:e:o:u:d:v:p:W:H:sS:xnVh", long_options, NULL)) != -1) {
 		switch (opt) {
 		case 'r':
 			opts->raw_device_path = optarg;
@@ -277,6 +296,13 @@ static int parse_args(int argc, char **argv, struct options *opts)
 			if (parse_u32(optarg, &opts->decode_height) != 0)
 				return -1;
 			break;
+		case 's':
+			opts->show_window = true;
+			break;
+		case 'S':
+			if (parse_u32(optarg, &opts->window_scale) != 0)
+				return -1;
+			break;
 		case 'x':
 			opts->decode_stream = false;
 			break;
@@ -297,6 +323,219 @@ static int parse_args(int argc, char **argv, struct options *opts)
 	return 0;
 }
 
+static void udl_decoder_lock(const struct udl_decode_runtime *decoder)
+{
+	if (decoder && decoder->framebuffer_mutex_initialized)
+		pthread_mutex_lock((pthread_mutex_t *)&decoder->framebuffer_mutex);
+}
+
+static void udl_decoder_unlock(const struct udl_decode_runtime *decoder)
+{
+	if (decoder && decoder->framebuffer_mutex_initialized)
+		pthread_mutex_unlock((pthread_mutex_t *)&decoder->framebuffer_mutex);
+}
+
+static int udl_decoder_copy_xrgb8888(const struct udl_decode_runtime *decoder,
+				     uint32_t *dst,
+				     size_t dst_pixels,
+				     uint32_t *visible_width_out,
+				     uint32_t *visible_height_out)
+{
+	uint32_t visible_width;
+	uint32_t visible_height;
+	size_t pixel_count;
+
+	if (!decoder || !decoder->framebuffer_xrgb8888 || !dst)
+		return -1;
+
+	pixel_count = (size_t)decoder->width * (size_t)decoder->height;
+	if (dst_pixels < pixel_count)
+		return -1;
+
+	udl_decoder_lock(decoder);
+	visible_width = udl_decoder_visible_width(decoder);
+	visible_height = udl_decoder_visible_height(decoder);
+	memcpy(dst, decoder->framebuffer_xrgb8888, pixel_count * sizeof(*dst));
+	udl_decoder_unlock(decoder);
+
+	if (visible_width_out)
+		*visible_width_out = visible_width;
+	if (visible_height_out)
+		*visible_height_out = visible_height;
+
+	return 0;
+}
+
+static void *udl_viewer_thread_main(void *arg)
+{
+	struct udl_decode_runtime *decoder = arg;
+	SDL_Window *window = NULL;
+	SDL_Renderer *renderer = NULL;
+	SDL_Texture *texture = NULL;
+	uint32_t *frame_copy = NULL;
+	size_t pixel_count;
+	int last_window_width = 0;
+	int last_window_height = 0;
+	int rc;
+
+	if (!decoder || !decoder->viewer_enabled || !decoder->framebuffer_xrgb8888)
+		return NULL;
+
+	rc = SDL_Init(SDL_INIT_VIDEO);
+	if (rc != 0) {
+		fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
+		stop_requested = 1;
+		return NULL;
+	}
+
+	pixel_count = (size_t)decoder->width * (size_t)decoder->height;
+	frame_copy = malloc(pixel_count * sizeof(*frame_copy));
+	if (!frame_copy) {
+		fprintf(stderr, "Unable to allocate SDL viewer frame copy buffer\n");
+		SDL_Quit();
+		stop_requested = 1;
+		return NULL;
+	}
+
+	window = SDL_CreateWindow("Breezy Box UDL Viewer",
+					 SDL_WINDOWPOS_CENTERED,
+					 SDL_WINDOWPOS_CENTERED,
+					 (int)decoder->width,
+					 (int)decoder->height,
+					 SDL_WINDOW_RESIZABLE);
+	if (!window) {
+		fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError());
+		free(frame_copy);
+		SDL_Quit();
+		stop_requested = 1;
+		return NULL;
+	}
+
+	renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+	if (!renderer)
+		renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
+	if (!renderer) {
+		fprintf(stderr, "SDL_CreateRenderer failed: %s\n", SDL_GetError());
+		SDL_DestroyWindow(window);
+		free(frame_copy);
+		SDL_Quit();
+		stop_requested = 1;
+		return NULL;
+	}
+
+	texture = SDL_CreateTexture(renderer,
+					   SDL_PIXELFORMAT_ARGB8888,
+					   SDL_TEXTUREACCESS_STREAMING,
+					   (int)decoder->width,
+					   (int)decoder->height);
+	if (!texture) {
+		fprintf(stderr, "SDL_CreateTexture failed: %s\n", SDL_GetError());
+		SDL_DestroyRenderer(renderer);
+		SDL_DestroyWindow(window);
+		free(frame_copy);
+		SDL_Quit();
+		stop_requested = 1;
+		return NULL;
+	}
+
+	while (!stop_requested && !atomic_load(&decoder->viewer_thread_stop)) {
+		SDL_Event event;
+		uint32_t visible_width = decoder->width;
+		uint32_t visible_height = decoder->height;
+		SDL_Rect src_rect;
+		SDL_Rect dst_rect;
+
+		while (SDL_PollEvent(&event)) {
+			if (event.type == SDL_QUIT) {
+				stop_requested = 1;
+				break;
+			}
+		}
+
+		if (udl_decoder_copy_xrgb8888(decoder,
+					     frame_copy,
+					     pixel_count,
+					     &visible_width,
+					     &visible_height) != 0) {
+			SDL_Delay(16u);
+			continue;
+		}
+
+		if (visible_width == 0u)
+			visible_width = decoder->width;
+		if (visible_height == 0u)
+			visible_height = decoder->height;
+
+		if (last_window_width != (int)(visible_width * decoder->window_scale) ||
+		    last_window_height != (int)(visible_height * decoder->window_scale)) {
+			last_window_width = (int)(visible_width * decoder->window_scale);
+			last_window_height = (int)(visible_height * decoder->window_scale);
+			SDL_SetWindowSize(window, last_window_width, last_window_height);
+		}
+
+		if (SDL_UpdateTexture(texture,
+					 NULL,
+					 frame_copy,
+					 (int)(decoder->width * sizeof(*frame_copy))) != 0) {
+			fprintf(stderr, "SDL_UpdateTexture failed: %s\n", SDL_GetError());
+			stop_requested = 1;
+			break;
+		}
+
+		src_rect.x = 0;
+		src_rect.y = 0;
+		src_rect.w = (int)visible_width;
+		src_rect.h = (int)visible_height;
+		dst_rect.x = 0;
+		dst_rect.y = 0;
+		dst_rect.w = last_window_width;
+		dst_rect.h = last_window_height;
+
+		SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+		SDL_RenderClear(renderer);
+		SDL_RenderCopy(renderer, texture, &src_rect, &dst_rect);
+		SDL_RenderPresent(renderer);
+		SDL_Delay(16u);
+	}
+
+	SDL_DestroyTexture(texture);
+	SDL_DestroyRenderer(renderer);
+	SDL_DestroyWindow(window);
+	free(frame_copy);
+	SDL_Quit();
+	return NULL;
+}
+
+static int udl_decoder_start_viewer(struct udl_decode_runtime *decoder)
+{
+	int rc;
+
+	if (!decoder || !decoder->viewer_enabled || decoder->viewer_thread_created)
+		return 0;
+
+	atomic_store(&decoder->viewer_thread_stop, false);
+	rc = pthread_create(&decoder->viewer_thread, NULL, udl_viewer_thread_main, decoder);
+	if (rc != 0) {
+		errno = rc;
+		perror("pthread_create SDL viewer");
+		return -1;
+	}
+
+	decoder->viewer_thread_created = true;
+	return 0;
+}
+
+static void udl_decoder_stop_viewer(struct udl_decode_runtime *decoder)
+{
+	if (!decoder || !decoder->viewer_thread_created)
+		return;
+
+	atomic_store(&decoder->viewer_thread_stop, true);
+	SDL_PushEvent(&(SDL_Event){ .type = SDL_QUIT });
+	(void)pthread_join(decoder->viewer_thread, NULL);
+	decoder->viewer_thread_created = false;
+}
+
 static int udl_decoder_init(struct udl_decode_runtime *decoder, const struct options *opts)
 {
 	size_t pixel_count;
@@ -307,6 +546,8 @@ static int udl_decoder_init(struct udl_decode_runtime *decoder, const struct opt
 	decoder->width = opts->decode_width;
 	decoder->height = opts->decode_height;
 	decoder->dump_image_path = opts->dump_image_path;
+	decoder->viewer_enabled = opts->show_window;
+	decoder->window_scale = opts->window_scale;
 
 	if (!decoder->enabled)
 		return 0;
@@ -319,11 +560,15 @@ static int udl_decoder_init(struct udl_decode_runtime *decoder, const struct opt
 	decoder->framebuffer_rgb565 = calloc(pixel_count, sizeof(*decoder->framebuffer_rgb565));
 	if (!decoder->framebuffer_rgb565)
 		return -1;
-	if (decoder->dump_image_path) {
+	if (decoder->dump_image_path || decoder->viewer_enabled) {
 		decoder->framebuffer_xrgb8888 = calloc(pixel_count, sizeof(*decoder->framebuffer_xrgb8888));
 		if (!decoder->framebuffer_xrgb8888)
 			return -1;
 	}
+	if (pthread_mutex_init(&decoder->framebuffer_mutex, NULL) != 0)
+		return -1;
+	decoder->framebuffer_mutex_initialized = true;
+	atomic_init(&decoder->viewer_thread_stop, false);
 
 	udl_sink_init(&decoder->sink,
 		      decoder->framebuffer_rgb565,
@@ -345,8 +590,13 @@ static void udl_decoder_destroy(struct udl_decode_runtime *decoder)
 	if (!decoder)
 		return;
 
+	udl_decoder_stop_viewer(decoder);
 	udl_transport_destroy(&decoder->transport);
 	udl_sink_destroy(&decoder->sink);
+	if (decoder->framebuffer_mutex_initialized) {
+		pthread_mutex_destroy(&decoder->framebuffer_mutex);
+		decoder->framebuffer_mutex_initialized = false;
+	}
 	free(decoder->framebuffer_rgb565);
 	free(decoder->framebuffer_xrgb8888);
 	decoder->framebuffer_rgb565 = NULL;
@@ -405,6 +655,7 @@ static int udl_decoder_dump_image(const struct udl_decode_runtime *decoder)
 		return -1;
 	}
 
+	udl_decoder_lock(decoder);
 	for (row = 0; row < height; ++row) {
 		const uint32_t *src = decoder->framebuffer_xrgb8888 + ((size_t)row * decoder->width);
 		uint32_t column;
@@ -417,12 +668,14 @@ static int udl_decoder_dump_image(const struct udl_decode_runtime *decoder)
 		}
 
 		if (fwrite(row_buffer, 1u, (size_t)width * 3u, file) != (size_t)width * 3u) {
+			udl_decoder_unlock(decoder);
 			perror("write PPM pixels");
 			free(row_buffer);
 			fclose(file);
 			return -1;
 		}
 	}
+	udl_decoder_unlock(decoder);
 
 	free(row_buffer);
 	if (fclose(file) != 0) {
@@ -471,15 +724,18 @@ static int udl_decoder_feed(struct udl_decode_runtime *decoder, const uint8_t *d
 
 	decoder->bulk_packets += 1u;
 	decoder->bulk_bytes += length;
+	udl_decoder_lock(decoder);
 	before_stats = udl_transport_get_stats(&decoder->transport);
 	transport_result = udl_transport_feed(&decoder->transport, data, length, &damage);
 	if (transport_result != UDL_TRANSPORT_OK) {
+		udl_decoder_unlock(decoder);
 		fprintf(stderr,
 			"UDL transport error: %s\n",
 			udl_transport_result_string(transport_result));
 		return -1;
 	}
 	after_stats = udl_transport_get_stats(&decoder->transport);
+	udl_decoder_unlock(decoder);
 
 	if (decoder->verbose && after_stats.decoded_commands > before_stats.decoded_commands) {
 		if (damage.touched) {
@@ -1496,6 +1752,7 @@ static void shutdown_raw_gadget(struct raw_runtime *runtime,
 				const char *udc_device)
 {
 	stop_bulk_out_drain_thread(runtime);
+	udl_decoder_stop_viewer(&runtime->decoder);
 	if (runtime->fd >= 0) {
 		reset_configuration_state(runtime);
 		(void)set_udc_soft_connect(udc_device,
@@ -1916,6 +2173,14 @@ int main(int argc, char **argv)
 		fprintf(stderr, "--dump-image requires decode support; remove --no-decode\n");
 		return EXIT_FAILURE;
 	}
+	if (!opts.decode_stream && opts.show_window) {
+		fprintf(stderr, "--show-window requires decode support; remove --no-decode\n");
+		return EXIT_FAILURE;
+	}
+	if (opts.window_scale == 0u) {
+		fprintf(stderr, "--window-scale must be at least 1\n");
+		return EXIT_FAILURE;
+	}
 
 	if ((!opts.udc_driver || !opts.udc_device) &&
 	    auto_detect_udc(udc_driver, sizeof(udc_driver), udc_device, sizeof(udc_device)) != 0) {
@@ -1937,6 +2202,10 @@ int main(int argc, char **argv)
 	atomic_init(&runtime.bulk_out_thread_stop, false);
 	if (udl_decoder_init(&runtime.decoder, &opts) != 0) {
 		fprintf(stderr, "Unable to initialize UDL decode runtime\n");
+		goto out;
+	}
+	if (udl_decoder_start_viewer(&runtime.decoder) != 0) {
+		fprintf(stderr, "Unable to start SDL viewer\n");
 		goto out;
 	}
 	build_default_edid(runtime.edid);
@@ -1977,6 +2246,9 @@ int main(int argc, char **argv)
 		printf("UDL decode is enabled with sink storage %ux%u. Bulk OUT traffic will be decoded as it arrives.\n",
 		       runtime.decoder.width,
 		       runtime.decoder.height);
+		if (runtime.decoder.viewer_enabled)
+			printf("A live SDL2 viewer window will be shown at %ux scale.\n",
+			       runtime.decoder.window_scale);
 		if (runtime.decoder.dump_image_path)
 			printf("A decoded snapshot will be written to %s on exit.\n",
 			       runtime.decoder.dump_image_path);

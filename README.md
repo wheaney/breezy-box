@@ -79,7 +79,13 @@ If `/dev/raw-gadget` still does not exist after that, the current kernel likely 
 sudo ./displaylink_gadget_raw_gadget --udc-device fe800000.usb --verbose
 ```
 
-The raw-gadget binary now accepts `--decode-width` and `--decode-height` to size the sink storage, `--no-decode` to fall back to pure bulk draining while debugging the USB path, and `--dump-image /tmp/udl.ppm` to write the latest decoded frame as a binary PPM image on exit.
+The raw-gadget binary now accepts `--decode-width` and `--decode-height` to size the sink storage, `--no-decode` to fall back to pure bulk draining while debugging the USB path, `--dump-image /tmp/udl.ppm` to write the latest decoded frame as a binary PPM image on exit, and `--show-window` to display the decoded framebuffer live in a basic SDL2 window.
+
+Example with a live viewer window and an exit snapshot:
+
+```sh
+sudo ./displaylink_gadget_raw_gadget --udc-device fe800000.usb --show-window --dump-image /tmp/udl.ppm --verbose
+```
 
 If you want to test the host against a real monitor identity instead of the built-in synthetic EDID, pass a 128-byte base EDID blob directly:
 
