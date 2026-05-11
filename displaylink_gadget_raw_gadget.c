@@ -21,6 +21,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "udl_sink.h"
+
 #define DISPLAYLINK_VENDOR_ID 0x17e9
 #define DISPLAYLINK_PRODUCT_ID 0x0104
 
@@ -45,11 +47,29 @@
 struct options {
 	const char *raw_device_path;
 	const char *edid_path;
+	const char *dump_image_path;
 	const char *udc_driver;
 	const char *udc_device;
 	uint16_t vendor_id;
 	uint16_t product_id;
+	uint32_t decode_width;
+	uint32_t decode_height;
+	bool decode_stream;
 	bool startup_soft_reconnect;
+	bool verbose;
+};
+
+struct udl_decode_runtime {
+	struct udl_sink sink;
+	struct udl_transport transport;
+	uint16_t *framebuffer_rgb565;
+	uint32_t *framebuffer_xrgb8888;
+	uint64_t bulk_packets;
+	uint64_t bulk_bytes;
+	uint32_t width;
+	uint32_t height;
+	const char *dump_image_path;
+	bool enabled;
 	bool verbose;
 };
 
@@ -99,6 +119,7 @@ struct raw_runtime {
 	uint8_t edid[128];
 	uint8_t vendor_descriptor[16];
 	size_t vendor_descriptor_len;
+	struct udl_decode_runtime decoder;
 };
 
 enum control_action {
@@ -130,10 +151,14 @@ static void usage(const char *argv0)
 		"Usage: %s [options]\n"
 		"  --raw-device PATH       Raw Gadget device node (default: /dev/raw-gadget)\n"
 		"  --edid-file PATH        Override the built-in 128-byte EDID with a binary blob\n"
+		"  --dump-image PATH       Write a binary PPM snapshot of the decoded frame on exit\n"
 		"  --udc-driver NAME       UDC driver name (default: auto-detect)\n"
 		"  --udc-device NAME       UDC device name (default: auto-detect)\n"
 		"  --vendor-id HEX         USB vendor ID (default: 0x17e9)\n"
 		"  --product-id HEX        USB product ID (default: 0x0104)\n"
+		"  --decode-width PIXELS   Sink storage width for decoded traffic (default: 1920)\n"
+		"  --decode-height PIXELS  Sink storage height for decoded traffic (default: 1080)\n"
+		"  --no-decode             Leave bulk traffic undecoded and only drain the endpoint\n"
 		"  --no-startup-reconnect  Do not force a startup soft disconnect/connect pulse\n"
 		"  --verbose               Log control requests and endpoint discovery\n",
 		argv0);
@@ -172,12 +197,29 @@ static int parse_hex16(const char *text, uint16_t *value)
 	return 0;
 }
 
+static int parse_u32(const char *text, uint32_t *value)
+{
+	char *end = NULL;
+	unsigned long parsed;
+
+	errno = 0;
+	parsed = strtoul(text, &end, 0);
+	if (errno != 0 || !end || *end != '\0' || parsed > 0xffffffffUL)
+		return -1;
+
+	*value = (uint32_t)parsed;
+	return 0;
+}
+
 static void default_options(struct options *opts)
 {
 	memset(opts, 0, sizeof(*opts));
 	opts->raw_device_path = DEFAULT_RAW_DEVICE_PATH;
 	opts->vendor_id = DISPLAYLINK_VENDOR_ID;
 	opts->product_id = DISPLAYLINK_PRODUCT_ID;
+	opts->decode_width = DEFAULT_DISPLAY_WIDTH;
+	opts->decode_height = DEFAULT_DISPLAY_HEIGHT;
+	opts->decode_stream = true;
 	opts->startup_soft_reconnect = true;
 	opts->verbose = false;
 }
@@ -187,10 +229,14 @@ static int parse_args(int argc, char **argv, struct options *opts)
 	static const struct option long_options[] = {
 		{ "raw-device", required_argument, NULL, 'r' },
 		{ "edid-file", required_argument, NULL, 'e' },
+		{ "dump-image", required_argument, NULL, 'o' },
 		{ "udc-driver", required_argument, NULL, 'u' },
 		{ "udc-device", required_argument, NULL, 'd' },
 		{ "vendor-id", required_argument, NULL, 'v' },
 		{ "product-id", required_argument, NULL, 'p' },
+		{ "decode-width", required_argument, NULL, 'W' },
+		{ "decode-height", required_argument, NULL, 'H' },
+		{ "no-decode", no_argument, NULL, 'x' },
 		{ "no-startup-reconnect", no_argument, NULL, 'n' },
 		{ "verbose", no_argument, NULL, 'V' },
 		{ "help", no_argument, NULL, 'h' },
@@ -198,13 +244,16 @@ static int parse_args(int argc, char **argv, struct options *opts)
 	};
 	int opt;
 
-	while ((opt = getopt_long(argc, argv, "r:e:u:d:v:p:nVh", long_options, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "r:e:o:u:d:v:p:W:H:xnVh", long_options, NULL)) != -1) {
 		switch (opt) {
 		case 'r':
 			opts->raw_device_path = optarg;
 			break;
 		case 'e':
 			opts->edid_path = optarg;
+			break;
+		case 'o':
+			opts->dump_image_path = optarg;
 			break;
 		case 'u':
 			opts->udc_driver = optarg;
@@ -220,6 +269,17 @@ static int parse_args(int argc, char **argv, struct options *opts)
 			if (parse_hex16(optarg, &opts->product_id) != 0)
 				return -1;
 			break;
+		case 'W':
+			if (parse_u32(optarg, &opts->decode_width) != 0)
+				return -1;
+			break;
+		case 'H':
+			if (parse_u32(optarg, &opts->decode_height) != 0)
+				return -1;
+			break;
+		case 'x':
+			opts->decode_stream = false;
+			break;
 		case 'n':
 			opts->startup_soft_reconnect = false;
 			break;
@@ -232,6 +292,225 @@ static int parse_args(int argc, char **argv, struct options *opts)
 		default:
 			return -1;
 		}
+	}
+
+	return 0;
+}
+
+static int udl_decoder_init(struct udl_decode_runtime *decoder, const struct options *opts)
+{
+	size_t pixel_count;
+
+	memset(decoder, 0, sizeof(*decoder));
+	decoder->enabled = opts->decode_stream;
+	decoder->verbose = opts->verbose;
+	decoder->width = opts->decode_width;
+	decoder->height = opts->decode_height;
+	decoder->dump_image_path = opts->dump_image_path;
+
+	if (!decoder->enabled)
+		return 0;
+	if (decoder->width == 0u || decoder->height == 0u)
+		return -1;
+	if ((size_t)decoder->height > SIZE_MAX / (size_t)decoder->width)
+		return -1;
+
+	pixel_count = (size_t)decoder->width * (size_t)decoder->height;
+	decoder->framebuffer_rgb565 = calloc(pixel_count, sizeof(*decoder->framebuffer_rgb565));
+	if (!decoder->framebuffer_rgb565)
+		return -1;
+	if (decoder->dump_image_path) {
+		decoder->framebuffer_xrgb8888 = calloc(pixel_count, sizeof(*decoder->framebuffer_xrgb8888));
+		if (!decoder->framebuffer_xrgb8888)
+			return -1;
+	}
+
+	udl_sink_init(&decoder->sink,
+		      decoder->framebuffer_rgb565,
+		      decoder->width,
+		      decoder->height,
+		      decoder->width);
+	udl_transport_init(&decoder->transport, &decoder->sink);
+	if (decoder->framebuffer_xrgb8888) {
+		udl_sink_attach_xrgb8888_output(&decoder->sink,
+					       decoder->framebuffer_xrgb8888,
+					       decoder->width);
+	}
+
+	return 0;
+}
+
+static void udl_decoder_destroy(struct udl_decode_runtime *decoder)
+{
+	if (!decoder)
+		return;
+
+	udl_transport_destroy(&decoder->transport);
+	udl_sink_destroy(&decoder->sink);
+	free(decoder->framebuffer_rgb565);
+	free(decoder->framebuffer_xrgb8888);
+	decoder->framebuffer_rgb565 = NULL;
+	decoder->framebuffer_xrgb8888 = NULL;
+}
+
+static uint32_t udl_decoder_visible_width(const struct udl_decode_runtime *decoder)
+{
+	const uint16_t signaled_width = udl_sink_get_hpixels(&decoder->sink);
+
+	if (signaled_width != 0u && signaled_width <= decoder->width)
+		return signaled_width;
+
+	return decoder->width;
+}
+
+static uint32_t udl_decoder_visible_height(const struct udl_decode_runtime *decoder)
+{
+	const uint16_t signaled_height = udl_sink_get_vpixels(&decoder->sink);
+
+	if (signaled_height != 0u && signaled_height <= decoder->height)
+		return signaled_height;
+
+	return decoder->height;
+}
+
+static int udl_decoder_dump_image(const struct udl_decode_runtime *decoder)
+{
+	FILE *file;
+	uint8_t *row_buffer;
+	const uint32_t width = udl_decoder_visible_width(decoder);
+	const uint32_t height = udl_decoder_visible_height(decoder);
+	uint32_t row;
+
+	if (!decoder || !decoder->enabled || !decoder->dump_image_path || !decoder->framebuffer_xrgb8888)
+		return 0;
+	if (width == 0u || height == 0u)
+		return 0;
+
+	file = fopen(decoder->dump_image_path, "wb");
+	if (!file) {
+		perror(decoder->dump_image_path);
+		return -1;
+	}
+
+	if (fprintf(file, "P6\n%u %u\n255\n", width, height) < 0) {
+		perror("write PPM header");
+		fclose(file);
+		return -1;
+	}
+
+	row_buffer = malloc((size_t)width * 3u);
+	if (!row_buffer) {
+		fprintf(stderr, "Unable to allocate row buffer for image dump\n");
+		fclose(file);
+		return -1;
+	}
+
+	for (row = 0; row < height; ++row) {
+		const uint32_t *src = decoder->framebuffer_xrgb8888 + ((size_t)row * decoder->width);
+		uint32_t column;
+
+		for (column = 0; column < width; ++column) {
+			const uint32_t pixel = src[column];
+			row_buffer[(size_t)column * 3u] = (uint8_t)(pixel >> 16);
+			row_buffer[(size_t)column * 3u + 1u] = (uint8_t)(pixel >> 8);
+			row_buffer[(size_t)column * 3u + 2u] = (uint8_t)pixel;
+		}
+
+		if (fwrite(row_buffer, 1u, (size_t)width * 3u, file) != (size_t)width * 3u) {
+			perror("write PPM pixels");
+			free(row_buffer);
+			fclose(file);
+			return -1;
+		}
+	}
+
+	free(row_buffer);
+	if (fclose(file) != 0) {
+		perror("close PPM image");
+		return -1;
+	}
+
+	fprintf(stderr,
+		"Wrote decoded framebuffer snapshot to %s (%ux%u)\n",
+		decoder->dump_image_path,
+		width,
+		height);
+	return 0;
+}
+
+static void udl_decoder_print_summary(const struct udl_decode_runtime *decoder)
+{
+	const struct udl_transport_stats stats = udl_transport_get_stats(&decoder->transport);
+
+	if (!decoder || !decoder->enabled)
+		return;
+
+	fprintf(stderr,
+		"UDL decode summary: bulk_packets=%llu bulk_bytes=%llu commands=%llu errors=%llu dropped=%llu configured=%ux%u signaled=%ux%u depth=%u\n",
+		(unsigned long long)decoder->bulk_packets,
+		(unsigned long long)decoder->bulk_bytes,
+		(unsigned long long)stats.decoded_commands,
+		(unsigned long long)stats.decode_errors,
+		(unsigned long long)stats.dropped_bytes,
+		decoder->width,
+		decoder->height,
+		(unsigned int)udl_sink_get_hpixels(&decoder->sink),
+		(unsigned int)udl_sink_get_vpixels(&decoder->sink),
+		(unsigned int)udl_sink_get_color_depth(&decoder->sink));
+}
+
+static int udl_decoder_feed(struct udl_decode_runtime *decoder, const uint8_t *data, size_t length)
+{
+	enum udl_transport_result transport_result;
+	struct udl_sink_damage damage;
+	struct udl_transport_stats before_stats;
+	struct udl_transport_stats after_stats;
+
+	if (!decoder || !decoder->enabled || !data || length == 0u)
+		return 0;
+
+	decoder->bulk_packets += 1u;
+	decoder->bulk_bytes += length;
+	before_stats = udl_transport_get_stats(&decoder->transport);
+	transport_result = udl_transport_feed(&decoder->transport, data, length, &damage);
+	if (transport_result != UDL_TRANSPORT_OK) {
+		fprintf(stderr,
+			"UDL transport error: %s\n",
+			udl_transport_result_string(transport_result));
+		return -1;
+	}
+	after_stats = udl_transport_get_stats(&decoder->transport);
+
+	if (decoder->verbose && after_stats.decoded_commands > before_stats.decoded_commands) {
+		if (damage.touched) {
+			fprintf(stderr,
+				"decoded %llu command(s) from %zu-byte chunk damage=(%u,%u)-(%u,%u) pixels=%u mode=%ux%u depth=%u\n",
+				(unsigned long long)(after_stats.decoded_commands - before_stats.decoded_commands),
+				length,
+				damage.x1,
+				damage.y1,
+				damage.x2,
+				damage.y2,
+				damage.pixel_count,
+				(unsigned int)udl_sink_get_hpixels(&decoder->sink),
+				(unsigned int)udl_sink_get_vpixels(&decoder->sink),
+				(unsigned int)udl_sink_get_color_depth(&decoder->sink));
+		} else {
+			fprintf(stderr,
+				"decoded %llu command(s) from %zu-byte chunk mode=%ux%u depth=%u\n",
+				(unsigned long long)(after_stats.decoded_commands - before_stats.decoded_commands),
+				length,
+				(unsigned int)udl_sink_get_hpixels(&decoder->sink),
+				(unsigned int)udl_sink_get_vpixels(&decoder->sink),
+				(unsigned int)udl_sink_get_color_depth(&decoder->sink));
+		}
+	}
+	if (decoder->verbose && after_stats.decode_errors > before_stats.decode_errors) {
+		fprintf(stderr,
+			"UDL transport resync/errors while processing %zu-byte chunk: +%llu error(s) +%llu dropped byte(s)\n",
+			length,
+			(unsigned long long)(after_stats.decode_errors - before_stats.decode_errors),
+			(unsigned long long)(after_stats.dropped_bytes - before_stats.dropped_bytes));
 	}
 
 	return 0;
@@ -984,6 +1263,8 @@ static void *bulk_out_drain_thread_main(void *arg)
 
 		if (runtime->verbose)
 			fprintf(stderr, "bulk OUT transferred %d bytes\n", rc);
+		if (udl_decoder_feed(&runtime->decoder, io.data, (size_t)rc) != 0)
+			break;
 	}
 
 	if (runtime->verbose)
@@ -1225,6 +1506,9 @@ static void shutdown_raw_gadget(struct raw_runtime *runtime,
 		close(runtime->fd);
 		runtime->fd = -1;
 	}
+	udl_decoder_print_summary(&runtime->decoder);
+	(void)udl_decoder_dump_image(&runtime->decoder);
+	udl_decoder_destroy(&runtime->decoder);
 }
 
 static void reset_configuration_state(struct raw_runtime *runtime)
@@ -1628,6 +1912,10 @@ int main(int argc, char **argv)
 		usage(argv[0]);
 		return EXIT_FAILURE;
 	}
+	if (!opts.decode_stream && opts.dump_image_path) {
+		fprintf(stderr, "--dump-image requires decode support; remove --no-decode\n");
+		return EXIT_FAILURE;
+	}
 
 	if ((!opts.udc_driver || !opts.udc_device) &&
 	    auto_detect_udc(udc_driver, sizeof(udc_driver), udc_device, sizeof(udc_device)) != 0) {
@@ -1647,6 +1935,10 @@ int main(int argc, char **argv)
 	runtime.bulk_out_address = DEFAULT_BULK_OUT_ADDRESS;
 	runtime.verbose = opts.verbose;
 	atomic_init(&runtime.bulk_out_thread_stop, false);
+	if (udl_decoder_init(&runtime.decoder, &opts) != 0) {
+		fprintf(stderr, "Unable to initialize UDL decode runtime\n");
+		goto out;
+	}
 	build_default_edid(runtime.edid);
 	if (opts.edid_path && load_edid_file(opts.edid_path, runtime.edid) != 0)
 		goto out;
@@ -1681,7 +1973,16 @@ int main(int argc, char **argv)
 	if (opts.edid_path)
 		printf("Using EDID override from %s\n", opts.edid_path);
 	printf("Entering Raw Gadget event loop. Press Ctrl+C to stop.\n");
-	printf("This control-plane prototype enables the DisplayLink vendor descriptor/channel/EDID path and drains bulk OUT traffic, but it does not yet decode or render the stream.\n");
+	if (runtime.decoder.enabled) {
+		printf("UDL decode is enabled with sink storage %ux%u. Bulk OUT traffic will be decoded as it arrives.\n",
+		       runtime.decoder.width,
+		       runtime.decoder.height);
+		if (runtime.decoder.dump_image_path)
+			printf("A decoded snapshot will be written to %s on exit.\n",
+			       runtime.decoder.dump_image_path);
+	} else {
+		printf("UDL decode is disabled; bulk OUT traffic will only be drained.\n");
+	}
 
 	if (run_loop(&runtime) != 0)
 		goto out;

@@ -54,7 +54,7 @@ We need a new component that will use a libcomposite integration to create the d
 This component would also be responsible for decoding the damage data coming in over the DisplayLink protocol and updating a DRM buffer with the latest textures for use in the 3D rendering. Although I've listed this as its own component, this would most likely live as a separate thread in the DRM/KMS rendering application, in order to have simpler access to shared memory for rendering.
 
 Current prototype status:
-The active path is now the Raw Gadget implementation in `displaylink_gadget_raw_gadget.c`. It owns ep0 completely, so it can answer the DisplayLink-specific vendor descriptor (`0x5f`), channel-select, and EDID control requests directly from userspace and log the subsequent control traffic. It also drains bulk OUT traffic after `SET_CONFIGURATION` so the host is not left writing into an unserviced endpoint.
+The active path is now the Raw Gadget implementation in `displaylink_gadget_raw_gadget.c`. It owns ep0 completely, so it can answer the DisplayLink-specific vendor descriptor (`0x5f`), channel-select, and EDID control requests directly from userspace and log the subsequent control traffic. It also drains bulk OUT traffic after `SET_CONFIGURATION` and now feeds that stream into the `modules/udl_sink` decoder so the latest frame can be reconstructed in userspace.
 
 Build notes:
 
@@ -78,6 +78,8 @@ If `/dev/raw-gadget` still does not exist after that, the current kernel likely 
 ```sh
 sudo ./displaylink_gadget_raw_gadget --udc-device fe800000.usb --verbose
 ```
+
+The raw-gadget binary now accepts `--decode-width` and `--decode-height` to size the sink storage, `--no-decode` to fall back to pure bulk draining while debugging the USB path, and `--dump-image /tmp/udl.ppm` to write the latest decoded frame as a binary PPM image on exit.
 
 If you want to test the host against a real monitor identity instead of the built-in synthetic EDID, pass a 128-byte base EDID blob directly:
 
