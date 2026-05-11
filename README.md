@@ -54,37 +54,17 @@ We need a new component that will use a libcomposite integration to create the d
 This component would also be responsible for decoding the damage data coming in over the DisplayLink protocol and updating a DRM buffer with the latest textures for use in the 3D rendering. Although I've listed this as its own component, this would most likely live as a separate thread in the DRM/KMS rendering application, in order to have simpler access to shared memory for rendering.
 
 Current prototype status:
-The FunctionFS gadget prototype in `displaylink_gadget_ffs.c` now links against the `modules/udl_sink` submodule and incrementally decodes real bulk OUT traffic into the sink-side UDL decoder. That transport path is intentionally narrow: it handles USB chunk reassembly and command framing so split bulk reads can still be decoded, and it can now write the decoded frame to an inspectable binary PPM image on exit.
-
-There is now also a parallel GadgetFS prototype in `displaylink_gadget_gadgetfs.c`. Unlike the FunctionFS version, it owns the device-level ep0 control path in userspace and can answer the specific UDL probe requests the Linux host driver cares about: the vendor firmware descriptor, the standard channel-select vendor request, and per-byte EDID reads. This is intended as the next experiment for full old-DisplayLink impersonation.
-
-There is also now a Raw Gadget fallback prototype in `displaylink_gadget_raw_gadget.c`. This exists because GadgetFS handles standard `GET_DESCRIPTOR` requests in-kernel and does not delegate unknown descriptor types like DisplayLink's `0x5f` vendor descriptor back to userspace. The Raw Gadget version owns ep0 completely, so it can answer that descriptor request directly and log every subsequent control transfer. The current Raw Gadget cut is still control-plane first, but it now drains bulk OUT traffic after `SET_CONFIGURATION` so the host is not left writing into an unserviced endpoint. It still does not decode or render the stream.
+The active path is now the Raw Gadget implementation in `displaylink_gadget_raw_gadget.c`. It owns ep0 completely, so it can answer the DisplayLink-specific vendor descriptor (`0x5f`), channel-select, and EDID control requests directly from userspace and log the subsequent control traffic. It also drains bulk OUT traffic after `SET_CONFIGURATION` so the host is not left writing into an unserviced endpoint.
 
 Build notes:
 
 ```sh
-sudo apt install build-essential pkg-config libusbgx-dev libconfig-dev
+sudo apt install build-essential
 git submodule update --init --recursive
 make
 ```
 
-If `libusbgx` is installed but its pkg-config metadata is not discoverable on the target distro, the FunctionFS target now falls back to `-lusbgx` automatically. You can still force that path manually with:
-
-```sh
-make USBG_LIBS=-lusbgx
-```
-
-On some Armbian/Debian installs, `libusbgx.pc` is present but `pkg-config libusbgx` still fails until `libconfig-dev` is installed, because `libusbgx.pc` declares `libconfig` as a pkg-config dependency.
-
-The resulting `displaylink_gadget_ffs` binary accepts `--decode-width` and `--decode-height` to size the sink storage, `--no-decode` to fall back to raw bulk logging while debugging the USB transport, and `--dump-image out.ppm` to snapshot the latest decoded frame when the process exits.
-
-The `displaylink_gadget_gadgetfs` prototype is a separate binary for boards where `gadgetfs` is available. It mounts `gadgetfs`, opens the UDC device node under `/dev/gadget`, configures bulk endpoints, and feeds the host's UDL bulk traffic into the same sink-side decoder. Example:
-
-```sh
-sudo ./displaylink_gadget_gadgetfs --device-name fe800000.usb --verbose --dump-image /tmp/udl.ppm
-```
-
-The `displaylink_gadget_raw_gadget` prototype is the current fallback for boards where `raw_gadget` is available and the host needs to fetch the DisplayLink vendor descriptor through ep0. It auto-detects the first UDC when possible; otherwise pass both the UDC driver and device names explicitly. Example:
+The resulting `displaylink_gadget_raw_gadget` binary is the only maintained prototype now. It auto-detects the first UDC when possible; otherwise pass both the UDC driver and device names explicitly. Example:
 
 Before running it, make sure the Raw Gadget misc device exists. On modular kernels that usually means loading the module first:
 
