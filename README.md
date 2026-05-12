@@ -75,16 +75,46 @@ ls -l /dev/raw-gadget
 
 If `/dev/raw-gadget` still does not exist after that, the current kernel likely does not expose `CONFIG_USB_RAW_GADGET`.
 
+If `/sys/class/udc` exists but is empty, this is not an auto-detect naming problem. It means the running image is not exposing any gadget-capable UDC at all for the selected port, so passing `--udc-device` and `--udc-driver` will not help until the kernel/DT side is fixed. On the Rock Pi 4C+ OTG path, the shortest checks are:
+
+```sh
+ls -la /sys/class/udc
+lsmod | grep -E 'dwc|udc|gadget|raw_gadget'
+sudo ./inspect_usb_gadget_dt.sh
+```
+
+On a fresh image, an empty `/sys/class/udc` usually means the OTG controller is not configured for peripheral mode, the relevant gadget/UDC drivers are missing, or the board kernel simply does not expose a UDC for that port.
+
+On the current Rock Pi 4C+ Armbian image, the stock board DTB configures `fe800000` as host-only. If you want the maintained Raw Gadget path to survive reboots or fresh images, install the matching boot overlay once on the SBC:
+
+```sh
+sudo ./install_usb0_peripheral_overlay.sh
+sudo reboot
+```
+
+That installer writes `/boot/overlay-user/rk3399-rock-4c-plus-usb0-peripheral.dtbo` and ensures `/boot/armbianEnv.txt` includes the matching `user_overlays` entry.
+
+After reboot, the shortest sanity checks are:
+
+```sh
+tr '\0' '\n' < /proc/device-tree/usb@fe800000/usb@fe800000/dr_mode
+ls -la /sys/class/udc
+```
+
+The expected good state is `dr_mode=peripheral` and a populated `/sys/class/udc/fe800000.usb`.
+
 ```sh
 sudo ./displaylink_gadget_raw_gadget --udc-device fe800000.usb --verbose
 ```
 
-The raw-gadget binary now accepts `--decode-width` and `--decode-height` to size the sink storage, `--no-decode` to fall back to pure bulk draining while debugging the USB path, `--dump-image /tmp/udl.ppm` to write the latest decoded frame as a binary PPM image on exit, and `--show-window` to display the decoded framebuffer live in a basic SDL2 window.
+The raw-gadget binary now accepts `--decode-width` and `--decode-height` to size the sink storage, `--no-decode` to fall back to pure bulk draining while debugging the USB path, `--dump-image /tmp/udl.ppm` to write the latest decoded frame as a binary PPM image on exit, `--show-window` to display the decoded framebuffer live in a basic SDL2 window, and `--usb-speed high|super` to select the advertised link speed. The default is back to high-speed because forcing super-speed changed host behavior enough to break the current viewer-oriented bring-up path.
 
 Example with a live viewer window and an exit snapshot:
 
 ```sh
 sudo ./displaylink_gadget_raw_gadget --udc-device fe800000.usb --show-window --dump-image /tmp/udl.ppm --verbose
+
+If you want to retry the newer USB 3 descriptor path explicitly, add `--usb-speed super`.
 ```
 
 If you want to test the host against a real monitor identity instead of the built-in synthetic EDID, pass a 128-byte base EDID blob directly:

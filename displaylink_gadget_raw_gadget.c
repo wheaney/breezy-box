@@ -54,6 +54,7 @@ struct options {
 	const char *udc_device;
 	uint16_t vendor_id;
 	uint16_t product_id;
+	enum usb_device_speed usb_speed;
 	uint32_t decode_width;
 	uint32_t decode_height;
 	uint32_t window_scale;
@@ -145,6 +146,7 @@ struct raw_runtime {
 	bool bulk_out_thread_created;
 	bool verbose;
 	atomic_bool bulk_out_thread_stop;
+	enum usb_device_speed usb_speed;
 	struct usb_device_descriptor device_descriptor;
 	struct usb_qualifier_descriptor qualifier_descriptor;
 	struct gadget_bos_block bos_descriptor;
@@ -174,6 +176,16 @@ static volatile sig_atomic_t stop_requested = 0;
 static uint32_t udl_decoder_visible_width(const struct udl_decode_runtime *decoder);
 static uint32_t udl_decoder_visible_height(const struct udl_decode_runtime *decoder);
 
+static bool usb_speed_is_super(enum usb_device_speed speed)
+{
+	return speed == USB_SPEED_SUPER || speed == USB_SPEED_SUPER_PLUS;
+}
+
+static const char *usb_speed_name(enum usb_device_speed speed)
+{
+	return usb_speed_is_super(speed) ? "super" : "high";
+}
+
 #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
 #define host_to_le16(value) ((uint16_t)(value))
 #else
@@ -191,6 +203,7 @@ static void usage(const char *argv0)
 		"  --udc-device NAME       UDC device name (default: auto-detect)\n"
 		"  --vendor-id HEX         USB vendor ID (default: 0x17e9)\n"
 		"  --product-id HEX        USB product ID (default: 0x0104)\n"
+		"  --usb-speed MODE        USB link speed: high or super (default: high)\n"
 		"  --decode-width PIXELS   Sink storage width for decoded traffic (default: 1920)\n"
 		"  --decode-height PIXELS  Sink storage height for decoded traffic (default: 1080)\n"
 		"  --show-window           Display the decoded framebuffer in a live SDL2 window\n"
@@ -248,12 +261,29 @@ static int parse_u32(const char *text, uint32_t *value)
 	return 0;
 }
 
+static int parse_usb_speed(const char *text, enum usb_device_speed *speed)
+{
+	if (!text || !speed)
+		return -1;
+	if (strcmp(text, "high") == 0) {
+		*speed = USB_SPEED_HIGH;
+		return 0;
+	}
+	if (strcmp(text, "super") == 0) {
+		*speed = USB_SPEED_SUPER;
+		return 0;
+	}
+
+	return -1;
+}
+
 static void default_options(struct options *opts)
 {
 	memset(opts, 0, sizeof(*opts));
 	opts->raw_device_path = DEFAULT_RAW_DEVICE_PATH;
 	opts->vendor_id = DISPLAYLINK_VENDOR_ID;
 	opts->product_id = DISPLAYLINK_PRODUCT_ID;
+	opts->usb_speed = USB_SPEED_HIGH;
 	opts->decode_width = DEFAULT_DISPLAY_WIDTH;
 	opts->decode_height = DEFAULT_DISPLAY_HEIGHT;
 	opts->window_scale = 1u;
@@ -272,6 +302,7 @@ static int parse_args(int argc, char **argv, struct options *opts)
 		{ "udc-device", required_argument, NULL, 'd' },
 		{ "vendor-id", required_argument, NULL, 'v' },
 		{ "product-id", required_argument, NULL, 'p' },
+		{ "usb-speed", required_argument, NULL, 'm' },
 		{ "decode-width", required_argument, NULL, 'W' },
 		{ "decode-height", required_argument, NULL, 'H' },
 		{ "show-window", no_argument, NULL, 's' },
@@ -284,7 +315,7 @@ static int parse_args(int argc, char **argv, struct options *opts)
 	};
 	int opt;
 
-	while ((opt = getopt_long(argc, argv, "r:e:o:u:d:v:p:W:H:sS:xnVh", long_options, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "r:e:o:u:d:v:p:m:W:H:sS:xnVh", long_options, NULL)) != -1) {
 		switch (opt) {
 		case 'r':
 			opts->raw_device_path = optarg;
@@ -307,6 +338,10 @@ static int parse_args(int argc, char **argv, struct options *opts)
 			break;
 		case 'p':
 			if (parse_hex16(optarg, &opts->product_id) != 0)
+				return -1;
+			break;
+		case 'm':
+			if (parse_usb_speed(optarg, &opts->usb_speed) != 0)
 				return -1;
 			break;
 		case 'W':
@@ -1011,6 +1046,17 @@ static int auto_detect_udc(char *driver_buffer,
 	}
 
 	closedir(directory);
+	if (found == 0) {
+		fprintf(stderr,
+			"Unable to auto-detect a UDC under /sys/class/udc because no gadget-capable controllers are currently exposed there.\n");
+		fprintf(stderr,
+			"On a fresh image this usually means the OTG/device controller is not configured for peripheral mode, the relevant USB gadget/UDC drivers are not loaded, or this board/kernel does not expose a UDC for the chosen port.\n");
+		fprintf(stderr,
+			"Check: 'ls -la /sys/class/udc', 'lsmod | grep -E \"dwc|udc|gadget|raw_gadget\"', and the live DT for usb@fe800000 / usb2phy@e450 if this is the Rock Pi OTG path.\n");
+		fprintf(stderr,
+			"If the new image names the controller differently, rerun with explicit '--udc-device <name> --udc-driver <name>' after inspecting /sys/class/udc and the matching uevent file.\n");
+		return -1;
+	}
 	if (found != 1) {
 		fprintf(stderr, "Unable to auto-detect a UDC under /sys/class/udc\n");
 		return -1;
@@ -1386,14 +1432,16 @@ static void build_vendor_descriptor(struct raw_runtime *runtime)
 static void build_device_descriptor(struct raw_runtime *runtime,
 				    const struct options *opts)
 {
+	const bool super_speed = usb_speed_is_super(opts->usb_speed);
+
 	memset(&runtime->device_descriptor, 0, sizeof(runtime->device_descriptor));
 	runtime->device_descriptor.bLength = USB_DT_DEVICE_SIZE;
 	runtime->device_descriptor.bDescriptorType = USB_DT_DEVICE;
-	runtime->device_descriptor.bcdUSB = host_to_le16(0x0300u);
+	runtime->device_descriptor.bcdUSB = host_to_le16(super_speed ? 0x0300u : 0x0200u);
 	runtime->device_descriptor.bDeviceClass = USB_CLASS_PER_INTERFACE;
 	runtime->device_descriptor.bDeviceSubClass = 0u;
 	runtime->device_descriptor.bDeviceProtocol = 0u;
-	runtime->device_descriptor.bMaxPacketSize0 = 9u;
+	runtime->device_descriptor.bMaxPacketSize0 = super_speed ? 9u : 64u;
 	runtime->device_descriptor.idVendor = host_to_le16(opts->vendor_id);
 	runtime->device_descriptor.idProduct = host_to_le16(opts->product_id);
 	runtime->device_descriptor.bcdDevice = host_to_le16(0x0001u);
@@ -1420,6 +1468,9 @@ static void build_device_qualifier(struct raw_runtime *runtime)
 static void build_bos_descriptor(struct raw_runtime *runtime)
 {
 	memset(&runtime->bos_descriptor, 0, sizeof(runtime->bos_descriptor));
+	if (!usb_speed_is_super(runtime->usb_speed))
+		return;
+
 	runtime->bos_descriptor.bos.bLength = USB_DT_BOS_SIZE;
 	runtime->bos_descriptor.bos.bDescriptorType = USB_DT_BOS;
 	runtime->bos_descriptor.bos.wTotalLength = host_to_le16(sizeof(runtime->bos_descriptor));
@@ -1841,7 +1892,7 @@ static int enable_bulk_out_endpoint(struct raw_runtime *runtime)
 	descriptor.bDescriptorType = USB_DT_ENDPOINT;
 	descriptor.bEndpointAddress = runtime->bulk_out_address;
 	descriptor.bmAttributes = USB_ENDPOINT_XFER_BULK;
-	descriptor.wMaxPacketSize = host_to_le16(1024u);
+	descriptor.wMaxPacketSize = host_to_le16(usb_speed_is_super(runtime->usb_speed) ? 1024u : 512u);
 
 	handle = raw_ep_enable(runtime->fd, &descriptor);
 	if (handle < 0) {
@@ -2014,6 +2065,8 @@ static int prepare_standard_request(struct raw_runtime *runtime,
 			*action = CONTROL_ACTION_WRITE;
 			return 0;
 		case USB_DT_BOS:
+			if (!usb_speed_is_super(runtime->usb_speed))
+				return 1;
 			memcpy(io->data,
 			       &runtime->bos_descriptor,
 			       sizeof(runtime->bos_descriptor));
@@ -2034,7 +2087,7 @@ static int prepare_standard_request(struct raw_runtime *runtime,
 								  ? runtime->bulk_out_address
 								  : DEFAULT_BULK_OUT_ADDRESS,
 						  false,
-						  true);
+						  usb_speed_is_super(runtime->usb_speed));
 			if (response_length == 0u)
 				return -1;
 			io->inner.length = response_length;
@@ -2377,6 +2430,7 @@ int main(int argc, char **argv)
 	runtime.udc_device = udc_device;
 	runtime.bulk_out_handle = -1;
 	runtime.bulk_out_address = DEFAULT_BULK_OUT_ADDRESS;
+	runtime.usb_speed = opts.usb_speed;
 	runtime.verbose = opts.verbose;
 	atomic_init(&runtime.bulk_out_thread_stop, false);
 	if (udl_decoder_init(&runtime.decoder, &opts) != 0) {
@@ -2402,7 +2456,7 @@ int main(int argc, char **argv)
 		goto out;
 	}
 
-	if (raw_init(runtime.fd, USB_SPEED_SUPER, udc_driver, udc_device) != 0) {
+	if (raw_init(runtime.fd, opts.usb_speed, udc_driver, udc_device) != 0) {
 		perror("ioctl USB_RAW_IOCTL_INIT");
 		goto out;
 	}
@@ -2420,6 +2474,8 @@ int main(int argc, char **argv)
 	       opts.raw_device_path,
 	       udc_driver,
 	       udc_device);
+	printf("Using %s-speed USB descriptors and endpoint settings.\n",
+	       usb_speed_name(opts.usb_speed));
 	if (opts.edid_path)
 		printf("Using EDID override from %s\n", opts.edid_path);
 	printf("Entering Raw Gadget event loop. Press Ctrl+C to stop.\n");
