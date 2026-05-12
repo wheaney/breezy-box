@@ -41,15 +41,21 @@ capture_tree() {
     local name="$1"
     local root="$2"
     local outfile="$OUT_DIR/$name.txt"
+    local resolved_root="$root"
+
+    if [[ -L "$root" ]]; then
+        resolved_root="$(readlink -f "$root" 2>/dev/null || printf '%s' "$root")"
+    fi
 
     {
         printf '## root\n%s\n\n' "$root"
-        if [[ ! -e "$root" ]]; then
+        printf '## resolved_root\n%s\n\n' "$resolved_root"
+        if [[ ! -e "$resolved_root" ]]; then
             printf 'missing\n'
             exit 0
         fi
 
-        find "$root" -maxdepth 3 \( -type f -o -type l \) | sort | while read -r path; do
+        find "$resolved_root" -maxdepth 4 \( -type f -o -type l \) | sort | while read -r path; do
             printf '## %s\n' "$path"
             if [[ -L "$path" ]]; then
                 readlink "$path" || true
