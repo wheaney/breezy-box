@@ -1137,6 +1137,24 @@ static void force_udc_soft_reconnect(const char *udc_device, bool verbose)
 	(void)set_udc_soft_connect(udc_device, "connect", verbose, true);
 }
 
+static void diagnose_udc_attach_state(const char *udc_device, bool verbose)
+{
+	char state[128];
+
+	if (read_udc_state(udc_device, state, sizeof(state)) != 0) {
+		if (verbose)
+			perror("read /sys/class/udc/.../state");
+		return;
+	}
+
+	if (strcmp(state, "not attached") != 0)
+		return;
+
+	fprintf(stderr,
+		"UDC %s still reports 'not attached' after startup recovery. If the cable is connected, the host did not observe a fresh attach, soft_connect may be unsupported on this UDC, or the controller/host port still needs a harder reset.\n",
+		udc_device);
+}
+
 static void prime_udc_attach_state(const char *udc_device, bool verbose)
 {
 	char state[128];
@@ -2326,6 +2344,7 @@ int main(int argc, char **argv)
 		force_udc_soft_reconnect(udc_device, runtime.verbose);
 	else
 		prime_udc_attach_state(udc_device, runtime.verbose);
+	diagnose_udc_attach_state(udc_device, runtime.verbose);
 
 	printf("DisplayLink Raw Gadget prepared. raw=%s udc_driver=%s udc_device=%s\n",
 	       opts.raw_device_path,
