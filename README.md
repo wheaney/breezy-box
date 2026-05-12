@@ -115,6 +115,14 @@ sudo ./capture_root_display_state.sh --driver udl
 
 That root capture includes `/sys/kernel/debug/dri/*/{state,summary,clients,framebuffer,name}` where available, filtered kernel journal output, `dmesg`, `modetest -M udl`, and matching DRM sysfs connector state.
 
+When the failure is lower than DRM and the SBC-side UDC never gets past `not attached`, there is also a dedicated gadget/PHY capture helper:
+
+```sh
+sudo ./capture_usb_gadget_state.sh --udc fe800000.usb
+```
+
+That capture bundles `/sys/class/udc`, role-switch, Type-C, extcon, PHY, selected controller sysfs, and filtered USB/UDC kernel logs so persistent attach failures can be compared across boots and cable/power cycles.
+
 ## Limitations
 
 The decision to go with DisplayLink has a couple repurcussions that mainly impact streaming and gaming. Since Breezy Box is intended to be a productivity device, the simplicity that DisplayLink offers this design seems worth that tradeoff.

@@ -1137,9 +1137,51 @@ static void force_udc_soft_reconnect(const char *udc_device, bool verbose)
 	(void)set_udc_soft_connect(udc_device, "connect", verbose, true);
 }
 
+static void log_usb_role_switch_states(bool verbose)
+{
+	DIR *directory;
+	struct dirent *entry;
+	bool found = false;
+
+	directory = opendir("/sys/class/usb_role");
+	if (!directory) {
+		if (verbose && errno != ENOENT && errno != ENOTDIR)
+			perror("opendir /sys/class/usb_role");
+		return;
+	}
+
+	while ((entry = readdir(directory)) != NULL) {
+		char path[512];
+		char value[128];
+
+		if (entry->d_name[0] == '.')
+			continue;
+		found = true;
+		if (snprintf(path,
+			     sizeof(path),
+			     "/sys/class/usb_role/%s/role",
+			     entry->d_name) >= (int)sizeof(path))
+			continue;
+		if (read_single_line_file(path, value, sizeof(value)) == 0) {
+			fprintf(stderr,
+				"USB role switch %s currently reports '%s'\n",
+				entry->d_name,
+				value);
+		}
+	}
+
+	closedir(directory);
+	if (verbose && !found) {
+		fprintf(stderr,
+			"No USB role switches were exposed under /sys/class/usb_role\n");
+	}
+}
+
 static void diagnose_udc_attach_state(const char *udc_device, bool verbose)
 {
+	char path[512];
 	char state[128];
+	char value[128];
 
 	if (read_udc_state(udc_device, state, sizeof(state)) != 0) {
 		if (verbose)
@@ -1153,6 +1195,34 @@ static void diagnose_udc_attach_state(const char *udc_device, bool verbose)
 	fprintf(stderr,
 		"UDC %s still reports 'not attached' after startup recovery. If the cable is connected, the host did not observe a fresh attach, soft_connect may be unsupported on this UDC, or the controller/host port still needs a harder reset.\n",
 		udc_device);
+
+	if (snprintf(path,
+		     sizeof(path),
+		     "/sys/class/udc/%s/current_speed",
+		     udc_device) < (int)sizeof(path) &&
+		read_single_line_file(path, value, sizeof(value)) == 0) {
+		fprintf(stderr,
+			"UDC %s current_speed=%s\n",
+			udc_device,
+			value);
+	}
+
+	if (snprintf(path,
+		     sizeof(path),
+		     "/sys/class/udc/%s/soft_connect",
+		     udc_device) < (int)sizeof(path)) {
+		if (access(path, F_OK) == 0) {
+			fprintf(stderr,
+				"UDC %s exposes soft_connect; the startup disconnect/connect pulse was attempted.\n",
+				udc_device);
+		} else {
+			fprintf(stderr,
+				"UDC %s does not expose soft_connect; userspace cannot force a reattach pulse on this controller.\n",
+				udc_device);
+		}
+	}
+
+	log_usb_role_switch_states(verbose);
 }
 
 static void prime_udc_attach_state(const char *udc_device, bool verbose)
