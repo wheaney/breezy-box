@@ -93,10 +93,30 @@ struct __attribute__((packed)) gadget_endpoint_descriptor {
 	uint8_t bInterval;
 };
 
+struct __attribute__((packed)) gadget_ss_ep_comp_descriptor {
+	uint8_t bLength;
+	uint8_t bDescriptorType;
+	uint8_t bMaxBurst;
+	uint8_t bmAttributes;
+	uint16_t wBytesPerInterval;
+};
+
 struct __attribute__((packed)) gadget_config_block {
 	struct usb_config_descriptor config;
 	struct usb_interface_descriptor interface;
 	struct gadget_endpoint_descriptor bulk_out;
+};
+
+struct __attribute__((packed)) gadget_ss_config_block {
+	struct usb_config_descriptor config;
+	struct usb_interface_descriptor interface;
+	struct gadget_endpoint_descriptor bulk_out;
+	struct gadget_ss_ep_comp_descriptor bulk_out_companion;
+};
+
+struct __attribute__((packed)) gadget_bos_block {
+	struct usb_bos_descriptor bos;
+	struct usb_ss_cap_descriptor ss_cap;
 };
 
 struct usb_raw_control_event {
@@ -127,6 +147,7 @@ struct raw_runtime {
 	atomic_bool bulk_out_thread_stop;
 	struct usb_device_descriptor device_descriptor;
 	struct usb_qualifier_descriptor qualifier_descriptor;
+	struct gadget_bos_block bos_descriptor;
 	uint8_t edid[128];
 	uint8_t vendor_descriptor[16];
 	size_t vendor_descriptor_len;
@@ -1280,11 +1301,11 @@ static void build_device_descriptor(struct raw_runtime *runtime,
 	memset(&runtime->device_descriptor, 0, sizeof(runtime->device_descriptor));
 	runtime->device_descriptor.bLength = USB_DT_DEVICE_SIZE;
 	runtime->device_descriptor.bDescriptorType = USB_DT_DEVICE;
-	runtime->device_descriptor.bcdUSB = host_to_le16(0x0200u);
+	runtime->device_descriptor.bcdUSB = host_to_le16(0x0300u);
 	runtime->device_descriptor.bDeviceClass = USB_CLASS_PER_INTERFACE;
 	runtime->device_descriptor.bDeviceSubClass = 0u;
 	runtime->device_descriptor.bDeviceProtocol = 0u;
-	runtime->device_descriptor.bMaxPacketSize0 = 64u;
+	runtime->device_descriptor.bMaxPacketSize0 = 9u;
 	runtime->device_descriptor.idVendor = host_to_le16(opts->vendor_id);
 	runtime->device_descriptor.idProduct = host_to_le16(opts->product_id);
 	runtime->device_descriptor.bcdDevice = host_to_le16(0x0001u);
@@ -1306,6 +1327,27 @@ static void build_device_qualifier(struct raw_runtime *runtime)
 	runtime->qualifier_descriptor.bMaxPacketSize0 = 64u;
 	runtime->qualifier_descriptor.bNumConfigurations = 1u;
 	runtime->qualifier_descriptor.bRESERVED = 0u;
+}
+
+static void build_bos_descriptor(struct raw_runtime *runtime)
+{
+	memset(&runtime->bos_descriptor, 0, sizeof(runtime->bos_descriptor));
+	runtime->bos_descriptor.bos.bLength = USB_DT_BOS_SIZE;
+	runtime->bos_descriptor.bos.bDescriptorType = USB_DT_BOS;
+	runtime->bos_descriptor.bos.wTotalLength = host_to_le16(sizeof(runtime->bos_descriptor));
+	runtime->bos_descriptor.bos.bNumDeviceCaps = 1u;
+
+	runtime->bos_descriptor.ss_cap.bLength = USB_DT_USB_SS_CAP_SIZE;
+	runtime->bos_descriptor.ss_cap.bDescriptorType = USB_DT_DEVICE_CAPABILITY;
+	runtime->bos_descriptor.ss_cap.bDevCapabilityType = USB_SS_CAP_TYPE;
+	runtime->bos_descriptor.ss_cap.bmAttributes = 0u;
+	runtime->bos_descriptor.ss_cap.wSpeedSupported = host_to_le16(
+		USB_FULL_SPEED_OPERATION |
+		USB_HIGH_SPEED_OPERATION |
+		USB_5GBPS_OPERATION);
+	runtime->bos_descriptor.ss_cap.bFunctionalitySupport = 3u;
+	runtime->bos_descriptor.ss_cap.bU1devExitLat = 0u;
+	runtime->bos_descriptor.ss_cap.bU2DevExitLat = host_to_le16(0u);
 }
 
 static size_t build_string_descriptor(uint8_t *buffer,
@@ -1357,13 +1399,53 @@ static size_t build_string_descriptor(uint8_t *buffer,
 static size_t build_config_descriptor(uint8_t *buffer,
 				      size_t capacity,
 				      uint8_t bulk_out_address,
-				      bool other_speed)
+				      bool other_speed,
+				      bool super_speed)
 {
 	struct gadget_config_block block;
-	const uint16_t total_length = (uint16_t)sizeof(block);
+	struct gadget_ss_config_block ss_block;
+	const uint16_t total_length = (uint16_t)(super_speed ? sizeof(ss_block) : sizeof(block));
 
-	if (capacity < sizeof(block))
+	if (capacity < total_length)
 		return 0u;
+
+	if (super_speed) {
+		memset(&ss_block, 0, sizeof(ss_block));
+		ss_block.config.bLength = USB_DT_CONFIG_SIZE;
+		ss_block.config.bDescriptorType = USB_DT_CONFIG;
+		ss_block.config.wTotalLength = host_to_le16(total_length);
+		ss_block.config.bNumInterfaces = 1u;
+		ss_block.config.bConfigurationValue = 1u;
+		ss_block.config.iConfiguration = 0u;
+		ss_block.config.bmAttributes = USB_CONFIG_ATT_ONE;
+		ss_block.config.bMaxPower = 8u;
+
+		ss_block.interface.bLength = USB_DT_INTERFACE_SIZE;
+		ss_block.interface.bDescriptorType = USB_DT_INTERFACE;
+		ss_block.interface.bInterfaceNumber = 0u;
+		ss_block.interface.bAlternateSetting = 0u;
+		ss_block.interface.bNumEndpoints = 1u;
+		ss_block.interface.bInterfaceClass = USB_CLASS_VENDOR_SPEC;
+		ss_block.interface.bInterfaceSubClass = 0u;
+		ss_block.interface.bInterfaceProtocol = 0u;
+		ss_block.interface.iInterface = 0u;
+
+		ss_block.bulk_out.bLength = USB_DT_ENDPOINT_SIZE;
+		ss_block.bulk_out.bDescriptorType = USB_DT_ENDPOINT;
+		ss_block.bulk_out.bEndpointAddress = bulk_out_address;
+		ss_block.bulk_out.bmAttributes = USB_ENDPOINT_XFER_BULK;
+		ss_block.bulk_out.wMaxPacketSize = host_to_le16(1024u);
+		ss_block.bulk_out.bInterval = 0u;
+
+		ss_block.bulk_out_companion.bLength = USB_DT_SS_EP_COMP_SIZE;
+		ss_block.bulk_out_companion.bDescriptorType = USB_DT_SS_ENDPOINT_COMP;
+		ss_block.bulk_out_companion.bMaxBurst = 0u;
+		ss_block.bulk_out_companion.bmAttributes = 0u;
+		ss_block.bulk_out_companion.wBytesPerInterval = host_to_le16(0u);
+
+		memcpy(buffer, &ss_block, sizeof(ss_block));
+		return sizeof(ss_block);
+	}
 
 	memset(&block, 0, sizeof(block));
 	block.config.bLength = USB_DT_CONFIG_SIZE;
@@ -1671,7 +1753,7 @@ static int enable_bulk_out_endpoint(struct raw_runtime *runtime)
 	descriptor.bDescriptorType = USB_DT_ENDPOINT;
 	descriptor.bEndpointAddress = runtime->bulk_out_address;
 	descriptor.bmAttributes = USB_ENDPOINT_XFER_BULK;
-	descriptor.wMaxPacketSize = host_to_le16(512u);
+	descriptor.wMaxPacketSize = host_to_le16(1024u);
 
 	handle = raw_ep_enable(runtime->fd, &descriptor);
 	if (handle < 0) {
@@ -1843,6 +1925,13 @@ static int prepare_standard_request(struct raw_runtime *runtime,
 			io->inner.length = sizeof(runtime->device_descriptor);
 			*action = CONTROL_ACTION_WRITE;
 			return 0;
+		case USB_DT_BOS:
+			memcpy(io->data,
+			       &runtime->bos_descriptor,
+			       sizeof(runtime->bos_descriptor));
+			io->inner.length = sizeof(runtime->bos_descriptor);
+			*action = CONTROL_ACTION_WRITE;
+			return 0;
 		case USB_DT_DEVICE_QUALIFIER:
 			memcpy(io->data,
 			       &runtime->qualifier_descriptor,
@@ -1856,7 +1945,8 @@ static int prepare_standard_request(struct raw_runtime *runtime,
 							  runtime->bulk_out_address_valid
 								  ? runtime->bulk_out_address
 								  : DEFAULT_BULK_OUT_ADDRESS,
-							  false);
+						  false,
+						  true);
 			if (response_length == 0u)
 				return -1;
 			io->inner.length = response_length;
@@ -1868,7 +1958,8 @@ static int prepare_standard_request(struct raw_runtime *runtime,
 							  runtime->bulk_out_address_valid
 								  ? runtime->bulk_out_address
 								  : DEFAULT_BULK_OUT_ADDRESS,
-							  true);
+						  true,
+						  false);
 			if (response_length == 0u)
 				return -1;
 			io->inner.length = response_length;
@@ -2214,6 +2305,7 @@ int main(int argc, char **argv)
 	build_vendor_descriptor(&runtime);
 	build_device_descriptor(&runtime, &opts);
 	build_device_qualifier(&runtime);
+	build_bos_descriptor(&runtime);
 	install_signal_handlers();
 
 	runtime.fd = open(opts.raw_device_path, O_RDWR);
@@ -2222,7 +2314,7 @@ int main(int argc, char **argv)
 		goto out;
 	}
 
-	if (raw_init(runtime.fd, USB_SPEED_HIGH, udc_driver, udc_device) != 0) {
+	if (raw_init(runtime.fd, USB_SPEED_SUPER, udc_driver, udc_device) != 0) {
 		perror("ioctl USB_RAW_IOCTL_INIT");
 		goto out;
 	}
