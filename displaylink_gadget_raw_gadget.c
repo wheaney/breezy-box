@@ -85,6 +85,7 @@ struct udl_decode_runtime {
 	pthread_t decode_thread;
 	pthread_t viewer_thread;
 	pthread_mutex_t packet_queue_mutex;
+	pthread_mutex_t performance_report_mutex;
 	pthread_mutex_t viewer_snapshot_mutex;
 	pthread_cond_t packet_queue_not_empty;
 	pthread_cond_t packet_queue_not_full;
@@ -98,10 +99,24 @@ struct udl_decode_runtime {
 	uint64_t packet_queue_backlog_since_nsec;
 	uint64_t packet_queue_last_log_nsec;
 	uint64_t packet_queue_full_waits;
+	uint64_t performance_last_report_nsec;
+	atomic_ullong perf_bulk_reads;
+	atomic_ullong perf_bulk_bytes;
+	atomic_ullong perf_decoded_commands;
+	atomic_ullong perf_damage_pixels;
+	atomic_ullong perf_damage_rectangles;
+	atomic_ullong perf_usb_read_wait_nsec;
+	atomic_ullong perf_queue_wait_nsec;
+	atomic_ullong perf_decode_nsec;
+	atomic_ullong perf_snapshot_copy_nsec;
+	atomic_ullong perf_sdl_upload_nsec;
+	atomic_ullong perf_sdl_present_nsec;
+	atomic_ullong perf_sdl_present_count;
 	atomic_bool decode_thread_stop;
 	atomic_bool viewer_thread_stop;
 	bool decode_thread_created;
 	bool packet_queue_initialized;
+	bool performance_report_mutex_initialized;
 	bool viewer_snapshot_mutex_initialized;
 	bool viewer_thread_created;
 	bool framebuffer_mutex_initialized;
@@ -221,6 +236,85 @@ static void udl_decoder_clear_damage(struct udl_sink_damage *damage)
 		return;
 
 	udl_sink_clear_damage(damage);
+}
+
+static void udl_decoder_record_counter(atomic_ullong *counter, uint64_t value)
+{
+	if (!counter || value == 0u)
+		return;
+
+	atomic_fetch_add(counter, (unsigned long long)value);
+}
+
+static void udl_decoder_maybe_log_performance(struct udl_decode_runtime *decoder)
+{
+	uint64_t now;
+	uint64_t interval_nsec;
+	unsigned long long bulk_reads;
+	unsigned long long bulk_bytes;
+	unsigned long long decoded_commands;
+	unsigned long long damage_pixels;
+	unsigned long long damage_rectangles;
+	unsigned long long usb_read_wait_nsec;
+	unsigned long long queue_wait_nsec;
+	unsigned long long decode_nsec;
+	unsigned long long snapshot_copy_nsec;
+	unsigned long long sdl_upload_nsec;
+	unsigned long long sdl_present_nsec;
+	unsigned long long sdl_present_count;
+	size_t queue_depth;
+
+	if (!decoder || !decoder->verbose || !decoder->performance_report_mutex_initialized)
+		return;
+
+	now = monotonic_nanoseconds();
+	if (now == 0u)
+		return;
+
+	pthread_mutex_lock(&decoder->performance_report_mutex);
+	if (decoder->performance_last_report_nsec == 0u) {
+		decoder->performance_last_report_nsec = now;
+		pthread_mutex_unlock(&decoder->performance_report_mutex);
+		return;
+	}
+
+	interval_nsec = now - decoder->performance_last_report_nsec;
+	if (interval_nsec < 1000000000ull) {
+		pthread_mutex_unlock(&decoder->performance_report_mutex);
+		return;
+	}
+	decoder->performance_last_report_nsec = now;
+	bulk_reads = atomic_exchange(&decoder->perf_bulk_reads, 0u);
+	bulk_bytes = atomic_exchange(&decoder->perf_bulk_bytes, 0u);
+	decoded_commands = atomic_exchange(&decoder->perf_decoded_commands, 0u);
+	damage_pixels = atomic_exchange(&decoder->perf_damage_pixels, 0u);
+	damage_rectangles = atomic_exchange(&decoder->perf_damage_rectangles, 0u);
+	usb_read_wait_nsec = atomic_exchange(&decoder->perf_usb_read_wait_nsec, 0u);
+	queue_wait_nsec = atomic_exchange(&decoder->perf_queue_wait_nsec, 0u);
+	decode_nsec = atomic_exchange(&decoder->perf_decode_nsec, 0u);
+	snapshot_copy_nsec = atomic_exchange(&decoder->perf_snapshot_copy_nsec, 0u);
+	sdl_upload_nsec = atomic_exchange(&decoder->perf_sdl_upload_nsec, 0u);
+	sdl_present_nsec = atomic_exchange(&decoder->perf_sdl_present_nsec, 0u);
+	sdl_present_count = atomic_exchange(&decoder->perf_sdl_present_count, 0u);
+	queue_depth = decoder->packet_queue_count;
+	pthread_mutex_unlock(&decoder->performance_report_mutex);
+
+	fprintf(stderr,
+		"UDL perf: interval=%.2fs reads=%llu bytes=%llu cmds=%llu rects=%llu pixels=%llu queue_depth=%zu usb_wait=%.2fms queue_wait=%.2fms decode=%.2fms snapshot=%.2fms sdl_upload=%.2fms sdl_present=%.2fms presents=%llu\n",
+		(double)interval_nsec / 1000000000.0,
+		bulk_reads,
+		bulk_bytes,
+		decoded_commands,
+		damage_rectangles,
+		damage_pixels,
+		queue_depth,
+		(double)usb_read_wait_nsec / 1000000.0,
+		(double)queue_wait_nsec / 1000000.0,
+		(double)decode_nsec / 1000000.0,
+		(double)snapshot_copy_nsec / 1000000.0,
+		(double)sdl_upload_nsec / 1000000.0,
+		(double)sdl_present_nsec / 1000000.0,
+		sdl_present_count);
 }
 
 static void udl_decoder_merge_damage(struct udl_sink_damage *dst,
@@ -571,6 +665,10 @@ static int udl_decoder_feed(struct udl_decode_runtime *decoder, const uint8_t *d
 	struct udl_sink_damage snapshot_damage;
 	struct udl_transport_stats before_stats;
 	struct udl_transport_stats after_stats;
+	uint64_t decode_start_nsec;
+	uint64_t decode_end_nsec;
+	uint64_t snapshot_start_nsec;
+	uint64_t snapshot_end_nsec;
 	uint32_t visible_width;
 	uint32_t visible_height;
 
@@ -579,6 +677,7 @@ static int udl_decoder_feed(struct udl_decode_runtime *decoder, const uint8_t *d
 
 	udl_decoder_clear_damage(&damage);
 	udl_decoder_clear_damage(&snapshot_damage);
+	decode_start_nsec = monotonic_nanoseconds();
 	udl_decoder_lock(decoder);
 	before_stats = udl_transport_get_stats(&decoder->transport);
 	transport_result = udl_transport_feed(&decoder->transport, data, length, &damage);
@@ -592,6 +691,7 @@ static int udl_decoder_feed(struct udl_decode_runtime *decoder, const uint8_t *d
 	visible_width = udl_decoder_visible_width(decoder);
 	visible_height = udl_decoder_visible_height(decoder);
 	snapshot_damage = damage;
+	snapshot_start_nsec = monotonic_nanoseconds();
 	if (decoder->viewer_enabled &&
 	    decoder->framebuffer_xrgb8888 &&
 	    decoder->viewer_snapshot_xrgb8888 &&
@@ -616,33 +716,22 @@ static int udl_decoder_feed(struct udl_decode_runtime *decoder, const uint8_t *d
 		}
 		pthread_mutex_unlock(&decoder->viewer_snapshot_mutex);
 	}
+	snapshot_end_nsec = monotonic_nanoseconds();
 	after_stats = udl_transport_get_stats(&decoder->transport);
 	udl_decoder_unlock(decoder);
-
-	if (decoder->verbose && after_stats.decoded_commands > before_stats.decoded_commands) {
-		if (damage.touched) {
-			fprintf(stderr,
-				"decoded %llu command(s) from %zu-byte chunk damage=(%u,%u)-(%u,%u) pixels=%u mode=%ux%u depth=%u\n",
-				(unsigned long long)(after_stats.decoded_commands - before_stats.decoded_commands),
-				length,
-				damage.x1,
-				damage.y1,
-				damage.x2,
-				damage.y2,
-				damage.pixel_count,
-				(unsigned int)udl_sink_get_hpixels(&decoder->sink),
-				(unsigned int)udl_sink_get_vpixels(&decoder->sink),
-				(unsigned int)udl_sink_get_color_depth(&decoder->sink));
-		} else {
-			fprintf(stderr,
-				"decoded %llu command(s) from %zu-byte chunk mode=%ux%u depth=%u\n",
-				(unsigned long long)(after_stats.decoded_commands - before_stats.decoded_commands),
-				length,
-				(unsigned int)udl_sink_get_hpixels(&decoder->sink),
-				(unsigned int)udl_sink_get_vpixels(&decoder->sink),
-				(unsigned int)udl_sink_get_color_depth(&decoder->sink));
-		}
+	decode_end_nsec = monotonic_nanoseconds();
+	udl_decoder_record_counter(&decoder->perf_decoded_commands,
+		(uint64_t)(after_stats.decoded_commands - before_stats.decoded_commands));
+	if (damage.touched) {
+		udl_decoder_record_counter(&decoder->perf_damage_pixels, damage.pixel_count);
+		udl_decoder_record_counter(&decoder->perf_damage_rectangles, 1u);
 	}
+	if (decode_end_nsec >= decode_start_nsec)
+		udl_decoder_record_counter(&decoder->perf_decode_nsec,
+			decode_end_nsec - decode_start_nsec);
+	if (snapshot_end_nsec >= snapshot_start_nsec)
+		udl_decoder_record_counter(&decoder->perf_snapshot_copy_nsec,
+			snapshot_end_nsec - snapshot_start_nsec);
 	if (decoder->verbose && after_stats.decode_errors > before_stats.decode_errors) {
 		fprintf(stderr,
 			"UDL transport resync/errors while processing %zu-byte chunk: +%llu error(s) +%llu dropped byte(s)\n",
@@ -650,6 +739,7 @@ static int udl_decoder_feed(struct udl_decode_runtime *decoder, const uint8_t *d
 			(unsigned long long)(after_stats.decode_errors - before_stats.decode_errors),
 			(unsigned long long)(after_stats.dropped_bytes - before_stats.dropped_bytes));
 	}
+	udl_decoder_maybe_log_performance(decoder);
 
 	return 0;
 }
@@ -698,6 +788,7 @@ static void *udl_decode_thread_main(void *arg)
 		udl_decoder_update_backlog_state_locked(decoder);
 		pthread_cond_signal(&decoder->packet_queue_not_full);
 		pthread_mutex_unlock(&decoder->packet_queue_mutex);
+		udl_decoder_maybe_log_performance(decoder);
 
 		if (udl_decoder_feed(decoder, packet, packet_length) != 0) {
 			stop_requested = 1;
@@ -764,9 +855,17 @@ static int udl_decoder_submit(struct udl_decode_runtime *decoder,
 	while (decoder->packet_queue_count == UDL_PACKET_QUEUE_CAPACITY &&
 	       !stop_requested &&
 	       !atomic_load(&decoder->decode_thread_stop)) {
+		uint64_t wait_start_nsec;
+		uint64_t wait_end_nsec;
+
 		decoder->packet_queue_full_waits += 1u;
 		udl_decoder_update_backlog_state_locked(decoder);
+		wait_start_nsec = monotonic_nanoseconds();
 		pthread_cond_wait(&decoder->packet_queue_not_full, &decoder->packet_queue_mutex);
+		wait_end_nsec = monotonic_nanoseconds();
+		if (wait_end_nsec >= wait_start_nsec)
+			udl_decoder_record_counter(&decoder->perf_queue_wait_nsec,
+				wait_end_nsec - wait_start_nsec);
 	}
 	if (stop_requested || atomic_load(&decoder->decode_thread_stop)) {
 		pthread_mutex_unlock(&decoder->packet_queue_mutex);
@@ -782,6 +881,9 @@ static int udl_decoder_submit(struct udl_decode_runtime *decoder,
 	udl_decoder_update_backlog_state_locked(decoder);
 	pthread_cond_signal(&decoder->packet_queue_not_empty);
 	pthread_mutex_unlock(&decoder->packet_queue_mutex);
+	udl_decoder_record_counter(&decoder->perf_bulk_reads, 1u);
+	udl_decoder_record_counter(&decoder->perf_bulk_bytes, length);
+	udl_decoder_maybe_log_performance(decoder);
 	return 0;
 }
 
@@ -853,6 +955,10 @@ static void *udl_viewer_thread_main(void *arg)
 		SDL_Rect dst_rect;
 		bool have_damage = false;
 		bool size_changed = false;
+		uint64_t upload_start_nsec;
+		uint64_t upload_end_nsec;
+		uint64_t present_start_nsec;
+		uint64_t present_end_nsec;
 
 		udl_decoder_clear_damage(&damage);
 
@@ -906,6 +1012,7 @@ static void *udl_viewer_thread_main(void *arg)
 			update_rect.y = (int)damage.y1;
 			update_rect.w = (int)(damage.x2 - damage.x1 + 1u);
 			update_rect.h = (int)(damage.y2 - damage.y1 + 1u);
+			upload_start_nsec = monotonic_nanoseconds();
 			if (SDL_UpdateTexture(texture,
 					     &update_rect,
 					     pixels,
@@ -915,6 +1022,10 @@ static void *udl_viewer_thread_main(void *arg)
 				stop_requested = 1;
 				break;
 			}
+			upload_end_nsec = monotonic_nanoseconds();
+			if (upload_end_nsec >= upload_start_nsec)
+				udl_decoder_record_counter(&decoder->perf_sdl_upload_nsec,
+					upload_end_nsec - upload_start_nsec);
 			udl_decoder_clear_damage(&decoder->viewer_pending_damage);
 			needs_present = true;
 		}
@@ -935,10 +1046,17 @@ static void *udl_viewer_thread_main(void *arg)
 		dst_rect.h = last_window_height;
 
 		SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+		present_start_nsec = monotonic_nanoseconds();
 		SDL_RenderClear(renderer);
 		SDL_RenderCopy(renderer, texture, &src_rect, &dst_rect);
 		SDL_RenderPresent(renderer);
+		present_end_nsec = monotonic_nanoseconds();
+		if (present_end_nsec >= present_start_nsec)
+			udl_decoder_record_counter(&decoder->perf_sdl_present_nsec,
+				present_end_nsec - present_start_nsec);
+		udl_decoder_record_counter(&decoder->perf_sdl_present_count, 1u);
 		needs_present = false;
+		udl_decoder_maybe_log_performance(decoder);
 		SDL_Delay(16u);
 	}
 
@@ -1025,6 +1143,9 @@ static int udl_decoder_init(struct udl_decode_runtime *decoder, const struct opt
 		goto fail;
 	}
 	decoder->packet_queue_initialized = true;
+	if (pthread_mutex_init(&decoder->performance_report_mutex, NULL) != 0)
+		goto fail;
+	decoder->performance_report_mutex_initialized = true;
 	if (pthread_mutex_init(&decoder->viewer_snapshot_mutex, NULL) != 0)
 		goto fail;
 	decoder->viewer_snapshot_mutex_initialized = true;
@@ -1033,6 +1154,18 @@ static int udl_decoder_init(struct udl_decode_runtime *decoder, const struct opt
 	decoder->framebuffer_mutex_initialized = true;
 	atomic_init(&decoder->decode_thread_stop, false);
 	atomic_init(&decoder->viewer_thread_stop, false);
+	atomic_init(&decoder->perf_bulk_reads, 0u);
+	atomic_init(&decoder->perf_bulk_bytes, 0u);
+	atomic_init(&decoder->perf_decoded_commands, 0u);
+	atomic_init(&decoder->perf_damage_pixels, 0u);
+	atomic_init(&decoder->perf_damage_rectangles, 0u);
+	atomic_init(&decoder->perf_usb_read_wait_nsec, 0u);
+	atomic_init(&decoder->perf_queue_wait_nsec, 0u);
+	atomic_init(&decoder->perf_decode_nsec, 0u);
+	atomic_init(&decoder->perf_snapshot_copy_nsec, 0u);
+	atomic_init(&decoder->perf_sdl_upload_nsec, 0u);
+	atomic_init(&decoder->perf_sdl_present_nsec, 0u);
+	atomic_init(&decoder->perf_sdl_present_count, 0u);
 	udl_decoder_clear_damage(&decoder->viewer_pending_damage);
 
 	udl_sink_init(&decoder->sink,
@@ -1070,6 +1203,10 @@ static void udl_decoder_destroy(struct udl_decode_runtime *decoder)
 		pthread_cond_destroy(&decoder->packet_queue_not_empty);
 		pthread_mutex_destroy(&decoder->packet_queue_mutex);
 		decoder->packet_queue_initialized = false;
+	}
+	if (decoder->performance_report_mutex_initialized) {
+		pthread_mutex_destroy(&decoder->performance_report_mutex);
+		decoder->performance_report_mutex_initialized = false;
 	}
 	if (decoder->viewer_snapshot_mutex_initialized) {
 		pthread_mutex_destroy(&decoder->viewer_snapshot_mutex);
@@ -2093,12 +2230,19 @@ static void *bulk_out_drain_thread_main(void *arg)
 
 	while (!stop_requested && !atomic_load(&runtime->bulk_out_thread_stop)) {
 		int rc;
+		uint64_t read_start_nsec;
+		uint64_t read_end_nsec;
 
 		memset(&io, 0, sizeof(io));
 		io.inner.ep = handle;
 		io.inner.length = sizeof(io.data);
 
+		read_start_nsec = monotonic_nanoseconds();
 		rc = raw_ep_read(runtime->fd, &io.inner);
+		read_end_nsec = monotonic_nanoseconds();
+		if (read_end_nsec >= read_start_nsec)
+			udl_decoder_record_counter(&runtime->decoder.perf_usb_read_wait_nsec,
+				read_end_nsec - read_start_nsec);
 		if (rc < 0) {
 			if (errno == EINTR && !stop_requested)
 				continue;
@@ -2107,10 +2251,9 @@ static void *bulk_out_drain_thread_main(void *arg)
 			break;
 		}
 
-		if (runtime->verbose)
-			fprintf(stderr, "bulk OUT transferred %d bytes\n", rc);
 		if (udl_decoder_submit(&runtime->decoder, io.data, (size_t)rc) != 0)
 			break;
+		udl_decoder_maybe_log_performance(&runtime->decoder);
 	}
 
 	if (runtime->verbose)
