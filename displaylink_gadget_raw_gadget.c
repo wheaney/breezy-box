@@ -114,6 +114,11 @@ struct udl_decode_runtime {
 	atomic_ullong perf_writerl16_commands;
 	atomic_ullong perf_writecopy16_commands;
 	atomic_ullong perf_writerlx16_commands;
+	atomic_ullong perf_writerlx16_raw_spans;
+	atomic_ullong perf_writerlx16_repeat_spans;
+	atomic_ullong perf_writerlx16_raw_pixels;
+	atomic_ullong perf_writerlx16_repeat_pixels;
+	atomic_ullong perf_writerlx16_raw_single_pixel_spans;
 	atomic_ullong perf_damage_pixels;
 	atomic_ullong perf_damage_rectangles;
 	atomic_ullong perf_usb_read_wait_nsec;
@@ -275,6 +280,11 @@ static void udl_decoder_maybe_log_performance(struct udl_decode_runtime *decoder
 	unsigned long long writerl16_commands;
 	unsigned long long writecopy16_commands;
 	unsigned long long writerlx16_commands;
+	unsigned long long writerlx16_raw_spans;
+	unsigned long long writerlx16_repeat_spans;
+	unsigned long long writerlx16_raw_pixels;
+	unsigned long long writerlx16_repeat_pixels;
+	unsigned long long writerlx16_raw_single_pixel_spans;
 	unsigned long long damage_pixels;
 	unsigned long long damage_rectangles;
 	unsigned long long usb_read_wait_nsec;
@@ -320,6 +330,11 @@ static void udl_decoder_maybe_log_performance(struct udl_decode_runtime *decoder
 	writerl16_commands = atomic_exchange(&decoder->perf_writerl16_commands, 0u);
 	writecopy16_commands = atomic_exchange(&decoder->perf_writecopy16_commands, 0u);
 	writerlx16_commands = atomic_exchange(&decoder->perf_writerlx16_commands, 0u);
+	writerlx16_raw_spans = atomic_exchange(&decoder->perf_writerlx16_raw_spans, 0u);
+	writerlx16_repeat_spans = atomic_exchange(&decoder->perf_writerlx16_repeat_spans, 0u);
+	writerlx16_raw_pixels = atomic_exchange(&decoder->perf_writerlx16_raw_pixels, 0u);
+	writerlx16_repeat_pixels = atomic_exchange(&decoder->perf_writerlx16_repeat_pixels, 0u);
+	writerlx16_raw_single_pixel_spans = atomic_exchange(&decoder->perf_writerlx16_raw_single_pixel_spans, 0u);
 	damage_pixels = atomic_exchange(&decoder->perf_damage_pixels, 0u);
 	damage_rectangles = atomic_exchange(&decoder->perf_damage_rectangles, 0u);
 	usb_read_wait_nsec = atomic_exchange(&decoder->perf_usb_read_wait_nsec, 0u);
@@ -333,7 +348,7 @@ static void udl_decoder_maybe_log_performance(struct udl_decode_runtime *decoder
 	pthread_mutex_unlock(&decoder->performance_report_mutex);
 
 	fprintf(stderr,
-		"UDL perf: interval=%.2fs reads=%llu bytes=%llu cmds=%llu nodmg=%llu reg=%llu reg_noop=%llu raw8=%llu rl8=%llu copy8=%llu rlx8=%llu raw16=%llu rl16=%llu copy16=%llu rlx16=%llu rects=%llu pixels=%llu queue_depth=%zu usb_wait=%.2fms queue_wait=%.2fms decode=%.2fms snapshot=%.2fms sdl_upload=%.2fms sdl_present=%.2fms presents=%llu\n",
+		"UDL perf: interval=%.2fs reads=%llu bytes=%llu cmds=%llu nodmg=%llu reg=%llu reg_noop=%llu raw8=%llu rl8=%llu copy8=%llu rlx8=%llu raw16=%llu rl16=%llu copy16=%llu rlx16=%llu rlx16_raw_spans=%llu rlx16_repeat_spans=%llu rlx16_raw_px=%llu rlx16_repeat_px=%llu rlx16_raw1=%llu rects=%llu pixels=%llu queue_depth=%zu usb_wait=%.2fms queue_wait=%.2fms decode=%.2fms snapshot=%.2fms sdl_upload=%.2fms sdl_present=%.2fms presents=%llu\n",
 		(double)interval_nsec / 1000000000.0,
 		bulk_reads,
 		bulk_bytes,
@@ -349,6 +364,11 @@ static void udl_decoder_maybe_log_performance(struct udl_decode_runtime *decoder
 		writerl16_commands,
 		writecopy16_commands,
 		writerlx16_commands,
+		writerlx16_raw_spans,
+		writerlx16_repeat_spans,
+		writerlx16_raw_pixels,
+		writerlx16_repeat_pixels,
+		writerlx16_raw_single_pixel_spans,
 		damage_rectangles,
 		damage_pixels,
 		queue_depth,
@@ -788,6 +808,16 @@ static int udl_decoder_feed(struct udl_decode_runtime *decoder, const uint8_t *d
 		(uint64_t)(after_stats.writecopy16_commands - before_stats.writecopy16_commands));
 	udl_decoder_record_counter(&decoder->perf_writerlx16_commands,
 		(uint64_t)(after_stats.writerlx16_commands - before_stats.writerlx16_commands));
+	udl_decoder_record_counter(&decoder->perf_writerlx16_raw_spans,
+		(uint64_t)(after_stats.writerlx16_raw_spans - before_stats.writerlx16_raw_spans));
+	udl_decoder_record_counter(&decoder->perf_writerlx16_repeat_spans,
+		(uint64_t)(after_stats.writerlx16_repeat_spans - before_stats.writerlx16_repeat_spans));
+	udl_decoder_record_counter(&decoder->perf_writerlx16_raw_pixels,
+		(uint64_t)(after_stats.writerlx16_raw_pixels - before_stats.writerlx16_raw_pixels));
+	udl_decoder_record_counter(&decoder->perf_writerlx16_repeat_pixels,
+		(uint64_t)(after_stats.writerlx16_repeat_pixels - before_stats.writerlx16_repeat_pixels));
+	udl_decoder_record_counter(&decoder->perf_writerlx16_raw_single_pixel_spans,
+		(uint64_t)(after_stats.writerlx16_raw_single_pixel_spans - before_stats.writerlx16_raw_single_pixel_spans));
 	if (damage.touched) {
 		udl_decoder_record_counter(&decoder->perf_damage_pixels, damage.pixel_count);
 		udl_decoder_record_counter(&decoder->perf_damage_rectangles, 1u);
@@ -1234,6 +1264,11 @@ static int udl_decoder_init(struct udl_decode_runtime *decoder, const struct opt
 	atomic_init(&decoder->perf_writerl16_commands, 0u);
 	atomic_init(&decoder->perf_writecopy16_commands, 0u);
 	atomic_init(&decoder->perf_writerlx16_commands, 0u);
+	atomic_init(&decoder->perf_writerlx16_raw_spans, 0u);
+	atomic_init(&decoder->perf_writerlx16_repeat_spans, 0u);
+	atomic_init(&decoder->perf_writerlx16_raw_pixels, 0u);
+	atomic_init(&decoder->perf_writerlx16_repeat_pixels, 0u);
+	atomic_init(&decoder->perf_writerlx16_raw_single_pixel_spans, 0u);
 	atomic_init(&decoder->perf_damage_pixels, 0u);
 	atomic_init(&decoder->perf_damage_rectangles, 0u);
 	atomic_init(&decoder->perf_usb_read_wait_nsec, 0u);
