@@ -45,6 +45,7 @@
 
 #define EP0_BUFFER_SIZE 512u
 #define BULK_OUT_BUFFER_SIZE 16384u
+#define UDL_PACKET_QUEUE_CAPACITY 256u
 
 struct options {
 	const char *raw_device_path;
@@ -64,6 +65,11 @@ struct options {
 	bool verbose;
 };
 
+struct udl_bulk_packet {
+	size_t length;
+	uint8_t data[BULK_OUT_BUFFER_SIZE];
+};
+
 struct udl_decode_runtime {
 	struct udl_sink sink;
 	struct udl_transport transport;
@@ -74,9 +80,20 @@ struct udl_decode_runtime {
 	uint32_t width;
 	uint32_t height;
 	const char *dump_image_path;
+	pthread_t decode_thread;
 	pthread_t viewer_thread;
+	pthread_mutex_t packet_queue_mutex;
+	pthread_cond_t packet_queue_not_empty;
+	pthread_cond_t packet_queue_not_full;
 	pthread_mutex_t framebuffer_mutex;
+	struct udl_bulk_packet packet_queue[UDL_PACKET_QUEUE_CAPACITY];
+	size_t packet_queue_read_index;
+	size_t packet_queue_write_index;
+	size_t packet_queue_count;
+	atomic_bool decode_thread_stop;
 	atomic_bool viewer_thread_stop;
+	bool decode_thread_created;
+	bool packet_queue_initialized;
 	bool viewer_thread_created;
 	bool framebuffer_mutex_initialized;
 	bool enabled;
@@ -422,6 +439,191 @@ static int udl_decoder_copy_xrgb8888(const struct udl_decode_runtime *decoder,
 	return 0;
 }
 
+static int udl_decoder_feed(struct udl_decode_runtime *decoder, const uint8_t *data, size_t length)
+{
+	enum udl_transport_result transport_result;
+	struct udl_sink_damage damage;
+	struct udl_transport_stats before_stats;
+	struct udl_transport_stats after_stats;
+
+	if (!decoder || !decoder->enabled || !data || length == 0u)
+		return 0;
+
+	udl_decoder_lock(decoder);
+	before_stats = udl_transport_get_stats(&decoder->transport);
+	transport_result = udl_transport_feed(&decoder->transport, data, length, &damage);
+	if (transport_result != UDL_TRANSPORT_OK) {
+		udl_decoder_unlock(decoder);
+		fprintf(stderr,
+			"UDL transport error: %s\n",
+			udl_transport_result_string(transport_result));
+		return -1;
+	}
+	after_stats = udl_transport_get_stats(&decoder->transport);
+	udl_decoder_unlock(decoder);
+
+	if (decoder->verbose && after_stats.decoded_commands > before_stats.decoded_commands) {
+		if (damage.touched) {
+			fprintf(stderr,
+				"decoded %llu command(s) from %zu-byte chunk damage=(%u,%u)-(%u,%u) pixels=%u mode=%ux%u depth=%u\n",
+				(unsigned long long)(after_stats.decoded_commands - before_stats.decoded_commands),
+				length,
+				damage.x1,
+				damage.y1,
+				damage.x2,
+				damage.y2,
+				damage.pixel_count,
+				(unsigned int)udl_sink_get_hpixels(&decoder->sink),
+				(unsigned int)udl_sink_get_vpixels(&decoder->sink),
+				(unsigned int)udl_sink_get_color_depth(&decoder->sink));
+		} else {
+			fprintf(stderr,
+				"decoded %llu command(s) from %zu-byte chunk mode=%ux%u depth=%u\n",
+				(unsigned long long)(after_stats.decoded_commands - before_stats.decoded_commands),
+				length,
+				(unsigned int)udl_sink_get_hpixels(&decoder->sink),
+				(unsigned int)udl_sink_get_vpixels(&decoder->sink),
+				(unsigned int)udl_sink_get_color_depth(&decoder->sink));
+		}
+	}
+	if (decoder->verbose && after_stats.decode_errors > before_stats.decode_errors) {
+		fprintf(stderr,
+			"UDL transport resync/errors while processing %zu-byte chunk: +%llu error(s) +%llu dropped byte(s)\n",
+			length,
+			(unsigned long long)(after_stats.decode_errors - before_stats.decode_errors),
+			(unsigned long long)(after_stats.dropped_bytes - before_stats.dropped_bytes));
+	}
+
+	return 0;
+}
+
+static void *udl_decode_thread_main(void *arg)
+{
+	struct udl_decode_runtime *decoder = arg;
+	uint8_t packet[BULK_OUT_BUFFER_SIZE];
+	size_t packet_length;
+	int rc;
+
+	if (!decoder || !decoder->enabled)
+		return NULL;
+
+	rc = pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
+	if (rc != 0 && decoder->verbose) {
+		errno = rc;
+		perror("pthread_setcancelstate UDL decode");
+	}
+	rc = pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, NULL);
+	if (rc != 0 && decoder->verbose) {
+		errno = rc;
+		perror("pthread_setcanceltype UDL decode");
+	}
+
+	for (;;) {
+		pthread_mutex_lock(&decoder->packet_queue_mutex);
+		while (decoder->packet_queue_count == 0u &&
+		       !atomic_load(&decoder->decode_thread_stop)) {
+			pthread_cond_wait(&decoder->packet_queue_not_empty,
+					  &decoder->packet_queue_mutex);
+		}
+		if (decoder->packet_queue_count == 0u &&
+		    atomic_load(&decoder->decode_thread_stop)) {
+			pthread_mutex_unlock(&decoder->packet_queue_mutex);
+			break;
+		}
+
+		packet_length = decoder->packet_queue[decoder->packet_queue_read_index].length;
+		memcpy(packet,
+		       decoder->packet_queue[decoder->packet_queue_read_index].data,
+		       packet_length);
+		decoder->packet_queue_read_index =
+			(decoder->packet_queue_read_index + 1u) % UDL_PACKET_QUEUE_CAPACITY;
+		decoder->packet_queue_count -= 1u;
+		pthread_cond_signal(&decoder->packet_queue_not_full);
+		pthread_mutex_unlock(&decoder->packet_queue_mutex);
+
+		if (udl_decoder_feed(decoder, packet, packet_length) != 0) {
+			stop_requested = 1;
+			break;
+		}
+	}
+
+	return NULL;
+}
+
+static int udl_decoder_start_worker(struct udl_decode_runtime *decoder)
+{
+	int rc;
+
+	if (!decoder || !decoder->enabled || decoder->decode_thread_created)
+		return 0;
+
+	atomic_store(&decoder->decode_thread_stop, false);
+	rc = pthread_create(&decoder->decode_thread, NULL, udl_decode_thread_main, decoder);
+	if (rc != 0) {
+		errno = rc;
+		perror("pthread_create UDL decode");
+		return -1;
+	}
+
+	decoder->decode_thread_created = true;
+	return 0;
+}
+
+static void udl_decoder_stop_worker(struct udl_decode_runtime *decoder)
+{
+	if (!decoder || !decoder->decode_thread_created)
+		return;
+
+	atomic_store(&decoder->decode_thread_stop, true);
+	if (decoder->packet_queue_initialized) {
+		pthread_mutex_lock(&decoder->packet_queue_mutex);
+		pthread_cond_broadcast(&decoder->packet_queue_not_empty);
+		pthread_cond_broadcast(&decoder->packet_queue_not_full);
+		pthread_mutex_unlock(&decoder->packet_queue_mutex);
+	}
+	(void)pthread_join(decoder->decode_thread, NULL);
+	decoder->decode_thread_created = false;
+}
+
+static int udl_decoder_submit(struct udl_decode_runtime *decoder,
+				      const uint8_t *data,
+				      size_t length)
+{
+	struct udl_bulk_packet *packet;
+
+	if (!decoder || !decoder->enabled || !data || length == 0u)
+		return 0;
+	if (length > BULK_OUT_BUFFER_SIZE)
+		return -1;
+
+	decoder->bulk_packets += 1u;
+	decoder->bulk_bytes += length;
+
+	if (!decoder->packet_queue_initialized)
+		return udl_decoder_feed(decoder, data, length);
+
+	pthread_mutex_lock(&decoder->packet_queue_mutex);
+	while (decoder->packet_queue_count == UDL_PACKET_QUEUE_CAPACITY &&
+	       !stop_requested &&
+	       !atomic_load(&decoder->decode_thread_stop)) {
+		pthread_cond_wait(&decoder->packet_queue_not_full, &decoder->packet_queue_mutex);
+	}
+	if (stop_requested || atomic_load(&decoder->decode_thread_stop)) {
+		pthread_mutex_unlock(&decoder->packet_queue_mutex);
+		return -1;
+	}
+
+	packet = &decoder->packet_queue[decoder->packet_queue_write_index];
+	packet->length = length;
+	memcpy(packet->data, data, length);
+	decoder->packet_queue_write_index =
+		(decoder->packet_queue_write_index + 1u) % UDL_PACKET_QUEUE_CAPACITY;
+	decoder->packet_queue_count += 1u;
+	pthread_cond_signal(&decoder->packet_queue_not_empty);
+	pthread_mutex_unlock(&decoder->packet_queue_mutex);
+	return 0;
+}
+
 static void *udl_viewer_thread_main(void *arg)
 {
 	struct udl_decode_runtime *decoder = arg;
@@ -619,11 +821,24 @@ static int udl_decoder_init(struct udl_decode_runtime *decoder, const struct opt
 	if (decoder->dump_image_path || decoder->viewer_enabled) {
 		decoder->framebuffer_xrgb8888 = calloc(pixel_count, sizeof(*decoder->framebuffer_xrgb8888));
 		if (!decoder->framebuffer_xrgb8888)
-			return -1;
+			goto fail;
 	}
+	if (pthread_mutex_init(&decoder->packet_queue_mutex, NULL) != 0)
+		goto fail;
+	if (pthread_cond_init(&decoder->packet_queue_not_empty, NULL) != 0) {
+		pthread_mutex_destroy(&decoder->packet_queue_mutex);
+		goto fail;
+	}
+	if (pthread_cond_init(&decoder->packet_queue_not_full, NULL) != 0) {
+		pthread_cond_destroy(&decoder->packet_queue_not_empty);
+		pthread_mutex_destroy(&decoder->packet_queue_mutex);
+		goto fail;
+	}
+	decoder->packet_queue_initialized = true;
 	if (pthread_mutex_init(&decoder->framebuffer_mutex, NULL) != 0)
-		return -1;
+		goto fail;
 	decoder->framebuffer_mutex_initialized = true;
+	atomic_init(&decoder->decode_thread_stop, false);
 	atomic_init(&decoder->viewer_thread_stop, false);
 
 	udl_sink_init(&decoder->sink,
@@ -637,8 +852,14 @@ static int udl_decoder_init(struct udl_decode_runtime *decoder, const struct opt
 					       decoder->framebuffer_xrgb8888,
 					       decoder->width);
 	}
+	if (udl_decoder_start_worker(decoder) != 0)
+		goto fail;
 
 	return 0;
+
+fail:
+	udl_decoder_destroy(decoder);
+	return -1;
 }
 
 static void udl_decoder_destroy(struct udl_decode_runtime *decoder)
@@ -646,9 +867,16 @@ static void udl_decoder_destroy(struct udl_decode_runtime *decoder)
 	if (!decoder)
 		return;
 
+	udl_decoder_stop_worker(decoder);
 	udl_decoder_stop_viewer(decoder);
 	udl_transport_destroy(&decoder->transport);
 	udl_sink_destroy(&decoder->sink);
+	if (decoder->packet_queue_initialized) {
+		pthread_cond_destroy(&decoder->packet_queue_not_full);
+		pthread_cond_destroy(&decoder->packet_queue_not_empty);
+		pthread_mutex_destroy(&decoder->packet_queue_mutex);
+		decoder->packet_queue_initialized = false;
+	}
 	if (decoder->framebuffer_mutex_initialized) {
 		pthread_mutex_destroy(&decoder->framebuffer_mutex);
 		decoder->framebuffer_mutex_initialized = false;
@@ -766,66 +994,6 @@ static void udl_decoder_print_summary(const struct udl_decode_runtime *decoder)
 		(unsigned int)udl_sink_get_hpixels(&decoder->sink),
 		(unsigned int)udl_sink_get_vpixels(&decoder->sink),
 		(unsigned int)udl_sink_get_color_depth(&decoder->sink));
-}
-
-static int udl_decoder_feed(struct udl_decode_runtime *decoder, const uint8_t *data, size_t length)
-{
-	enum udl_transport_result transport_result;
-	struct udl_sink_damage damage;
-	struct udl_transport_stats before_stats;
-	struct udl_transport_stats after_stats;
-
-	if (!decoder || !decoder->enabled || !data || length == 0u)
-		return 0;
-
-	decoder->bulk_packets += 1u;
-	decoder->bulk_bytes += length;
-	udl_decoder_lock(decoder);
-	before_stats = udl_transport_get_stats(&decoder->transport);
-	transport_result = udl_transport_feed(&decoder->transport, data, length, &damage);
-	if (transport_result != UDL_TRANSPORT_OK) {
-		udl_decoder_unlock(decoder);
-		fprintf(stderr,
-			"UDL transport error: %s\n",
-			udl_transport_result_string(transport_result));
-		return -1;
-	}
-	after_stats = udl_transport_get_stats(&decoder->transport);
-	udl_decoder_unlock(decoder);
-
-	if (decoder->verbose && after_stats.decoded_commands > before_stats.decoded_commands) {
-		if (damage.touched) {
-			fprintf(stderr,
-				"decoded %llu command(s) from %zu-byte chunk damage=(%u,%u)-(%u,%u) pixels=%u mode=%ux%u depth=%u\n",
-				(unsigned long long)(after_stats.decoded_commands - before_stats.decoded_commands),
-				length,
-				damage.x1,
-				damage.y1,
-				damage.x2,
-				damage.y2,
-				damage.pixel_count,
-				(unsigned int)udl_sink_get_hpixels(&decoder->sink),
-				(unsigned int)udl_sink_get_vpixels(&decoder->sink),
-				(unsigned int)udl_sink_get_color_depth(&decoder->sink));
-		} else {
-			fprintf(stderr,
-				"decoded %llu command(s) from %zu-byte chunk mode=%ux%u depth=%u\n",
-				(unsigned long long)(after_stats.decoded_commands - before_stats.decoded_commands),
-				length,
-				(unsigned int)udl_sink_get_hpixels(&decoder->sink),
-				(unsigned int)udl_sink_get_vpixels(&decoder->sink),
-				(unsigned int)udl_sink_get_color_depth(&decoder->sink));
-		}
-	}
-	if (decoder->verbose && after_stats.decode_errors > before_stats.decode_errors) {
-		fprintf(stderr,
-			"UDL transport resync/errors while processing %zu-byte chunk: +%llu error(s) +%llu dropped byte(s)\n",
-			length,
-			(unsigned long long)(after_stats.decode_errors - before_stats.decode_errors),
-			(unsigned long long)(after_stats.dropped_bytes - before_stats.dropped_bytes));
-	}
-
-	return 0;
 }
 
 static int load_edid_file(const char *path, uint8_t edid[128])
@@ -1740,7 +1908,7 @@ static void *bulk_out_drain_thread_main(void *arg)
 
 		if (runtime->verbose)
 			fprintf(stderr, "bulk OUT transferred %d bytes\n", rc);
-		if (udl_decoder_feed(&runtime->decoder, io.data, (size_t)rc) != 0)
+		if (udl_decoder_submit(&runtime->decoder, io.data, (size_t)rc) != 0)
 			break;
 	}
 
@@ -1973,6 +2141,7 @@ static void shutdown_raw_gadget(struct raw_runtime *runtime,
 				const char *udc_device)
 {
 	stop_bulk_out_drain_thread(runtime);
+	udl_decoder_stop_worker(&runtime->decoder);
 	udl_decoder_stop_viewer(&runtime->decoder);
 	if (runtime->fd >= 0) {
 		reset_configuration_state(runtime);
