@@ -46,6 +46,7 @@
 #define EP0_BUFFER_SIZE 512u
 #define BULK_OUT_BUFFER_SIZE 16384u
 #define UDL_PACKET_QUEUE_CAPACITY 256u
+#define UDL_BACKLOG_LOG_INTERVAL_NSEC 1000000000ull
 
 struct options {
 	const char *raw_device_path;
@@ -75,6 +76,7 @@ struct udl_decode_runtime {
 	struct udl_transport transport;
 	uint16_t *framebuffer_rgb565;
 	uint32_t *framebuffer_xrgb8888;
+	uint32_t *viewer_snapshot_xrgb8888;
 	uint64_t bulk_packets;
 	uint64_t bulk_bytes;
 	uint32_t width;
@@ -83,23 +85,32 @@ struct udl_decode_runtime {
 	pthread_t decode_thread;
 	pthread_t viewer_thread;
 	pthread_mutex_t packet_queue_mutex;
+	pthread_mutex_t viewer_snapshot_mutex;
 	pthread_cond_t packet_queue_not_empty;
 	pthread_cond_t packet_queue_not_full;
 	pthread_mutex_t framebuffer_mutex;
 	struct udl_bulk_packet packet_queue[UDL_PACKET_QUEUE_CAPACITY];
+	struct udl_sink_damage viewer_pending_damage;
 	size_t packet_queue_read_index;
 	size_t packet_queue_write_index;
 	size_t packet_queue_count;
+	size_t packet_queue_peak_count;
+	uint64_t packet_queue_backlog_since_nsec;
+	uint64_t packet_queue_last_log_nsec;
+	uint64_t packet_queue_full_waits;
 	atomic_bool decode_thread_stop;
 	atomic_bool viewer_thread_stop;
 	bool decode_thread_created;
 	bool packet_queue_initialized;
+	bool viewer_snapshot_mutex_initialized;
 	bool viewer_thread_created;
 	bool framebuffer_mutex_initialized;
 	bool enabled;
 	bool viewer_enabled;
 	bool verbose;
 	uint32_t window_scale;
+	uint32_t viewer_visible_width;
+	uint32_t viewer_visible_height;
 };
 
 struct __attribute__((packed)) gadget_endpoint_descriptor {
@@ -193,6 +204,150 @@ static volatile sig_atomic_t stop_requested = 0;
 static uint32_t udl_decoder_visible_width(const struct udl_decode_runtime *decoder);
 static uint32_t udl_decoder_visible_height(const struct udl_decode_runtime *decoder);
 static void udl_decoder_destroy(struct udl_decode_runtime *decoder);
+
+static uint64_t monotonic_nanoseconds(void)
+{
+	struct timespec ts;
+
+	if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+		return 0u;
+
+	return ((uint64_t)ts.tv_sec * 1000000000ull) + (uint64_t)ts.tv_nsec;
+}
+
+static void udl_decoder_clear_damage(struct udl_sink_damage *damage)
+{
+	if (!damage)
+		return;
+
+	udl_sink_clear_damage(damage);
+}
+
+static void udl_decoder_merge_damage(struct udl_sink_damage *dst,
+				     const struct udl_sink_damage *src)
+{
+	if (!dst || !src || !src->touched)
+		return;
+	if (!dst->touched) {
+		*dst = *src;
+		return;
+	}
+
+	if (src->x1 < dst->x1)
+		dst->x1 = src->x1;
+	if (src->y1 < dst->y1)
+		dst->y1 = src->y1;
+	if (src->x2 > dst->x2)
+		dst->x2 = src->x2;
+	if (src->y2 > dst->y2)
+		dst->y2 = src->y2;
+	dst->pixel_count += src->pixel_count;
+	dst->touched = true;
+}
+
+static void udl_decoder_mark_full_damage(struct udl_sink_damage *damage,
+				    uint32_t width,
+				    uint32_t height)
+{
+	if (!damage || width == 0u || height == 0u)
+		return;
+
+	damage->touched = true;
+	damage->x1 = 0u;
+	damage->y1 = 0u;
+	damage->x2 = width - 1u;
+	damage->y2 = height - 1u;
+	damage->pixel_count = width * height;
+}
+
+static void udl_decoder_copy_damage_region(uint32_t *dst,
+				   const uint32_t *src,
+				   uint32_t stride_pixels,
+				   uint32_t width,
+				   uint32_t height,
+				   const struct udl_sink_damage *damage)
+{
+	uint32_t start_x;
+	uint32_t end_x;
+	uint32_t start_y;
+	uint32_t end_y;
+	uint32_t row;
+	size_t copy_width;
+
+	if (!dst || !src || !damage || !damage->touched || width == 0u || height == 0u)
+		return;
+
+	start_x = damage->x1 < width ? damage->x1 : width - 1u;
+	start_y = damage->y1 < height ? damage->y1 : height - 1u;
+	end_x = damage->x2 < width ? damage->x2 : width - 1u;
+	end_y = damage->y2 < height ? damage->y2 : height - 1u;
+	if (end_x < start_x || end_y < start_y)
+		return;
+
+	copy_width = (size_t)(end_x - start_x + 1u);
+	for (row = start_y; row <= end_y; ++row) {
+		memcpy(dst + ((size_t)row * stride_pixels) + start_x,
+		       src + ((size_t)row * stride_pixels) + start_x,
+		       copy_width * sizeof(*dst));
+	}
+}
+
+static void udl_decoder_update_backlog_state_locked(struct udl_decode_runtime *decoder)
+{
+	uint64_t now;
+	uint64_t age_nsec;
+
+	if (!decoder)
+		return;
+
+	now = monotonic_nanoseconds();
+	if (decoder->packet_queue_count > decoder->packet_queue_peak_count)
+		decoder->packet_queue_peak_count = decoder->packet_queue_count;
+
+	if (decoder->packet_queue_count == 0u) {
+		if (decoder->verbose && decoder->packet_queue_backlog_since_nsec != 0u) {
+			age_nsec = now > decoder->packet_queue_backlog_since_nsec
+				? now - decoder->packet_queue_backlog_since_nsec
+				: 0u;
+			if (age_nsec >= UDL_BACKLOG_LOG_INTERVAL_NSEC) {
+				fprintf(stderr,
+					"UDL packet backlog drained after %.2fs peak=%zu/%u full_waits=%llu\n",
+					(double)age_nsec / 1000000000.0,
+					decoder->packet_queue_peak_count,
+					(unsigned int)UDL_PACKET_QUEUE_CAPACITY,
+					(unsigned long long)decoder->packet_queue_full_waits);
+			}
+		}
+		decoder->packet_queue_backlog_since_nsec = 0u;
+		decoder->packet_queue_last_log_nsec = 0u;
+		decoder->packet_queue_peak_count = 0u;
+		return;
+	}
+
+	if (decoder->packet_queue_backlog_since_nsec == 0u)
+		decoder->packet_queue_backlog_since_nsec = now;
+	if (!decoder->verbose)
+		return;
+
+	age_nsec = now > decoder->packet_queue_backlog_since_nsec
+		? now - decoder->packet_queue_backlog_since_nsec
+		: 0u;
+	if (age_nsec < UDL_BACKLOG_LOG_INTERVAL_NSEC)
+		return;
+	if (decoder->packet_queue_last_log_nsec != 0u &&
+	    now - decoder->packet_queue_last_log_nsec < UDL_BACKLOG_LOG_INTERVAL_NSEC)
+		return;
+
+	decoder->packet_queue_last_log_nsec = now;
+	fprintf(stderr,
+		"UDL packet backlog persists: depth=%zu/%u peak=%zu/%u age=%.2fs full_waits=%llu\n",
+		decoder->packet_queue_count,
+		(unsigned int)UDL_PACKET_QUEUE_CAPACITY,
+		decoder->packet_queue_peak_count,
+		(unsigned int)UDL_PACKET_QUEUE_CAPACITY,
+		(double)age_nsec / 1000000000.0,
+		(unsigned long long)decoder->packet_queue_full_waits);
+}
 
 static bool usb_speed_is_super(enum usb_device_speed speed)
 {
@@ -409,47 +564,21 @@ static void udl_decoder_unlock(const struct udl_decode_runtime *decoder)
 		pthread_mutex_unlock((pthread_mutex_t *)&decoder->framebuffer_mutex);
 }
 
-static int udl_decoder_copy_xrgb8888(const struct udl_decode_runtime *decoder,
-				     uint32_t *dst,
-				     size_t dst_pixels,
-				     uint32_t *visible_width_out,
-				     uint32_t *visible_height_out)
-{
-	uint32_t visible_width;
-	uint32_t visible_height;
-	size_t pixel_count;
-
-	if (!decoder || !decoder->framebuffer_xrgb8888 || !dst)
-		return -1;
-
-	pixel_count = (size_t)decoder->width * (size_t)decoder->height;
-	if (dst_pixels < pixel_count)
-		return -1;
-
-	udl_decoder_lock(decoder);
-	visible_width = udl_decoder_visible_width(decoder);
-	visible_height = udl_decoder_visible_height(decoder);
-	memcpy(dst, decoder->framebuffer_xrgb8888, pixel_count * sizeof(*dst));
-	udl_decoder_unlock(decoder);
-
-	if (visible_width_out)
-		*visible_width_out = visible_width;
-	if (visible_height_out)
-		*visible_height_out = visible_height;
-
-	return 0;
-}
-
 static int udl_decoder_feed(struct udl_decode_runtime *decoder, const uint8_t *data, size_t length)
 {
 	enum udl_transport_result transport_result;
 	struct udl_sink_damage damage;
+	struct udl_sink_damage snapshot_damage;
 	struct udl_transport_stats before_stats;
 	struct udl_transport_stats after_stats;
+	uint32_t visible_width;
+	uint32_t visible_height;
 
 	if (!decoder || !decoder->enabled || !data || length == 0u)
 		return 0;
 
+	udl_decoder_clear_damage(&damage);
+	udl_decoder_clear_damage(&snapshot_damage);
 	udl_decoder_lock(decoder);
 	before_stats = udl_transport_get_stats(&decoder->transport);
 	transport_result = udl_transport_feed(&decoder->transport, data, length, &damage);
@@ -459,6 +588,33 @@ static int udl_decoder_feed(struct udl_decode_runtime *decoder, const uint8_t *d
 			"UDL transport error: %s\n",
 			udl_transport_result_string(transport_result));
 		return -1;
+	}
+	visible_width = udl_decoder_visible_width(decoder);
+	visible_height = udl_decoder_visible_height(decoder);
+	snapshot_damage = damage;
+	if (decoder->viewer_enabled &&
+	    decoder->framebuffer_xrgb8888 &&
+	    decoder->viewer_snapshot_xrgb8888 &&
+	    decoder->viewer_snapshot_mutex_initialized) {
+		pthread_mutex_lock(&decoder->viewer_snapshot_mutex);
+		if (decoder->viewer_visible_width != visible_width ||
+		    decoder->viewer_visible_height != visible_height) {
+			decoder->viewer_visible_width = visible_width;
+			decoder->viewer_visible_height = visible_height;
+			udl_decoder_mark_full_damage(&snapshot_damage,
+						    decoder->width,
+						    decoder->height);
+		}
+		if (snapshot_damage.touched) {
+			udl_decoder_copy_damage_region(decoder->viewer_snapshot_xrgb8888,
+						      decoder->framebuffer_xrgb8888,
+						      decoder->width,
+						      decoder->width,
+						      decoder->height,
+						      &snapshot_damage);
+			udl_decoder_merge_damage(&decoder->viewer_pending_damage, &snapshot_damage);
+		}
+		pthread_mutex_unlock(&decoder->viewer_snapshot_mutex);
 	}
 	after_stats = udl_transport_get_stats(&decoder->transport);
 	udl_decoder_unlock(decoder);
@@ -539,6 +695,7 @@ static void *udl_decode_thread_main(void *arg)
 		decoder->packet_queue_read_index =
 			(decoder->packet_queue_read_index + 1u) % UDL_PACKET_QUEUE_CAPACITY;
 		decoder->packet_queue_count -= 1u;
+		udl_decoder_update_backlog_state_locked(decoder);
 		pthread_cond_signal(&decoder->packet_queue_not_full);
 		pthread_mutex_unlock(&decoder->packet_queue_mutex);
 
@@ -607,6 +764,8 @@ static int udl_decoder_submit(struct udl_decode_runtime *decoder,
 	while (decoder->packet_queue_count == UDL_PACKET_QUEUE_CAPACITY &&
 	       !stop_requested &&
 	       !atomic_load(&decoder->decode_thread_stop)) {
+		decoder->packet_queue_full_waits += 1u;
+		udl_decoder_update_backlog_state_locked(decoder);
 		pthread_cond_wait(&decoder->packet_queue_not_full, &decoder->packet_queue_mutex);
 	}
 	if (stop_requested || atomic_load(&decoder->decode_thread_stop)) {
@@ -620,6 +779,7 @@ static int udl_decoder_submit(struct udl_decode_runtime *decoder,
 	decoder->packet_queue_write_index =
 		(decoder->packet_queue_write_index + 1u) % UDL_PACKET_QUEUE_CAPACITY;
 	decoder->packet_queue_count += 1u;
+	udl_decoder_update_backlog_state_locked(decoder);
 	pthread_cond_signal(&decoder->packet_queue_not_empty);
 	pthread_mutex_unlock(&decoder->packet_queue_mutex);
 	return 0;
@@ -631,10 +791,9 @@ static void *udl_viewer_thread_main(void *arg)
 	SDL_Window *window = NULL;
 	SDL_Renderer *renderer = NULL;
 	SDL_Texture *texture = NULL;
-	uint32_t *frame_copy = NULL;
-	size_t pixel_count;
 	int last_window_width = 0;
 	int last_window_height = 0;
+	bool needs_present = true;
 	int rc;
 
 	if (!decoder || !decoder->viewer_enabled || !decoder->framebuffer_xrgb8888)
@@ -647,15 +806,6 @@ static void *udl_viewer_thread_main(void *arg)
 		return NULL;
 	}
 
-	pixel_count = (size_t)decoder->width * (size_t)decoder->height;
-	frame_copy = malloc(pixel_count * sizeof(*frame_copy));
-	if (!frame_copy) {
-		fprintf(stderr, "Unable to allocate SDL viewer frame copy buffer\n");
-		SDL_Quit();
-		stop_requested = 1;
-		return NULL;
-	}
-
 	window = SDL_CreateWindow("Breezy Box UDL Viewer",
 					 SDL_WINDOWPOS_CENTERED,
 					 SDL_WINDOWPOS_CENTERED,
@@ -664,7 +814,6 @@ static void *udl_viewer_thread_main(void *arg)
 					 SDL_WINDOW_RESIZABLE);
 	if (!window) {
 		fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError());
-		free(frame_copy);
 		SDL_Quit();
 		stop_requested = 1;
 		return NULL;
@@ -676,7 +825,6 @@ static void *udl_viewer_thread_main(void *arg)
 	if (!renderer) {
 		fprintf(stderr, "SDL_CreateRenderer failed: %s\n", SDL_GetError());
 		SDL_DestroyWindow(window);
-		free(frame_copy);
 		SDL_Quit();
 		stop_requested = 1;
 		return NULL;
@@ -691,7 +839,6 @@ static void *udl_viewer_thread_main(void *arg)
 		fprintf(stderr, "SDL_CreateTexture failed: %s\n", SDL_GetError());
 		SDL_DestroyRenderer(renderer);
 		SDL_DestroyWindow(window);
-		free(frame_copy);
 		SDL_Quit();
 		stop_requested = 1;
 		return NULL;
@@ -701,24 +848,40 @@ static void *udl_viewer_thread_main(void *arg)
 		SDL_Event event;
 		uint32_t visible_width = decoder->width;
 		uint32_t visible_height = decoder->height;
+		struct udl_sink_damage damage;
 		SDL_Rect src_rect;
 		SDL_Rect dst_rect;
+		bool have_damage = false;
+		bool size_changed = false;
+
+		udl_decoder_clear_damage(&damage);
 
 		while (SDL_PollEvent(&event)) {
 			if (event.type == SDL_QUIT) {
 				stop_requested = 1;
 				break;
 			}
+			if (event.type == SDL_WINDOWEVENT &&
+			    (event.window.event == SDL_WINDOWEVENT_EXPOSED ||
+			     event.window.event == SDL_WINDOWEVENT_SIZE_CHANGED)) {
+				needs_present = true;
+			}
 		}
 
-		if (udl_decoder_copy_xrgb8888(decoder,
-					     frame_copy,
-					     pixel_count,
-					     &visible_width,
-					     &visible_height) != 0) {
+		if (!decoder->viewer_snapshot_mutex_initialized) {
 			SDL_Delay(16u);
 			continue;
 		}
+
+		pthread_mutex_lock(&decoder->viewer_snapshot_mutex);
+		visible_width = decoder->viewer_visible_width != 0u
+			? decoder->viewer_visible_width
+			: decoder->width;
+		visible_height = decoder->viewer_visible_height != 0u
+			? decoder->viewer_visible_height
+			: decoder->height;
+		damage = decoder->viewer_pending_damage;
+		have_damage = damage.touched;
 
 		if (visible_width == 0u)
 			visible_width = decoder->width;
@@ -730,15 +893,36 @@ static void *udl_viewer_thread_main(void *arg)
 			last_window_width = (int)(visible_width * decoder->window_scale);
 			last_window_height = (int)(visible_height * decoder->window_scale);
 			SDL_SetWindowSize(window, last_window_width, last_window_height);
+			size_changed = true;
+			needs_present = true;
 		}
 
-		if (SDL_UpdateTexture(texture,
-					 NULL,
-					 frame_copy,
-					 (int)(decoder->width * sizeof(*frame_copy))) != 0) {
-			fprintf(stderr, "SDL_UpdateTexture failed: %s\n", SDL_GetError());
-			stop_requested = 1;
-			break;
+		if (have_damage) {
+			SDL_Rect update_rect;
+			const uint8_t *pixels = (const uint8_t *)(decoder->viewer_snapshot_xrgb8888 +
+				((size_t)damage.y1 * decoder->width) + damage.x1);
+
+			update_rect.x = (int)damage.x1;
+			update_rect.y = (int)damage.y1;
+			update_rect.w = (int)(damage.x2 - damage.x1 + 1u);
+			update_rect.h = (int)(damage.y2 - damage.y1 + 1u);
+			if (SDL_UpdateTexture(texture,
+					     &update_rect,
+					     pixels,
+					     (int)(decoder->width * sizeof(*decoder->viewer_snapshot_xrgb8888))) != 0) {
+				pthread_mutex_unlock(&decoder->viewer_snapshot_mutex);
+				fprintf(stderr, "SDL_UpdateTexture failed: %s\n", SDL_GetError());
+				stop_requested = 1;
+				break;
+			}
+			udl_decoder_clear_damage(&decoder->viewer_pending_damage);
+			needs_present = true;
+		}
+		pthread_mutex_unlock(&decoder->viewer_snapshot_mutex);
+
+		if (!needs_present && !size_changed) {
+			SDL_Delay(16u);
+			continue;
 		}
 
 		src_rect.x = 0;
@@ -754,13 +938,13 @@ static void *udl_viewer_thread_main(void *arg)
 		SDL_RenderClear(renderer);
 		SDL_RenderCopy(renderer, texture, &src_rect, &dst_rect);
 		SDL_RenderPresent(renderer);
+		needs_present = false;
 		SDL_Delay(16u);
 	}
 
 	SDL_DestroyTexture(texture);
 	SDL_DestroyRenderer(renderer);
 	SDL_DestroyWindow(window);
-	free(frame_copy);
 	SDL_Quit();
 	return NULL;
 }
@@ -824,6 +1008,11 @@ static int udl_decoder_init(struct udl_decode_runtime *decoder, const struct opt
 		if (!decoder->framebuffer_xrgb8888)
 			goto fail;
 	}
+	if (decoder->viewer_enabled) {
+		decoder->viewer_snapshot_xrgb8888 = calloc(pixel_count, sizeof(*decoder->viewer_snapshot_xrgb8888));
+		if (!decoder->viewer_snapshot_xrgb8888)
+			goto fail;
+	}
 	if (pthread_mutex_init(&decoder->packet_queue_mutex, NULL) != 0)
 		goto fail;
 	if (pthread_cond_init(&decoder->packet_queue_not_empty, NULL) != 0) {
@@ -836,11 +1025,15 @@ static int udl_decoder_init(struct udl_decode_runtime *decoder, const struct opt
 		goto fail;
 	}
 	decoder->packet_queue_initialized = true;
+	if (pthread_mutex_init(&decoder->viewer_snapshot_mutex, NULL) != 0)
+		goto fail;
+	decoder->viewer_snapshot_mutex_initialized = true;
 	if (pthread_mutex_init(&decoder->framebuffer_mutex, NULL) != 0)
 		goto fail;
 	decoder->framebuffer_mutex_initialized = true;
 	atomic_init(&decoder->decode_thread_stop, false);
 	atomic_init(&decoder->viewer_thread_stop, false);
+	udl_decoder_clear_damage(&decoder->viewer_pending_damage);
 
 	udl_sink_init(&decoder->sink,
 		      decoder->framebuffer_rgb565,
@@ -878,14 +1071,20 @@ static void udl_decoder_destroy(struct udl_decode_runtime *decoder)
 		pthread_mutex_destroy(&decoder->packet_queue_mutex);
 		decoder->packet_queue_initialized = false;
 	}
+	if (decoder->viewer_snapshot_mutex_initialized) {
+		pthread_mutex_destroy(&decoder->viewer_snapshot_mutex);
+		decoder->viewer_snapshot_mutex_initialized = false;
+	}
 	if (decoder->framebuffer_mutex_initialized) {
 		pthread_mutex_destroy(&decoder->framebuffer_mutex);
 		decoder->framebuffer_mutex_initialized = false;
 	}
 	free(decoder->framebuffer_rgb565);
 	free(decoder->framebuffer_xrgb8888);
+	free(decoder->viewer_snapshot_xrgb8888);
 	decoder->framebuffer_rgb565 = NULL;
 	decoder->framebuffer_xrgb8888 = NULL;
+	decoder->viewer_snapshot_xrgb8888 = NULL;
 }
 
 static uint32_t udl_decoder_visible_width(const struct udl_decode_runtime *decoder)
@@ -984,12 +1183,13 @@ static void udl_decoder_print_summary(const struct udl_decode_runtime *decoder)
 		return;
 
 	fprintf(stderr,
-		"UDL decode summary: bulk_packets=%llu bulk_bytes=%llu commands=%llu errors=%llu dropped=%llu configured=%ux%u signaled=%ux%u depth=%u\n",
+		"UDL decode summary: bulk_packets=%llu bulk_bytes=%llu commands=%llu errors=%llu dropped=%llu queue_full_waits=%llu configured=%ux%u signaled=%ux%u depth=%u\n",
 		(unsigned long long)decoder->bulk_packets,
 		(unsigned long long)decoder->bulk_bytes,
 		(unsigned long long)stats.decoded_commands,
 		(unsigned long long)stats.decode_errors,
 		(unsigned long long)stats.dropped_bytes,
+		(unsigned long long)decoder->packet_queue_full_waits,
 		decoder->width,
 		decoder->height,
 		(unsigned int)udl_sink_get_hpixels(&decoder->sink),
