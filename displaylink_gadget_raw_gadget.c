@@ -192,6 +192,7 @@ static volatile sig_atomic_t stop_requested = 0;
 
 static uint32_t udl_decoder_visible_width(const struct udl_decode_runtime *decoder);
 static uint32_t udl_decoder_visible_height(const struct udl_decode_runtime *decoder);
+static void udl_decoder_destroy(struct udl_decode_runtime *decoder);
 
 static bool usb_speed_is_super(enum usb_device_speed speed)
 {
