@@ -153,6 +153,8 @@ sudo ./capture_usb_gadget_state.sh --udc fe800000.usb
 
 That capture bundles `/sys/class/udc`, role-switch, Type-C, extcon, PHY, selected controller sysfs, and filtered USB/UDC kernel logs so persistent attach failures can be compared across boots and cable/power cycles.
 
+It also snapshots the mutable boot/config surfaces that can explain a failure state that suddenly persists across reboots: `/boot/armbianEnv.txt`, boot script strings/checksums, the active DTB symlink and Rock Pi DTB checksum, `/boot/overlay-user`, configfs gadget and DT overlay state, selected `/proc/device-tree` nodes, USB-related local system config under `/etc` and `/usr/local`, and matching package/history excerpts.
+
 ## Limitations
 
 The decision to go with DisplayLink has a couple repurcussions that mainly impact streaming and gaming. Since Breezy Box is intended to be a productivity device, the simplicity that DisplayLink offers this design seems worth that tradeoff.
