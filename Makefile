@@ -7,7 +7,7 @@ SDL2_CFLAGS ?= $(shell $(PKG_CONFIG) --cflags sdl2)
 SDL2_LIBS ?= $(shell $(PKG_CONFIG) --libs sdl2)
 
 RAW_GADGET_TARGET := displaylink_gadget_raw_gadget
-RAW_GADGET_SOURCES := displaylink_gadget_raw_gadget.c $(UDL_SINK_DIR)/src/udl_sink.c
+RAW_GADGET_SOURCES := displaylink_gadget_raw_gadget.c displaylink_compositor.c $(UDL_SINK_DIR)/src/udl_sink.c
 
 TARGETS := $(RAW_GADGET_TARGET)
 

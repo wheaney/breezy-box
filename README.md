@@ -137,6 +137,47 @@ If auto-detection does not find the correct driver name, rerun with both values,
 sudo ./displaylink_gadget_raw_gadget --udc-driver fe800000.usb --udc-device fe800000.usb --verbose
 ```
 
+### Multi-display supervisor prototype
+
+For a quick multi-display prototype, there is now a small supervisor at `displaylink_gadget_supervisor.py`. It watches a JSON config file and launches one `displaylink_gadget_raw_gadget` child per enabled display entry.
+
+This is still one UDC per display. The supervisor does not multiplex several DisplayLink adapters through a single UDC; each configured display must name its own `udc_device` and `udc_driver`.
+
+Start by copying and editing `displaylink_multi_display.example.json`, then sanity-check the expanded child commands without touching hardware:
+
+```sh
+python3 ./displaylink_gadget_supervisor.py ./displaylink_multi_display.example.json --dry-run
+```
+
+To run it for real, launch the supervisor as root so the child raw-gadget processes inherit the required privileges:
+
+```sh
+sudo python3 ./displaylink_gadget_supervisor.py /path/to/displays.json
+```
+
+If you want to preview both decoded displays as separate windows during development, set `"show_window": true` on each display entry. The SDL window title now follows `monitor_name`, so two entries such as `Breezy Box 1` and `Breezy Box 2` show up as two distinct preview windows.
+
+```json
+{
+	"name": "display-1",
+	"udc_device": "replace-with-first-udc",
+	"udc_driver": "replace-with-first-udc",
+	"serial_string": "BREEZY0001",
+	"monitor_name": "Breezy Box 1",
+	"show_window": true
+}
+```
+
+Those preview windows are a local-debug feature. They work best when you run the supervisor from a graphical desktop session that also has permission to access the Raw Gadget device. On a headless SBC, or when root cannot open windows on the current Wayland session, use `dump_image_path` or the real DRM/KMS renderer instead.
+
+The supervisor reloads the config once per second. Adding, removing, enabling, disabling, or changing a display entry causes the matching raw-gadget child to be started, stopped, or restarted.
+
+Each display entry can override the existing raw-gadget settings, including `decode_width`, `decode_height`, `usb_speed`, `edid_path`, `capture_stream_path`, `dump_image_path`, `show_window`, `serial_string`, `manufacturer_string`, `product_string`, and `monitor_name`.
+
+The built-in EDID is still a fixed 1920x1080@60 personality unless `edid_path` is supplied. In this prototype, per-display `decode_width` and `decode_height` now also drive the vendor descriptor pixel limit, but fully user-defined resolutions and framerates still need per-display EDID blobs.
+
+Longer term, the right shape is to move the supervisor into the same renderer process and replace the current process-per-display model with in-process display sessions. Each session would own its gadget control loop, bulk drain, decode transport, and render target, so decoded damage can be applied directly to shared render buffers instead of copied across process boundaries.
+
 When the remaining issue is on the host side rather than in the gadget itself, there is also a small capture helper that dumps the relevant DRM and Mutter state into one directory. This is useful when a hotplug reproduces the `No available CRTC ... not found` path and you want one repeatable bundle instead of rerunning ad hoc commands:
 
 ```sh

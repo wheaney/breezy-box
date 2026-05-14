@@ -23,6 +23,8 @@
 
 #include <SDL2/SDL.h>
 
+#include "displaylink_compositor.h"
+#include "displaylink_session.h"
 #include "udl_sink.h"
 
 #define DISPLAYLINK_VENDOR_ID 0x17e9
@@ -34,6 +36,10 @@
 #define DEFAULT_DISPLAY_HEIGHT 1080u
 #define DEFAULT_BULK_OUT_ADDRESS 0x01u
 #define DEFAULT_RAW_DEVICE_PATH "/dev/raw-gadget"
+#define DEFAULT_MANUFACTURER_STRING "DisplayLink"
+#define DEFAULT_PRODUCT_STRING "DisplayLink Adapter"
+#define DEFAULT_SERIAL_STRING "DEADBEEF0001"
+#define DEFAULT_MONITOR_NAME "Breezy Box"
 #define UDC_SOFT_RECONNECT_SETTLE_USEC 250000u
 #define UDL_CAPTURE_STREAM_MAGIC "UDLCAP01"
 #define UDL_CAPTURE_STREAM_MAGIC_SIZE 8u
@@ -57,6 +63,10 @@ struct options {
 	const char *edid_path;
 	const char *capture_stream_path;
 	const char *dump_image_path;
+	const char *manufacturer_string;
+	const char *product_string;
+	const char *serial_string;
+	const char *monitor_name;
 	const char *udc_driver;
 	const char *udc_device;
 	uint16_t vendor_id;
@@ -65,6 +75,7 @@ struct options {
 	uint32_t decode_width;
 	uint32_t decode_height;
 	uint32_t window_scale;
+	struct displaylink_output_surface output_surface;
 	bool decode_stream;
 	bool show_window;
 	bool startup_soft_reconnect;
@@ -82,11 +93,14 @@ struct udl_decode_runtime {
 	uint16_t *framebuffer_rgb565;
 	uint32_t *framebuffer_xrgb8888;
 	uint32_t *viewer_snapshot_xrgb8888;
+	struct displaylink_compositor_surface viewer_surface;
 	uint64_t bulk_packets;
 	uint64_t bulk_bytes;
 	uint32_t width;
 	uint32_t height;
+	uint32_t framebuffer_xrgb8888_stride_pixels;
 	const char *dump_image_path;
+	const char *viewer_window_title;
 	pthread_t decode_thread;
 	pthread_t viewer_thread;
 	pthread_mutex_t packet_queue_mutex;
@@ -141,6 +155,7 @@ struct udl_decode_runtime {
 	bool viewer_snapshot_mutex_initialized;
 	bool viewer_thread_created;
 	bool framebuffer_mutex_initialized;
+	bool framebuffer_xrgb8888_owned;
 	bool enabled;
 	bool viewer_enabled;
 	bool verbose;
@@ -203,6 +218,10 @@ struct raw_runtime {
 	int fd;
 	const char *udc_device;
 	const char *capture_stream_path;
+	const char *manufacturer_string;
+	const char *product_string;
+	const char *serial_string;
+	const char *monitor_name;
 	uint8_t current_configuration;
 	int bulk_out_handle;
 	FILE *capture_stream_file;
@@ -230,10 +249,6 @@ enum control_action {
 	CONTROL_ACTION_READ,
 };
 
-static const char *const k_string_manufacturer = "DisplayLink";
-static const char *const k_string_product = "DisplayLink Adapter";
-static const char *const k_string_serial = "DEADBEEF0001";
-
 static const uint8_t k_std_channel[16] = {
 	0x57, 0xcd, 0xdc, 0xa7, 0x1c, 0x88, 0x5e, 0x15,
 	0x60, 0xfe, 0xc6, 0x97, 0x16, 0x3d, 0x47, 0xf2,
@@ -241,6 +256,7 @@ static const uint8_t k_std_channel[16] = {
 
 static volatile sig_atomic_t stop_requested = 0;
 
+static int parse_args(int argc, char **argv, struct options *opts);
 static uint32_t udl_decoder_visible_width(const struct udl_decode_runtime *decoder);
 static uint32_t udl_decoder_visible_height(const struct udl_decode_runtime *decoder);
 static void udl_decoder_destroy(struct udl_decode_runtime *decoder);
@@ -540,6 +556,10 @@ static void usage(const char *argv0)
 		"  --edid-file PATH        Override the built-in 128-byte EDID with a binary blob\n"
 		"  --capture-stream PATH   Write raw bulk OUT packets to a replayable binary trace\n"
 		"  --dump-image PATH       Write a binary PPM snapshot of the decoded frame on exit\n"
+		"  --manufacturer TEXT     Override the USB manufacturer string\n"
+		"  --product-string TEXT   Override the USB product string\n"
+		"  --serial-string TEXT    Override the USB serial string\n"
+		"  --monitor-name TEXT     Override the built-in EDID monitor name\n"
 		"  --udc-driver NAME       UDC driver name (default: auto-detect)\n"
 		"  --udc-device NAME       UDC device name (default: auto-detect)\n"
 		"  --vendor-id HEX         USB vendor ID (default: 0x17e9)\n"
@@ -618,10 +638,74 @@ static int parse_usb_speed(const char *text, enum usb_device_speed *speed)
 	return -1;
 }
 
+static void public_options_from_internal(struct displaylink_session_options *dst,
+					 const struct options *src)
+{
+	if (!dst || !src)
+		return;
+
+	memset(dst, 0, sizeof(*dst));
+	dst->raw_device_path = src->raw_device_path;
+	dst->edid_path = src->edid_path;
+	dst->capture_stream_path = src->capture_stream_path;
+	dst->dump_image_path = src->dump_image_path;
+	dst->manufacturer_string = src->manufacturer_string;
+	dst->product_string = src->product_string;
+	dst->serial_string = src->serial_string;
+	dst->monitor_name = src->monitor_name;
+	dst->udc_driver = src->udc_driver;
+	dst->udc_device = src->udc_device;
+	dst->vendor_id = src->vendor_id;
+	dst->product_id = src->product_id;
+	dst->usb_speed = src->usb_speed;
+	dst->decode_width = src->decode_width;
+	dst->decode_height = src->decode_height;
+	dst->window_scale = src->window_scale;
+	dst->output_surface = src->output_surface;
+	dst->decode_stream = src->decode_stream;
+	dst->show_window = src->show_window;
+	dst->startup_soft_reconnect = src->startup_soft_reconnect;
+	dst->verbose = src->verbose;
+}
+
+static void internal_options_from_public(struct options *dst,
+					 const struct displaylink_session_options *src)
+{
+	if (!dst || !src)
+		return;
+
+	memset(dst, 0, sizeof(*dst));
+	dst->raw_device_path = src->raw_device_path;
+	dst->edid_path = src->edid_path;
+	dst->capture_stream_path = src->capture_stream_path;
+	dst->dump_image_path = src->dump_image_path;
+	dst->manufacturer_string = src->manufacturer_string;
+	dst->product_string = src->product_string;
+	dst->serial_string = src->serial_string;
+	dst->monitor_name = src->monitor_name;
+	dst->udc_driver = src->udc_driver;
+	dst->udc_device = src->udc_device;
+	dst->vendor_id = src->vendor_id;
+	dst->product_id = src->product_id;
+	dst->usb_speed = src->usb_speed;
+	dst->decode_width = src->decode_width;
+	dst->decode_height = src->decode_height;
+	dst->window_scale = src->window_scale;
+	dst->output_surface = src->output_surface;
+	dst->decode_stream = src->decode_stream;
+	dst->show_window = src->show_window;
+	dst->startup_soft_reconnect = src->startup_soft_reconnect;
+	dst->verbose = src->verbose;
+}
+
 static void default_options(struct options *opts)
 {
 	memset(opts, 0, sizeof(*opts));
 	opts->raw_device_path = DEFAULT_RAW_DEVICE_PATH;
+	opts->manufacturer_string = DEFAULT_MANUFACTURER_STRING;
+	opts->product_string = DEFAULT_PRODUCT_STRING;
+	opts->serial_string = DEFAULT_SERIAL_STRING;
+	opts->monitor_name = DEFAULT_MONITOR_NAME;
 	opts->vendor_id = DISPLAYLINK_VENDOR_ID;
 	opts->product_id = DISPLAYLINK_PRODUCT_ID;
 	opts->usb_speed = USB_SPEED_HIGH;
@@ -633,6 +717,91 @@ static void default_options(struct options *opts)
 	opts->verbose = false;
 }
 
+static int validate_options(const struct options *opts)
+{
+	if (!opts)
+		return -1;
+	if (!opts->raw_device_path) {
+		fprintf(stderr, "raw_device_path is required\n");
+		return -1;
+	}
+	if (opts->decode_width == 0u || opts->decode_height == 0u) {
+		fprintf(stderr, "decode dimensions must be at least 1x1\n");
+		return -1;
+	}
+	if (!opts->decode_stream && opts->dump_image_path) {
+		fprintf(stderr, "--dump-image requires decode support; remove --no-decode\n");
+		return -1;
+	}
+	if (!opts->decode_stream && opts->show_window) {
+		fprintf(stderr, "--show-window requires decode support; remove --no-decode\n");
+		return -1;
+	}
+	if (opts->window_scale == 0u) {
+		fprintf(stderr, "--window-scale must be at least 1\n");
+		return -1;
+	}
+	if (opts->output_surface.pixels) {
+		if (!opts->decode_stream) {
+			fprintf(stderr, "external output_surface requires decode support\n");
+			return -1;
+		}
+		if (opts->output_surface.width < opts->decode_width ||
+		    opts->output_surface.height < opts->decode_height ||
+		    opts->output_surface.stride_pixels < opts->decode_width) {
+			fprintf(stderr,
+				"external output_surface must be at least %ux%u with stride >= %u\n",
+				opts->decode_width,
+				opts->decode_height,
+				opts->decode_width);
+			return -1;
+		}
+	}
+
+	return 0;
+}
+
+void displaylink_session_options_init(struct displaylink_session_options *opts)
+{
+	struct options internal_opts;
+
+	default_options(&internal_opts);
+	public_options_from_internal(opts, &internal_opts);
+}
+
+int displaylink_session_parse_args(int argc,
+				   char **argv,
+				   struct displaylink_session_options *opts)
+{
+	struct options internal_opts;
+
+	if (!opts)
+		return -1;
+
+	default_options(&internal_opts);
+	optind = 1;
+	if (parse_args(argc, argv, &internal_opts) != 0)
+		return -1;
+	public_options_from_internal(opts, &internal_opts);
+	return 0;
+}
+
+int displaylink_session_validate_options(const struct displaylink_session_options *opts)
+{
+	struct options internal_opts;
+
+	if (!opts)
+		return -1;
+
+	internal_options_from_public(&internal_opts, opts);
+	return validate_options(&internal_opts);
+}
+
+void displaylink_session_request_stop(void)
+{
+	stop_requested = 1;
+}
+
 static int parse_args(int argc, char **argv, struct options *opts)
 {
 	static const struct option long_options[] = {
@@ -640,6 +809,10 @@ static int parse_args(int argc, char **argv, struct options *opts)
 		{ "edid-file", required_argument, NULL, 'e' },
 		{ "capture-stream", required_argument, NULL, 'c' },
 		{ "dump-image", required_argument, NULL, 'o' },
+		{ "manufacturer", required_argument, NULL, 1000 },
+		{ "product-string", required_argument, NULL, 1001 },
+		{ "serial-string", required_argument, NULL, 1002 },
+		{ "monitor-name", required_argument, NULL, 1003 },
 		{ "udc-driver", required_argument, NULL, 'u' },
 		{ "udc-device", required_argument, NULL, 'd' },
 		{ "vendor-id", required_argument, NULL, 'v' },
@@ -670,6 +843,18 @@ static int parse_args(int argc, char **argv, struct options *opts)
 			break;
 		case 'o':
 			opts->dump_image_path = optarg;
+			break;
+		case 1000:
+			opts->manufacturer_string = optarg;
+			break;
+		case 1001:
+			opts->product_string = optarg;
+			break;
+		case 1002:
+			opts->serial_string = optarg;
+			break;
+		case 1003:
+			opts->monitor_name = optarg;
 			break;
 		case 'u':
 			opts->udc_driver = optarg;
@@ -893,6 +1078,9 @@ static int udl_decoder_feed(struct udl_decode_runtime *decoder, const uint8_t *d
 	    decoder->framebuffer_xrgb8888 &&
 	    decoder->viewer_snapshot_xrgb8888 &&
 	    decoder->viewer_snapshot_mutex_initialized) {
+		struct udl_sink_damage composed_damage;
+
+		udl_decoder_clear_damage(&composed_damage);
 		pthread_mutex_lock(&decoder->viewer_snapshot_mutex);
 		if (decoder->viewer_visible_width != visible_width ||
 		    decoder->viewer_visible_height != visible_height) {
@@ -906,10 +1094,23 @@ static int udl_decoder_feed(struct udl_decode_runtime *decoder, const uint8_t *d
 			udl_decoder_copy_damage_region(decoder->viewer_snapshot_xrgb8888,
 						      decoder->framebuffer_xrgb8888,
 						      decoder->width,
-						      decoder->width,
+					      decoder->framebuffer_xrgb8888_stride_pixels,
 						      decoder->height,
 						      &snapshot_damage);
-			udl_decoder_merge_damage(&decoder->viewer_pending_damage, &snapshot_damage);
+			if (!displaylink_compositor_surface_blit_damage(&decoder->viewer_surface,
+							       decoder->viewer_snapshot_xrgb8888,
+							       decoder->width,
+							       decoder->width,
+							       decoder->height,
+							       0u,
+							       0u,
+							       &snapshot_damage,
+							       &composed_damage)) {
+				pthread_mutex_unlock(&decoder->viewer_snapshot_mutex);
+				fprintf(stderr, "Viewer compositor update failed\n");
+				return -1;
+			}
+			udl_decoder_merge_damage(&decoder->viewer_pending_damage, &composed_damage);
 		}
 		pthread_mutex_unlock(&decoder->viewer_snapshot_mutex);
 	}
@@ -1135,7 +1336,7 @@ static void *udl_viewer_thread_main(void *arg)
 	bool needs_present = true;
 	int rc;
 
-	if (!decoder || !decoder->viewer_enabled || !decoder->framebuffer_xrgb8888)
+	if (!decoder || !decoder->viewer_enabled || !decoder->viewer_surface.pixels)
 		return NULL;
 
 	rc = SDL_Init(SDL_INIT_VIDEO);
@@ -1145,7 +1346,9 @@ static void *udl_viewer_thread_main(void *arg)
 		return NULL;
 	}
 
-	window = SDL_CreateWindow("Breezy Box UDL Viewer",
+	window = SDL_CreateWindow(decoder->viewer_window_title
+				 ? decoder->viewer_window_title
+				 : DEFAULT_MONITOR_NAME,
 					 SDL_WINDOWPOS_CENTERED,
 					 SDL_WINDOWPOS_CENTERED,
 					 (int)decoder->width,
@@ -1242,7 +1445,7 @@ static void *udl_viewer_thread_main(void *arg)
 
 		if (have_damage) {
 			SDL_Rect update_rect;
-			const uint8_t *pixels = (const uint8_t *)(decoder->viewer_snapshot_xrgb8888 +
+			const uint8_t *pixels = (const uint8_t *)(decoder->viewer_surface.pixels +
 				((size_t)damage.y1 * decoder->width) + damage.x1);
 
 			update_rect.x = (int)damage.x1;
@@ -1253,7 +1456,7 @@ static void *udl_viewer_thread_main(void *arg)
 			if (SDL_UpdateTexture(texture,
 					     &update_rect,
 					     pixels,
-					     (int)(decoder->width * sizeof(*decoder->viewer_snapshot_xrgb8888))) != 0) {
+					     (int)(decoder->width * sizeof(*decoder->viewer_surface.pixels))) != 0) {
 				pthread_mutex_unlock(&decoder->viewer_snapshot_mutex);
 				fprintf(stderr, "SDL_UpdateTexture failed: %s\n", SDL_GetError());
 				stop_requested = 1;
@@ -1344,8 +1547,10 @@ static int udl_decoder_init(struct udl_decode_runtime *decoder, const struct opt
 	decoder->width = opts->decode_width;
 	decoder->height = opts->decode_height;
 	decoder->dump_image_path = opts->dump_image_path;
+	decoder->viewer_window_title = opts->monitor_name;
 	decoder->viewer_enabled = opts->show_window;
 	decoder->window_scale = opts->window_scale;
+	decoder->framebuffer_xrgb8888_stride_pixels = opts->decode_width;
 
 	if (!decoder->enabled)
 		return 0;
@@ -1358,14 +1563,24 @@ static int udl_decoder_init(struct udl_decode_runtime *decoder, const struct opt
 	decoder->framebuffer_rgb565 = calloc(pixel_count, sizeof(*decoder->framebuffer_rgb565));
 	if (!decoder->framebuffer_rgb565)
 		return -1;
-	if (decoder->dump_image_path || decoder->viewer_enabled) {
+	if (opts->output_surface.pixels) {
+		decoder->framebuffer_xrgb8888 = opts->output_surface.pixels;
+		decoder->framebuffer_xrgb8888_stride_pixels = opts->output_surface.stride_pixels;
+		decoder->framebuffer_xrgb8888_owned = false;
+	} else if (decoder->dump_image_path || decoder->viewer_enabled) {
 		decoder->framebuffer_xrgb8888 = calloc(pixel_count, sizeof(*decoder->framebuffer_xrgb8888));
 		if (!decoder->framebuffer_xrgb8888)
 			goto fail;
+		decoder->framebuffer_xrgb8888_stride_pixels = decoder->width;
+		decoder->framebuffer_xrgb8888_owned = true;
 	}
 	if (decoder->viewer_enabled) {
 		decoder->viewer_snapshot_xrgb8888 = calloc(pixel_count, sizeof(*decoder->viewer_snapshot_xrgb8888));
 		if (!decoder->viewer_snapshot_xrgb8888)
+			goto fail;
+		if (!displaylink_compositor_surface_init(&decoder->viewer_surface,
+							       decoder->width,
+							       decoder->height))
 			goto fail;
 	}
 	if (pthread_mutex_init(&decoder->packet_queue_mutex, NULL) != 0)
@@ -1432,7 +1647,7 @@ static int udl_decoder_init(struct udl_decode_runtime *decoder, const struct opt
 	if (decoder->framebuffer_xrgb8888) {
 		udl_sink_attach_xrgb8888_output(&decoder->sink,
 					       decoder->framebuffer_xrgb8888,
-					       decoder->width);
+					       decoder->framebuffer_xrgb8888_stride_pixels);
 	}
 	if (udl_decoder_start_worker(decoder) != 0)
 		goto fail;
@@ -1472,11 +1687,14 @@ static void udl_decoder_destroy(struct udl_decode_runtime *decoder)
 		decoder->framebuffer_mutex_initialized = false;
 	}
 	free(decoder->framebuffer_rgb565);
-	free(decoder->framebuffer_xrgb8888);
+	if (decoder->framebuffer_xrgb8888_owned)
+		free(decoder->framebuffer_xrgb8888);
 	free(decoder->viewer_snapshot_xrgb8888);
+	displaylink_compositor_surface_destroy(&decoder->viewer_surface);
 	decoder->framebuffer_rgb565 = NULL;
 	decoder->framebuffer_xrgb8888 = NULL;
 	decoder->viewer_snapshot_xrgb8888 = NULL;
+	decoder->framebuffer_xrgb8888_owned = false;
 }
 
 static uint32_t udl_decoder_visible_width(const struct udl_decode_runtime *decoder)
@@ -1533,7 +1751,8 @@ static int udl_decoder_dump_image(const struct udl_decode_runtime *decoder)
 
 	udl_decoder_lock(decoder);
 	for (row = 0; row < height; ++row) {
-		const uint32_t *src = decoder->framebuffer_xrgb8888 + ((size_t)row * decoder->width);
+		const uint32_t *src = decoder->framebuffer_xrgb8888 +
+			((size_t)row * decoder->framebuffer_xrgb8888_stride_pixels);
 		uint32_t column;
 
 		for (column = 0; column < width; ++column) {
@@ -2086,7 +2305,7 @@ static void write_ascii_monitor_name(uint8_t *dst, const char *name)
 		dst[length] = '\n';
 }
 
-static void build_default_edid(uint8_t edid[128])
+static void build_default_edid(uint8_t edid[128], const char *monitor_name)
 {
 	uint32_t sum = 0u;
 	size_t index;
@@ -2148,7 +2367,8 @@ static void build_default_edid(uint8_t edid[128])
 	edid[74] = 0x00;
 	edid[75] = 0xfc;
 	edid[76] = 0x00;
-	write_ascii_monitor_name(&edid[77], "Breezy Box");
+	write_ascii_monitor_name(&edid[77],
+				 monitor_name ? monitor_name : DEFAULT_MONITOR_NAME);
 
 	edid[90] = 0x00;
 	edid[91] = 0x00;
@@ -2179,9 +2399,11 @@ static void build_default_edid(uint8_t edid[128])
 	edid[127] = (uint8_t)((256u - (sum & 0xffu)) & 0xffu);
 }
 
-static void build_vendor_descriptor(struct raw_runtime *runtime)
+static void build_vendor_descriptor(struct raw_runtime *runtime,
+				    const struct options *opts)
 {
-	const uint32_t pixel_limit = DEFAULT_DISPLAY_WIDTH * DEFAULT_DISPLAY_HEIGHT;
+	const uint64_t pixels = (uint64_t)opts->decode_width * (uint64_t)opts->decode_height;
+	const uint32_t pixel_limit = pixels > UINT32_MAX ? UINT32_MAX : (uint32_t)pixels;
 
 	runtime->vendor_descriptor[0] = 12u;
 	runtime->vendor_descriptor[1] = UDL_VENDOR_DESCRIPTOR_TYPE;
@@ -2258,7 +2480,8 @@ static void build_bos_descriptor(struct raw_runtime *runtime)
 	runtime->bos_descriptor.ss_cap.bU2DevExitLat = host_to_le16(0u);
 }
 
-static size_t build_string_descriptor(uint8_t *buffer,
+static size_t build_string_descriptor(const struct raw_runtime *runtime,
+				      uint8_t *buffer,
 				      size_t capacity,
 				      uint8_t index)
 {
@@ -2278,19 +2501,27 @@ static size_t build_string_descriptor(uint8_t *buffer,
 
 	switch (index) {
 	case 1u:
-		text = k_string_manufacturer;
+		text = runtime && runtime->manufacturer_string
+			? runtime->manufacturer_string
+			: DEFAULT_MANUFACTURER_STRING;
 		break;
 	case 2u:
-		text = k_string_product;
+		text = runtime && runtime->product_string
+			? runtime->product_string
+			: DEFAULT_PRODUCT_STRING;
 		break;
 	case 3u:
-		text = k_string_serial;
+		text = runtime && runtime->serial_string
+			? runtime->serial_string
+			: DEFAULT_SERIAL_STRING;
 		break;
 	default:
 		return 0u;
 	}
 
 	length = strlen(text);
+	if (length > 126u)
+		return 0u;
 	if (2u + (length * 2u) > capacity)
 		return 0u;
 
@@ -2895,7 +3126,8 @@ static int prepare_standard_request(struct raw_runtime *runtime,
 			*action = CONTROL_ACTION_WRITE;
 			return 0;
 		case USB_DT_STRING:
-			response_length = build_string_descriptor(io->data,
+			response_length = build_string_descriptor(runtime,
+							  io->data,
 							  sizeof(io->data),
 							  (uint8_t)(value & 0xffu));
 			if (response_length == 0u)
@@ -3176,7 +3408,7 @@ static int run_loop(struct raw_runtime *runtime)
 	return 0;
 }
 
-int main(int argc, char **argv)
+int displaylink_session_run(const struct displaylink_session_options *session_opts)
 {
 	struct options opts;
 	struct raw_runtime runtime;
@@ -3184,23 +3416,12 @@ int main(int argc, char **argv)
 	char udc_device[UDC_NAME_LENGTH_MAX] = {0};
 	int ret = EXIT_FAILURE;
 
-	default_options(&opts);
-	if (parse_args(argc, argv, &opts) != 0) {
-		usage(argv[0]);
+	if (!session_opts)
 		return EXIT_FAILURE;
-	}
-	if (!opts.decode_stream && opts.dump_image_path) {
-		fprintf(stderr, "--dump-image requires decode support; remove --no-decode\n");
+	internal_options_from_public(&opts, session_opts);
+	if (validate_options(&opts) != 0)
 		return EXIT_FAILURE;
-	}
-	if (!opts.decode_stream && opts.show_window) {
-		fprintf(stderr, "--show-window requires decode support; remove --no-decode\n");
-		return EXIT_FAILURE;
-	}
-	if (opts.window_scale == 0u) {
-		fprintf(stderr, "--window-scale must be at least 1\n");
-		return EXIT_FAILURE;
-	}
+	stop_requested = 0;
 
 	if ((!opts.udc_driver || !opts.udc_device) &&
 	    auto_detect_udc(udc_driver, sizeof(udc_driver), udc_device, sizeof(udc_device)) != 0) {
@@ -3219,6 +3440,10 @@ int main(int argc, char **argv)
 	runtime.bulk_out_handle = -1;
 	runtime.bulk_out_address = DEFAULT_BULK_OUT_ADDRESS;
 	runtime.capture_stream_path = opts.capture_stream_path;
+	runtime.manufacturer_string = opts.manufacturer_string;
+	runtime.product_string = opts.product_string;
+	runtime.serial_string = opts.serial_string;
+	runtime.monitor_name = opts.monitor_name;
 	runtime.usb_speed = opts.usb_speed;
 	runtime.verbose = opts.verbose;
 	atomic_init(&runtime.bulk_out_thread_stop, false);
@@ -3232,14 +3457,13 @@ int main(int argc, char **argv)
 		fprintf(stderr, "Unable to start SDL viewer\n");
 		goto out;
 	}
-	build_default_edid(runtime.edid);
+	build_default_edid(runtime.edid, opts.monitor_name);
 	if (opts.edid_path && load_edid_file(opts.edid_path, runtime.edid) != 0)
 		goto out;
-	build_vendor_descriptor(&runtime);
+	build_vendor_descriptor(&runtime, &opts);
 	build_device_descriptor(&runtime, &opts);
 	build_device_qualifier(&runtime);
 	build_bos_descriptor(&runtime);
-	install_signal_handlers();
 
 	runtime.fd = open(opts.raw_device_path, O_RDWR);
 	if (runtime.fd < 0) {
@@ -3297,3 +3521,21 @@ out:
 	shutdown_raw_gadget(&runtime, udc_device);
 	return ret;
 }
+
+#ifndef DISPLAYLINK_SESSION_NO_MAIN
+int main(int argc, char **argv)
+{
+	struct displaylink_session_options opts;
+
+	displaylink_session_options_init(&opts);
+	if (displaylink_session_parse_args(argc, argv, &opts) != 0) {
+		usage(argv[0]);
+		return EXIT_FAILURE;
+	}
+	if (displaylink_session_validate_options(&opts) != 0)
+		return EXIT_FAILURE;
+
+	install_signal_handlers();
+	return displaylink_session_run(&opts);
+}
+#endif

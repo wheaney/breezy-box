@@ -1,0 +1,26 @@
+{
+	"poll_interval_sec": 1.0,
+	"defaults": {
+		"raw_device_path": "/dev/raw-gadget",
+		"usb_speed": "high",
+		"decode_width": 1920,
+		"decode_height": 1080,
+		"verbose": true
+	},
+	"displays": [
+		{
+			"name": "display-1",
+			"udc_device": "replace-with-first-udc",
+			"udc_driver": "replace-with-first-udc",
+			"serial_string": "BREEZY0001",
+			"monitor_name": "Breezy Box 1"
+		},
+		{
+			"name": "display-2",
+			"udc_device": "replace-with-second-udc",
+			"udc_driver": "replace-with-second-udc",
+			"serial_string": "BREEZY0002",
+			"monitor_name": "Breezy Box 2"
+		}
+	]
+}
