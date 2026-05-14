@@ -1841,7 +1841,9 @@ static void log_usb_role_switch_states(bool verbose)
 	}
 }
 
-static void diagnose_udc_attach_state(const char *udc_device, bool verbose)
+static void diagnose_udc_attach_state(const char *udc_device,
+				      bool startup_soft_reconnect_attempted,
+				      bool verbose)
 {
 	char path[512];
 	char state[128];
@@ -1876,9 +1878,15 @@ static void diagnose_udc_attach_state(const char *udc_device, bool verbose)
 		     "/sys/class/udc/%s/soft_connect",
 		     udc_device) < (int)sizeof(path)) {
 		if (access(path, F_OK) == 0) {
-			fprintf(stderr,
-				"UDC %s exposes soft_connect; the startup disconnect/connect pulse was attempted.\n",
-				udc_device);
+			if (startup_soft_reconnect_attempted) {
+				fprintf(stderr,
+					"UDC %s exposes soft_connect; the startup disconnect/connect pulse was attempted.\n",
+					udc_device);
+			} else {
+				fprintf(stderr,
+					"UDC %s exposes soft_connect, but startup reconnect was disabled so userspace left the idle controller armed for a future host attach.\n",
+					udc_device);
+			}
 		} else {
 			fprintf(stderr,
 				"UDC %s does not expose soft_connect; userspace cannot force a reattach pulse on this controller.\n",
@@ -3093,7 +3101,9 @@ int main(int argc, char **argv)
 		force_udc_soft_reconnect(udc_device, runtime.verbose);
 	else
 		prime_udc_attach_state(udc_device, runtime.verbose);
-	diagnose_udc_attach_state(udc_device, runtime.verbose);
+	diagnose_udc_attach_state(udc_device,
+				      opts.startup_soft_reconnect,
+				      runtime.verbose);
 
 	printf("DisplayLink Raw Gadget prepared. raw=%s udc_driver=%s udc_device=%s\n",
 	       opts.raw_device_path,
