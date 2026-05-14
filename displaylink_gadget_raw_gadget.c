@@ -1286,6 +1286,7 @@ static int udl_decoder_init(struct udl_decode_runtime *decoder, const struct opt
 		      decoder->height,
 		      decoder->width);
 	udl_transport_init(&decoder->transport, &decoder->sink);
+	udl_transport_set_writerlx16_span_stats(&decoder->transport, decoder->verbose);
 	if (decoder->framebuffer_xrgb8888) {
 		udl_sink_attach_xrgb8888_output(&decoder->sink,
 					       decoder->framebuffer_xrgb8888,
