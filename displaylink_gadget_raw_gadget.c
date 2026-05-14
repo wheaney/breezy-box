@@ -727,8 +727,9 @@ static int udl_decoder_feed(struct udl_decode_runtime *decoder, const uint8_t *d
 	enum udl_transport_result transport_result;
 	struct udl_sink_damage damage;
 	struct udl_sink_damage snapshot_damage;
-	struct udl_transport_stats before_stats;
-	struct udl_transport_stats after_stats;
+	struct udl_transport_stats before_stats = {0};
+	struct udl_transport_stats after_stats = {0};
+	const bool collect_performance = decoder && decoder->verbose;
 	uint64_t decode_start_nsec;
 	uint64_t decode_end_nsec;
 	uint64_t snapshot_start_nsec;
@@ -741,9 +742,10 @@ static int udl_decoder_feed(struct udl_decode_runtime *decoder, const uint8_t *d
 
 	udl_decoder_clear_damage(&damage);
 	udl_decoder_clear_damage(&snapshot_damage);
-	decode_start_nsec = monotonic_nanoseconds();
+	decode_start_nsec = collect_performance ? monotonic_nanoseconds() : 0u;
 	udl_decoder_lock(decoder);
-	before_stats = udl_transport_get_stats(&decoder->transport);
+	if (collect_performance)
+		before_stats = udl_transport_get_stats(&decoder->transport);
 	transport_result = udl_transport_feed(&decoder->transport, data, length, &damage);
 	if (transport_result != UDL_TRANSPORT_OK) {
 		udl_decoder_unlock(decoder);
@@ -755,7 +757,7 @@ static int udl_decoder_feed(struct udl_decode_runtime *decoder, const uint8_t *d
 	visible_width = udl_decoder_visible_width(decoder);
 	visible_height = udl_decoder_visible_height(decoder);
 	snapshot_damage = damage;
-	snapshot_start_nsec = monotonic_nanoseconds();
+	snapshot_start_nsec = collect_performance ? monotonic_nanoseconds() : 0u;
 	if (decoder->viewer_enabled &&
 	    decoder->framebuffer_xrgb8888 &&
 	    decoder->viewer_snapshot_xrgb8888 &&
@@ -780,62 +782,66 @@ static int udl_decoder_feed(struct udl_decode_runtime *decoder, const uint8_t *d
 		}
 		pthread_mutex_unlock(&decoder->viewer_snapshot_mutex);
 	}
-	snapshot_end_nsec = monotonic_nanoseconds();
-	after_stats = udl_transport_get_stats(&decoder->transport);
+	snapshot_end_nsec = collect_performance ? monotonic_nanoseconds() : 0u;
+	if (collect_performance)
+		after_stats = udl_transport_get_stats(&decoder->transport);
 	udl_decoder_unlock(decoder);
-	decode_end_nsec = monotonic_nanoseconds();
-	udl_decoder_record_counter(&decoder->perf_decoded_commands,
-		(uint64_t)(after_stats.decoded_commands - before_stats.decoded_commands));
-	udl_decoder_record_counter(&decoder->perf_no_damage_commands,
-		(uint64_t)(after_stats.no_damage_commands - before_stats.no_damage_commands));
-	udl_decoder_record_counter(&decoder->perf_writereg_commands,
-		(uint64_t)(after_stats.writereg_commands - before_stats.writereg_commands));
-	udl_decoder_record_counter(&decoder->perf_writereg_redundant_commands,
-		(uint64_t)(after_stats.writereg_redundant_commands - before_stats.writereg_redundant_commands));
-	udl_decoder_record_counter(&decoder->perf_writeraw8_commands,
-		(uint64_t)(after_stats.writeraw8_commands - before_stats.writeraw8_commands));
-	udl_decoder_record_counter(&decoder->perf_writerl8_commands,
-		(uint64_t)(after_stats.writerl8_commands - before_stats.writerl8_commands));
-	udl_decoder_record_counter(&decoder->perf_writecopy8_commands,
-		(uint64_t)(after_stats.writecopy8_commands - before_stats.writecopy8_commands));
-	udl_decoder_record_counter(&decoder->perf_writerlx8_commands,
-		(uint64_t)(after_stats.writerlx8_commands - before_stats.writerlx8_commands));
-	udl_decoder_record_counter(&decoder->perf_writeraw16_commands,
-		(uint64_t)(after_stats.writeraw16_commands - before_stats.writeraw16_commands));
-	udl_decoder_record_counter(&decoder->perf_writerl16_commands,
-		(uint64_t)(after_stats.writerl16_commands - before_stats.writerl16_commands));
-	udl_decoder_record_counter(&decoder->perf_writecopy16_commands,
-		(uint64_t)(after_stats.writecopy16_commands - before_stats.writecopy16_commands));
-	udl_decoder_record_counter(&decoder->perf_writerlx16_commands,
-		(uint64_t)(after_stats.writerlx16_commands - before_stats.writerlx16_commands));
-	udl_decoder_record_counter(&decoder->perf_writerlx16_raw_spans,
-		(uint64_t)(after_stats.writerlx16_raw_spans - before_stats.writerlx16_raw_spans));
-	udl_decoder_record_counter(&decoder->perf_writerlx16_repeat_spans,
-		(uint64_t)(after_stats.writerlx16_repeat_spans - before_stats.writerlx16_repeat_spans));
-	udl_decoder_record_counter(&decoder->perf_writerlx16_raw_pixels,
-		(uint64_t)(after_stats.writerlx16_raw_pixels - before_stats.writerlx16_raw_pixels));
-	udl_decoder_record_counter(&decoder->perf_writerlx16_repeat_pixels,
-		(uint64_t)(after_stats.writerlx16_repeat_pixels - before_stats.writerlx16_repeat_pixels));
-	udl_decoder_record_counter(&decoder->perf_writerlx16_raw_single_pixel_spans,
-		(uint64_t)(after_stats.writerlx16_raw_single_pixel_spans - before_stats.writerlx16_raw_single_pixel_spans));
-	if (damage.touched) {
-		udl_decoder_record_counter(&decoder->perf_damage_pixels, damage.pixel_count);
-		udl_decoder_record_counter(&decoder->perf_damage_rectangles, 1u);
+	decode_end_nsec = collect_performance ? monotonic_nanoseconds() : 0u;
+	if (collect_performance) {
+		udl_decoder_record_counter(&decoder->perf_decoded_commands,
+			(uint64_t)(after_stats.decoded_commands - before_stats.decoded_commands));
+		udl_decoder_record_counter(&decoder->perf_no_damage_commands,
+			(uint64_t)(after_stats.no_damage_commands - before_stats.no_damage_commands));
+		udl_decoder_record_counter(&decoder->perf_writereg_commands,
+			(uint64_t)(after_stats.writereg_commands - before_stats.writereg_commands));
+		udl_decoder_record_counter(&decoder->perf_writereg_redundant_commands,
+			(uint64_t)(after_stats.writereg_redundant_commands - before_stats.writereg_redundant_commands));
+		udl_decoder_record_counter(&decoder->perf_writeraw8_commands,
+			(uint64_t)(after_stats.writeraw8_commands - before_stats.writeraw8_commands));
+		udl_decoder_record_counter(&decoder->perf_writerl8_commands,
+			(uint64_t)(after_stats.writerl8_commands - before_stats.writerl8_commands));
+		udl_decoder_record_counter(&decoder->perf_writecopy8_commands,
+			(uint64_t)(after_stats.writecopy8_commands - before_stats.writecopy8_commands));
+		udl_decoder_record_counter(&decoder->perf_writerlx8_commands,
+			(uint64_t)(after_stats.writerlx8_commands - before_stats.writerlx8_commands));
+		udl_decoder_record_counter(&decoder->perf_writeraw16_commands,
+			(uint64_t)(after_stats.writeraw16_commands - before_stats.writeraw16_commands));
+		udl_decoder_record_counter(&decoder->perf_writerl16_commands,
+			(uint64_t)(after_stats.writerl16_commands - before_stats.writerl16_commands));
+		udl_decoder_record_counter(&decoder->perf_writecopy16_commands,
+			(uint64_t)(after_stats.writecopy16_commands - before_stats.writecopy16_commands));
+		udl_decoder_record_counter(&decoder->perf_writerlx16_commands,
+			(uint64_t)(after_stats.writerlx16_commands - before_stats.writerlx16_commands));
+		udl_decoder_record_counter(&decoder->perf_writerlx16_raw_spans,
+			(uint64_t)(after_stats.writerlx16_raw_spans - before_stats.writerlx16_raw_spans));
+		udl_decoder_record_counter(&decoder->perf_writerlx16_repeat_spans,
+			(uint64_t)(after_stats.writerlx16_repeat_spans - before_stats.writerlx16_repeat_spans));
+		udl_decoder_record_counter(&decoder->perf_writerlx16_raw_pixels,
+			(uint64_t)(after_stats.writerlx16_raw_pixels - before_stats.writerlx16_raw_pixels));
+		udl_decoder_record_counter(&decoder->perf_writerlx16_repeat_pixels,
+			(uint64_t)(after_stats.writerlx16_repeat_pixels - before_stats.writerlx16_repeat_pixels));
+		udl_decoder_record_counter(&decoder->perf_writerlx16_raw_single_pixel_spans,
+			(uint64_t)(after_stats.writerlx16_raw_single_pixel_spans - before_stats.writerlx16_raw_single_pixel_spans));
+		if (damage.touched) {
+			udl_decoder_record_counter(&decoder->perf_damage_pixels, damage.pixel_count);
+			udl_decoder_record_counter(&decoder->perf_damage_rectangles, 1u);
+		}
+		if (decode_end_nsec >= decode_start_nsec)
+			udl_decoder_record_counter(&decoder->perf_decode_nsec,
+				decode_end_nsec - decode_start_nsec);
+		if (snapshot_end_nsec >= snapshot_start_nsec)
+			udl_decoder_record_counter(&decoder->perf_snapshot_copy_nsec,
+				snapshot_end_nsec - snapshot_start_nsec);
 	}
-	if (decode_end_nsec >= decode_start_nsec)
-		udl_decoder_record_counter(&decoder->perf_decode_nsec,
-			decode_end_nsec - decode_start_nsec);
-	if (snapshot_end_nsec >= snapshot_start_nsec)
-		udl_decoder_record_counter(&decoder->perf_snapshot_copy_nsec,
-			snapshot_end_nsec - snapshot_start_nsec);
-	if (decoder->verbose && after_stats.decode_errors > before_stats.decode_errors) {
+	if (collect_performance && after_stats.decode_errors > before_stats.decode_errors) {
 		fprintf(stderr,
 			"UDL transport resync/errors while processing %zu-byte chunk: +%llu error(s) +%llu dropped byte(s)\n",
 			length,
 			(unsigned long long)(after_stats.decode_errors - before_stats.decode_errors),
 			(unsigned long long)(after_stats.dropped_bytes - before_stats.dropped_bytes));
 	}
-	udl_decoder_maybe_log_performance(decoder);
+	if (collect_performance)
+		udl_decoder_maybe_log_performance(decoder);
 
 	return 0;
 }
@@ -884,7 +890,8 @@ static void *udl_decode_thread_main(void *arg)
 		udl_decoder_update_backlog_state_locked(decoder);
 		pthread_cond_signal(&decoder->packet_queue_not_full);
 		pthread_mutex_unlock(&decoder->packet_queue_mutex);
-		udl_decoder_maybe_log_performance(decoder);
+		if (decoder->verbose)
+			udl_decoder_maybe_log_performance(decoder);
 
 		if (udl_decoder_feed(decoder, packet, packet_length) != 0) {
 			stop_requested = 1;
@@ -935,6 +942,7 @@ static int udl_decoder_submit(struct udl_decode_runtime *decoder,
 				      size_t length)
 {
 	struct udl_bulk_packet *packet;
+	const bool collect_performance = decoder && decoder->verbose;
 
 	if (!decoder || !decoder->enabled || !data || length == 0u)
 		return 0;
@@ -956,10 +964,10 @@ static int udl_decoder_submit(struct udl_decode_runtime *decoder,
 
 		decoder->packet_queue_full_waits += 1u;
 		udl_decoder_update_backlog_state_locked(decoder);
-		wait_start_nsec = monotonic_nanoseconds();
+		wait_start_nsec = collect_performance ? monotonic_nanoseconds() : 0u;
 		pthread_cond_wait(&decoder->packet_queue_not_full, &decoder->packet_queue_mutex);
-		wait_end_nsec = monotonic_nanoseconds();
-		if (wait_end_nsec >= wait_start_nsec)
+		wait_end_nsec = collect_performance ? monotonic_nanoseconds() : 0u;
+		if (collect_performance && wait_end_nsec >= wait_start_nsec)
 			udl_decoder_record_counter(&decoder->perf_queue_wait_nsec,
 				wait_end_nsec - wait_start_nsec);
 	}
@@ -977,9 +985,11 @@ static int udl_decoder_submit(struct udl_decode_runtime *decoder,
 	udl_decoder_update_backlog_state_locked(decoder);
 	pthread_cond_signal(&decoder->packet_queue_not_empty);
 	pthread_mutex_unlock(&decoder->packet_queue_mutex);
-	udl_decoder_record_counter(&decoder->perf_bulk_reads, 1u);
-	udl_decoder_record_counter(&decoder->perf_bulk_bytes, length);
-	udl_decoder_maybe_log_performance(decoder);
+	if (collect_performance) {
+		udl_decoder_record_counter(&decoder->perf_bulk_reads, 1u);
+		udl_decoder_record_counter(&decoder->perf_bulk_bytes, length);
+		udl_decoder_maybe_log_performance(decoder);
+	}
 	return 0;
 }
 
@@ -1286,6 +1296,7 @@ static int udl_decoder_init(struct udl_decode_runtime *decoder, const struct opt
 		      decoder->height,
 		      decoder->width);
 	udl_transport_init(&decoder->transport, &decoder->sink);
+	udl_transport_set_detailed_stats(&decoder->transport, decoder->verbose);
 	udl_transport_set_writerlx16_span_stats(&decoder->transport, decoder->verbose);
 	if (decoder->framebuffer_xrgb8888) {
 		udl_sink_attach_xrgb8888_output(&decoder->sink,
@@ -2358,10 +2369,10 @@ static void *bulk_out_drain_thread_main(void *arg)
 		io.inner.ep = handle;
 		io.inner.length = sizeof(io.data);
 
-		read_start_nsec = monotonic_nanoseconds();
+		read_start_nsec = runtime->verbose ? monotonic_nanoseconds() : 0u;
 		rc = raw_ep_read(runtime->fd, &io.inner);
-		read_end_nsec = monotonic_nanoseconds();
-		if (read_end_nsec >= read_start_nsec)
+		read_end_nsec = runtime->verbose ? monotonic_nanoseconds() : 0u;
+		if (runtime->verbose && read_end_nsec >= read_start_nsec)
 			udl_decoder_record_counter(&runtime->decoder.perf_usb_read_wait_nsec,
 				read_end_nsec - read_start_nsec);
 		if (rc < 0) {
@@ -2374,7 +2385,8 @@ static void *bulk_out_drain_thread_main(void *arg)
 
 		if (udl_decoder_submit(&runtime->decoder, io.data, (size_t)rc) != 0)
 			break;
-		udl_decoder_maybe_log_performance(&runtime->decoder);
+		if (runtime->verbose)
+			udl_decoder_maybe_log_performance(&runtime->decoder);
 	}
 
 	if (runtime->verbose)
