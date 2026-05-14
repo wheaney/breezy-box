@@ -107,15 +107,23 @@ The expected good state is `dr_mode=peripheral` and a populated `/sys/class/udc/
 sudo ./displaylink_gadget_raw_gadget --udc-device fe800000.usb --verbose
 ```
 
-The raw-gadget binary now accepts `--decode-width` and `--decode-height` to size the sink storage, `--no-decode` to fall back to pure bulk draining while debugging the USB path, `--dump-image /tmp/udl.ppm` to write the latest decoded frame as a binary PPM image on exit, `--show-window` to display the decoded framebuffer live in a basic SDL2 window, and `--usb-speed high|super` to select the advertised link speed. The default is back to high-speed because forcing super-speed changed host behavior enough to break the current viewer-oriented bring-up path.
+The raw-gadget binary now accepts `--decode-width` and `--decode-height` to size the sink storage, `--no-decode` to fall back to pure bulk draining while debugging the USB path, `--capture-stream /tmp/deck.udlcap` to record replayable bulk OUT traffic, `--dump-image /tmp/udl.ppm` to write the latest decoded frame as a binary PPM image on exit, `--show-window` to display the decoded framebuffer live in a basic SDL2 window, and `--usb-speed high|super` to select the advertised link speed. The default is back to high-speed because forcing super-speed changed host behavior enough to break the current viewer-oriented bring-up path.
 
 Example with a live viewer window and an exit snapshot:
 
 ```sh
 sudo ./displaylink_gadget_raw_gadget --udc-device fe800000.usb --show-window --dump-image /tmp/udl.ppm --verbose
+```
 
 If you want to retry the newer USB 3 descriptor path explicitly, add `--usb-speed super`.
+
+For low-perturbation capture on a machine like the Steam Deck, the shortest path is to turn decode off and dump the real bulk OUT stream directly:
+
+```sh
+sudo ./displaylink_gadget_raw_gadget --udc-device fe800000.usb --no-decode --capture-stream /tmp/deck-wayland.udlcap
 ```
+
+That capture format starts with the 8-byte magic `UDLCAP01`, then a 32-bit version and 32-bit reserved field. Each packet record then stores a 64-bit monotonic timestamp in nanoseconds, a 32-bit payload length, a 32-bit reserved field, and the exact bulk packet payload. This preserves host packet boundaries so the stream can be replayed later into the transport layer without the Deck attached.
 
 If you want to test the host against a real monitor identity instead of the built-in synthetic EDID, pass a 128-byte base EDID blob directly:
 

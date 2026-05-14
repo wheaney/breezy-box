@@ -35,6 +35,10 @@
 #define DEFAULT_BULK_OUT_ADDRESS 0x01u
 #define DEFAULT_RAW_DEVICE_PATH "/dev/raw-gadget"
 #define UDC_SOFT_RECONNECT_SETTLE_USEC 250000u
+#define UDL_CAPTURE_STREAM_MAGIC "UDLCAP01"
+#define UDL_CAPTURE_STREAM_MAGIC_SIZE 8u
+#define UDL_CAPTURE_STREAM_VERSION 1u
+#define UDL_CAPTURE_STREAM_BUFFER_SIZE (1024u * 1024u)
 
 #define UDL_VENDOR_DESCRIPTOR_TYPE 0x5fU
 #define UDL_VENDOR_DESCRIPTOR_VERSION 0x0001U
@@ -51,6 +55,7 @@
 struct options {
 	const char *raw_device_path;
 	const char *edid_path;
+	const char *capture_stream_path;
 	const char *dump_image_path;
 	const char *udc_driver;
 	const char *udc_device;
@@ -197,10 +202,14 @@ struct usb_raw_bulk_io {
 struct raw_runtime {
 	int fd;
 	const char *udc_device;
+	const char *capture_stream_path;
 	uint8_t current_configuration;
 	int bulk_out_handle;
+	FILE *capture_stream_file;
 	pthread_t bulk_out_thread;
 	uint8_t bulk_out_address;
+	uint64_t capture_stream_packets;
+	uint64_t capture_stream_bytes;
 	bool bulk_out_address_valid;
 	bool bulk_out_thread_created;
 	bool verbose;
@@ -529,6 +538,7 @@ static void usage(const char *argv0)
 		"Usage: %s [options]\n"
 		"  --raw-device PATH       Raw Gadget device node (default: /dev/raw-gadget)\n"
 		"  --edid-file PATH        Override the built-in 128-byte EDID with a binary blob\n"
+		"  --capture-stream PATH   Write raw bulk OUT packets to a replayable binary trace\n"
 		"  --dump-image PATH       Write a binary PPM snapshot of the decoded frame on exit\n"
 		"  --udc-driver NAME       UDC driver name (default: auto-detect)\n"
 		"  --udc-device NAME       UDC device name (default: auto-detect)\n"
@@ -628,6 +638,7 @@ static int parse_args(int argc, char **argv, struct options *opts)
 	static const struct option long_options[] = {
 		{ "raw-device", required_argument, NULL, 'r' },
 		{ "edid-file", required_argument, NULL, 'e' },
+		{ "capture-stream", required_argument, NULL, 'c' },
 		{ "dump-image", required_argument, NULL, 'o' },
 		{ "udc-driver", required_argument, NULL, 'u' },
 		{ "udc-device", required_argument, NULL, 'd' },
@@ -646,13 +657,16 @@ static int parse_args(int argc, char **argv, struct options *opts)
 	};
 	int opt;
 
-	while ((opt = getopt_long(argc, argv, "r:e:o:u:d:v:p:m:W:H:sS:xnVh", long_options, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "r:e:c:o:u:d:v:p:m:W:H:sS:xnVh", long_options, NULL)) != -1) {
 		switch (opt) {
 		case 'r':
 			opts->raw_device_path = optarg;
 			break;
 		case 'e':
 			opts->edid_path = optarg;
+			break;
+		case 'c':
+			opts->capture_stream_path = optarg;
 			break;
 		case 'o':
 			opts->dump_image_path = optarg;
@@ -708,6 +722,123 @@ static int parse_args(int argc, char **argv, struct options *opts)
 	}
 
 	return 0;
+}
+
+static int write_capture_bytes(FILE *file, const void *buffer, size_t length)
+{
+	if (!file || !buffer || length == 0u)
+		return 0;
+
+	if (fwrite(buffer, 1u, length, file) != length) {
+		if (errno == 0)
+			errno = EIO;
+		return -1;
+	}
+
+	return 0;
+}
+
+static int write_capture_u32_le(FILE *file, uint32_t value)
+{
+	const uint8_t bytes[4] = {
+		(uint8_t)(value & 0xffu),
+		(uint8_t)((value >> 8) & 0xffu),
+		(uint8_t)((value >> 16) & 0xffu),
+		(uint8_t)((value >> 24) & 0xffu),
+	};
+
+	return write_capture_bytes(file, bytes, sizeof(bytes));
+}
+
+static int write_capture_u64_le(FILE *file, uint64_t value)
+{
+	const uint8_t bytes[8] = {
+		(uint8_t)(value & 0xffu),
+		(uint8_t)((value >> 8) & 0xffu),
+		(uint8_t)((value >> 16) & 0xffu),
+		(uint8_t)((value >> 24) & 0xffu),
+		(uint8_t)((value >> 32) & 0xffu),
+		(uint8_t)((value >> 40) & 0xffu),
+		(uint8_t)((value >> 48) & 0xffu),
+		(uint8_t)((value >> 56) & 0xffu),
+	};
+
+	return write_capture_bytes(file, bytes, sizeof(bytes));
+}
+
+static int open_capture_stream(struct raw_runtime *runtime)
+{
+	FILE *file;
+
+	if (!runtime || !runtime->capture_stream_path)
+		return 0;
+
+	file = fopen(runtime->capture_stream_path, "wb");
+	if (!file) {
+		perror(runtime->capture_stream_path);
+		return -1;
+	}
+
+	(void)setvbuf(file, NULL, _IOFBF, UDL_CAPTURE_STREAM_BUFFER_SIZE);
+	if (write_capture_bytes(file, UDL_CAPTURE_STREAM_MAGIC, UDL_CAPTURE_STREAM_MAGIC_SIZE) != 0 ||
+	    write_capture_u32_le(file, UDL_CAPTURE_STREAM_VERSION) != 0 ||
+	    write_capture_u32_le(file, 0u) != 0) {
+		perror(runtime->capture_stream_path);
+		fclose(file);
+		return -1;
+	}
+
+	runtime->capture_stream_file = file;
+	runtime->capture_stream_packets = 0u;
+	runtime->capture_stream_bytes = 0u;
+	return 0;
+}
+
+static int capture_stream_packet(struct raw_runtime *runtime,
+				       const uint8_t *data,
+				       size_t length,
+				       uint64_t timestamp_nsec)
+{
+	if (!runtime || !runtime->capture_stream_file || !data || length == 0u)
+		return 0;
+	if (length > UINT32_MAX) {
+		errno = EOVERFLOW;
+		return -1;
+	}
+
+	if (write_capture_u64_le(runtime->capture_stream_file, timestamp_nsec) != 0 ||
+	    write_capture_u32_le(runtime->capture_stream_file, (uint32_t)length) != 0 ||
+	    write_capture_u32_le(runtime->capture_stream_file, 0u) != 0 ||
+	    write_capture_bytes(runtime->capture_stream_file, data, length) != 0) {
+		if (errno == 0)
+			errno = EIO;
+		return -1;
+	}
+
+	runtime->capture_stream_packets += 1u;
+	runtime->capture_stream_bytes += (uint64_t)length;
+	return 0;
+}
+
+static void close_capture_stream(struct raw_runtime *runtime)
+{
+	int rc;
+
+	if (!runtime || !runtime->capture_stream_file)
+		return;
+
+	rc = fclose(runtime->capture_stream_file);
+	if (rc != 0) {
+		perror(runtime->capture_stream_path ? runtime->capture_stream_path : "capture stream");
+	} else {
+		fprintf(stderr,
+			"Captured %llu bulk packets (%llu bytes) to %s\n",
+			(unsigned long long)runtime->capture_stream_packets,
+			(unsigned long long)runtime->capture_stream_bytes,
+			runtime->capture_stream_path);
+	}
+
+	runtime->capture_stream_file = NULL;
 }
 
 static void udl_decoder_lock(const struct udl_decode_runtime *decoder)
@@ -2362,6 +2493,7 @@ static void *bulk_out_drain_thread_main(void *arg)
 
 	while (!stop_requested && !atomic_load(&runtime->bulk_out_thread_stop)) {
 		int rc;
+		uint64_t capture_timestamp_nsec = 0u;
 		uint64_t read_start_nsec;
 		uint64_t read_end_nsec;
 
@@ -2381,6 +2513,15 @@ static void *bulk_out_drain_thread_main(void *arg)
 			if (!stop_requested && !atomic_load(&runtime->bulk_out_thread_stop) && runtime->verbose)
 				perror("ioctl USB_RAW_IOCTL_EP_READ");
 			break;
+		}
+		if (runtime->capture_stream_file) {
+			capture_timestamp_nsec = read_end_nsec != 0u ? read_end_nsec : monotonic_nanoseconds();
+			if (capture_stream_packet(runtime, io.data, (size_t)rc, capture_timestamp_nsec) != 0) {
+				if (!stop_requested)
+					perror(runtime->capture_stream_path ? runtime->capture_stream_path : "capture stream");
+				stop_requested = 1;
+				break;
+			}
 		}
 
 		if (udl_decoder_submit(&runtime->decoder, io.data, (size_t)rc) != 0)
@@ -2620,6 +2761,7 @@ static void shutdown_raw_gadget(struct raw_runtime *runtime,
 	stop_bulk_out_drain_thread(runtime);
 	udl_decoder_stop_worker(&runtime->decoder);
 	udl_decoder_stop_viewer(&runtime->decoder);
+	close_capture_stream(runtime);
 	if (runtime->fd >= 0) {
 		reset_configuration_state(runtime);
 		(void)set_udc_soft_connect(udc_device,
@@ -3076,9 +3218,12 @@ int main(int argc, char **argv)
 	runtime.udc_device = udc_device;
 	runtime.bulk_out_handle = -1;
 	runtime.bulk_out_address = DEFAULT_BULK_OUT_ADDRESS;
+	runtime.capture_stream_path = opts.capture_stream_path;
 	runtime.usb_speed = opts.usb_speed;
 	runtime.verbose = opts.verbose;
 	atomic_init(&runtime.bulk_out_thread_stop, false);
+	if (open_capture_stream(&runtime) != 0)
+		goto out;
 	if (udl_decoder_init(&runtime.decoder, &opts) != 0) {
 		fprintf(stderr, "Unable to initialize UDL decode runtime\n");
 		goto out;
@@ -3126,6 +3271,8 @@ int main(int argc, char **argv)
 	       usb_speed_name(opts.usb_speed));
 	if (opts.edid_path)
 		printf("Using EDID override from %s\n", opts.edid_path);
+	if (runtime.capture_stream_path)
+		printf("Bulk OUT capture will be written to %s\n", runtime.capture_stream_path);
 	printf("Entering Raw Gadget event loop. Press Ctrl+C to stop.\n");
 	if (runtime.decoder.enabled) {
 		printf("UDL decode is enabled with sink storage %ux%u. Bulk OUT traffic will be decoded as it arrives.\n",
