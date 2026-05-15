@@ -59,7 +59,7 @@ The active path is now the Raw Gadget implementation in `displaylink_gadget_raw_
 Build notes:
 
 ```sh
-sudo apt install build-essential
+sudo apt install build-essential libsdl2-dev
 git submodule update --init --recursive
 make
 ```
@@ -136,6 +136,30 @@ If auto-detection does not find the correct driver name, rerun with both values,
 ```sh
 sudo ./displaylink_gadget_raw_gadget --udc-driver fe800000.usb --udc-device fe800000.usb --verbose
 ```
+
+### In-process multi-session demo
+
+There is now also a small in-process demo binary at `displaylink_multi_session_demo`. This is the shortest path to exercise the new reusable session API and output-ring contract without bringing in the full DRM/KMS renderer yet.
+
+Each session is started inside the same process with its own `--session` block, and the demo composites the latest published frames side-by-side into one canvas. By default it runs headless and can dump a final composite image on exit; add `--show-window` to preview the composed output in a single SDL2 window.
+
+Example with one shared viewer window:
+
+```sh
+sudo ./displaylink_multi_session_demo --show-window \
+	--session --udc-device fe800000.usb --udc-driver fe800000.usb --monitor-name Left \
+	--session --udc-device fe900000.usb --udc-driver fe900000.usb --monitor-name Right
+```
+
+Example headless run that writes the composed result on exit:
+
+```sh
+sudo ./displaylink_multi_session_demo --dump-image /tmp/composite.ppm \
+	--session --udc-device fe800000.usb --udc-driver fe800000.usb --monitor-name Left \
+	--session --udc-device fe900000.usb --udc-driver fe900000.usb --monitor-name Right
+```
+
+The current demo is intentionally small: it uses the new in-process `displaylink_session` object model, renderer-owned ring buffers, and a simple horizontal layout. It is a test seam, not the final DRM/KMS presenter.
 
 ### Multi-display supervisor prototype
 

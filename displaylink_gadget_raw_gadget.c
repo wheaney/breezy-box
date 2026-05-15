@@ -57,6 +57,7 @@
 #define BULK_OUT_BUFFER_SIZE 16384u
 #define UDL_PACKET_QUEUE_CAPACITY 256u
 #define UDL_BACKLOG_LOG_INTERVAL_NSEC 1000000000ull
+#define DISPLAYLINK_SESSION_WAKE_SIGNAL SIGUSR1
 
 struct options {
 	const char *raw_device_path;
@@ -76,6 +77,7 @@ struct options {
 	uint32_t decode_height;
 	uint32_t window_scale;
 	struct displaylink_output_surface output_surface;
+	struct displaylink_output_ring output_ring;
 	bool decode_stream;
 	bool show_window;
 	bool startup_soft_reconnect;
@@ -87,6 +89,24 @@ struct udl_bulk_packet {
 	uint8_t data[BULK_OUT_BUFFER_SIZE];
 };
 
+struct displaylink_output_ring_runtime {
+	struct displaylink_output_surface *surfaces;
+	struct displaylink_output_damage *surface_damage;
+	uint64_t *surface_sequences;
+	uint32_t *surface_readers;
+	uint32_t *surface_visible_width;
+	uint32_t *surface_visible_height;
+	uint32_t surface_count;
+	uint32_t front_index;
+	uint64_t next_sequence;
+	pthread_mutex_t mutex;
+	pthread_cond_t released;
+	bool enabled;
+	bool has_front;
+	bool mutex_initialized;
+	bool released_cond_initialized;
+};
+
 struct udl_decode_runtime {
 	struct udl_sink sink;
 	struct udl_transport transport;
@@ -94,6 +114,7 @@ struct udl_decode_runtime {
 	uint32_t *framebuffer_xrgb8888;
 	uint32_t *viewer_snapshot_xrgb8888;
 	struct displaylink_compositor_surface viewer_surface;
+	struct displaylink_output_ring_runtime output_ring;
 	uint64_t bulk_packets;
 	uint64_t bulk_bytes;
 	uint32_t width;
@@ -149,6 +170,7 @@ struct udl_decode_runtime {
 	atomic_ullong perf_sdl_present_count;
 	atomic_bool decode_thread_stop;
 	atomic_bool viewer_thread_stop;
+	atomic_bool *stop_requested;
 	bool decode_thread_created;
 	bool packet_queue_initialized;
 	bool performance_report_mutex_initialized;
@@ -233,6 +255,7 @@ struct raw_runtime {
 	bool bulk_out_thread_created;
 	bool verbose;
 	atomic_bool bulk_out_thread_stop;
+	atomic_bool *stop_requested;
 	enum usb_device_speed usb_speed;
 	struct usb_device_descriptor device_descriptor;
 	struct usb_qualifier_descriptor qualifier_descriptor;
@@ -242,6 +265,63 @@ struct raw_runtime {
 	size_t vendor_descriptor_len;
 	struct udl_decode_runtime decoder;
 };
+
+struct displaylink_session {
+	struct options opts;
+	struct raw_runtime runtime;
+	char udc_driver[UDC_NAME_LENGTH_MAX];
+	char udc_device[UDC_NAME_LENGTH_MAX];
+	pthread_mutex_t state_mutex;
+	pthread_t thread;
+	pthread_t owner_thread;
+	atomic_bool execution_active;
+	atomic_bool stop_requested;
+	int exit_code;
+	bool state_mutex_initialized;
+	bool owner_thread_active;
+	bool thread_started;
+	bool thread_joined;
+};
+
+static void displaylink_session_set_owner_thread(struct displaylink_session *session, bool active)
+{
+	if (!session || !session->state_mutex_initialized)
+		return;
+
+	pthread_mutex_lock(&session->state_mutex);
+	if (active)
+		session->owner_thread = pthread_self();
+	session->owner_thread_active = active;
+	pthread_mutex_unlock(&session->state_mutex);
+}
+
+static bool displaylink_session_get_owner_thread(struct displaylink_session *session,
+					      pthread_t *thread)
+{
+	bool active = false;
+
+	if (!session || !thread || !session->state_mutex_initialized)
+		return false;
+
+	pthread_mutex_lock(&session->state_mutex);
+	if (session->owner_thread_active) {
+		*thread = session->owner_thread;
+		active = true;
+	}
+	pthread_mutex_unlock(&session->state_mutex);
+	return active;
+}
+
+static void *displaylink_session_thread_main(void *arg)
+{
+	struct displaylink_session *session = arg;
+
+	if (!session)
+		return NULL;
+
+	session->exit_code = displaylink_session_execute(session);
+	return NULL;
+}
 
 enum control_action {
 	CONTROL_ACTION_STALL,
@@ -254,12 +334,16 @@ static const uint8_t k_std_channel[16] = {
 	0x60, 0xfe, 0xc6, 0x97, 0x16, 0x3d, 0x47, 0xf2,
 };
 
-static volatile sig_atomic_t stop_requested = 0;
+static volatile sig_atomic_t process_signal_stop_requested = 0;
+static pthread_once_t wake_signal_handler_once = PTHREAD_ONCE_INIT;
 
 static int parse_args(int argc, char **argv, struct options *opts);
 static uint32_t udl_decoder_visible_width(const struct udl_decode_runtime *decoder);
 static uint32_t udl_decoder_visible_height(const struct udl_decode_runtime *decoder);
 static void udl_decoder_destroy(struct udl_decode_runtime *decoder);
+static int udl_decoder_init(struct udl_decode_runtime *decoder,
+			      const struct options *opts,
+			      atomic_bool *stop_requested);
 
 static uint64_t monotonic_nanoseconds(void)
 {
@@ -285,6 +369,325 @@ static void udl_decoder_record_counter(atomic_ullong *counter, uint64_t value)
 		return;
 
 	atomic_fetch_add(counter, (unsigned long long)value);
+}
+
+static bool displaylink_process_stop_requested(void)
+{
+	return process_signal_stop_requested != 0;
+}
+
+static bool displaylink_atomic_stop_requested(const atomic_bool *stop_requested)
+{
+	return stop_requested && atomic_load(stop_requested);
+}
+
+static bool udl_decoder_stop_requested(const struct udl_decode_runtime *decoder)
+{
+	return (decoder && displaylink_atomic_stop_requested(decoder->stop_requested)) ||
+		displaylink_process_stop_requested();
+}
+
+static void displaylink_output_ring_notify_stop(struct displaylink_output_ring_runtime *ring)
+{
+	if (!ring || !ring->enabled || !ring->mutex_initialized || !ring->released_cond_initialized)
+		return;
+
+	pthread_mutex_lock(&ring->mutex);
+	pthread_cond_broadcast(&ring->released);
+	pthread_mutex_unlock(&ring->mutex);
+}
+
+static void udl_decoder_request_stop(struct udl_decode_runtime *decoder)
+{
+	if (!decoder)
+		return;
+	if (decoder->stop_requested)
+		atomic_store(decoder->stop_requested, true);
+	if (decoder->packet_queue_initialized) {
+		pthread_mutex_lock(&decoder->packet_queue_mutex);
+		pthread_cond_broadcast(&decoder->packet_queue_not_empty);
+		pthread_cond_broadcast(&decoder->packet_queue_not_full);
+		pthread_mutex_unlock(&decoder->packet_queue_mutex);
+	}
+	displaylink_output_ring_notify_stop(&decoder->output_ring);
+	if (decoder->viewer_thread_created)
+		(void)SDL_PushEvent(&(SDL_Event){ .type = SDL_QUIT });
+}
+
+static bool raw_runtime_stop_requested(const struct raw_runtime *runtime)
+{
+	return (runtime && displaylink_atomic_stop_requested(runtime->stop_requested)) ||
+		displaylink_process_stop_requested();
+}
+
+static void raw_runtime_request_stop(struct raw_runtime *runtime)
+{
+	if (!runtime)
+		return;
+	if (runtime->stop_requested)
+		atomic_store(runtime->stop_requested, true);
+	udl_decoder_request_stop(&runtime->decoder);
+}
+
+static void displaylink_output_damage_clear(struct displaylink_output_damage *damage)
+{
+	if (!damage)
+		return;
+
+	memset(damage, 0, sizeof(*damage));
+}
+
+static void displaylink_output_damage_from_sink(struct displaylink_output_damage *dst,
+						const struct udl_sink_damage *src)
+{
+	if (!dst)
+		return;
+
+	displaylink_output_damage_clear(dst);
+	if (!src || !src->touched)
+		return;
+
+	dst->touched = src->touched;
+	dst->x1 = src->x1;
+	dst->y1 = src->y1;
+	dst->x2 = src->x2;
+	dst->y2 = src->y2;
+	dst->pixel_count = src->pixel_count;
+}
+
+static void displaylink_output_damage_mark_full(struct displaylink_output_damage *damage,
+						uint32_t width,
+						uint32_t height)
+{
+	if (!damage)
+		return;
+
+	displaylink_output_damage_clear(damage);
+	if (width == 0u || height == 0u)
+		return;
+
+	damage->touched = true;
+	damage->x1 = 0u;
+	damage->y1 = 0u;
+	damage->x2 = width - 1u;
+	damage->y2 = height - 1u;
+	damage->pixel_count = width * height;
+}
+
+static int displaylink_output_ring_init(struct displaylink_output_ring_runtime *ring,
+					const struct displaylink_output_ring *config)
+{
+	if (!ring)
+		return -1;
+
+	memset(ring, 0, sizeof(*ring));
+	if (!config || !config->surfaces || config->surface_count == 0u)
+		return 0;
+
+	ring->surfaces = config->surfaces;
+	ring->surface_count = config->surface_count;
+	ring->front_index = UINT32_MAX;
+	ring->surface_damage = calloc((size_t)ring->surface_count, sizeof(*ring->surface_damage));
+	ring->surface_sequences = calloc((size_t)ring->surface_count, sizeof(*ring->surface_sequences));
+	ring->surface_readers = calloc((size_t)ring->surface_count, sizeof(*ring->surface_readers));
+	ring->surface_visible_width = calloc((size_t)ring->surface_count, sizeof(*ring->surface_visible_width));
+	ring->surface_visible_height = calloc((size_t)ring->surface_count, sizeof(*ring->surface_visible_height));
+	if (!ring->surface_damage ||
+	    !ring->surface_sequences ||
+	    !ring->surface_readers ||
+	    !ring->surface_visible_width ||
+	    !ring->surface_visible_height)
+		goto fail;
+	if (pthread_mutex_init(&ring->mutex, NULL) != 0)
+		goto fail;
+	ring->mutex_initialized = true;
+	if (pthread_cond_init(&ring->released, NULL) != 0)
+		goto fail;
+	ring->released_cond_initialized = true;
+	ring->enabled = true;
+	return 0;
+
+fail:
+	if (ring->released_cond_initialized)
+		pthread_cond_destroy(&ring->released);
+	if (ring->mutex_initialized)
+		pthread_mutex_destroy(&ring->mutex);
+	free(ring->surface_damage);
+	free(ring->surface_sequences);
+	free(ring->surface_readers);
+	free(ring->surface_visible_width);
+	free(ring->surface_visible_height);
+	memset(ring, 0, sizeof(*ring));
+	return -1;
+}
+
+static void displaylink_output_ring_destroy(struct displaylink_output_ring_runtime *ring)
+{
+	if (!ring)
+		return;
+
+	if (ring->released_cond_initialized)
+		pthread_cond_destroy(&ring->released);
+	if (ring->mutex_initialized)
+		pthread_mutex_destroy(&ring->mutex);
+	free(ring->surface_damage);
+	free(ring->surface_sequences);
+	free(ring->surface_readers);
+	free(ring->surface_visible_width);
+	free(ring->surface_visible_height);
+	memset(ring, 0, sizeof(*ring));
+}
+
+static int displaylink_output_ring_find_writable_slot_locked(
+				const struct displaylink_output_ring_runtime *ring)
+{
+	uint32_t index;
+
+	if (!ring || !ring->enabled || ring->surface_count == 0u)
+		return -1;
+	if (ring->has_front &&
+	    ring->front_index < ring->surface_count &&
+	    ring->surface_readers[ring->front_index] == 0u)
+		return (int)ring->front_index;
+
+	for (index = 0u; index < ring->surface_count; ++index) {
+		if (ring->surface_readers[index] == 0u)
+			return (int)index;
+	}
+
+	return -1;
+}
+
+static void displaylink_output_ring_copy_frame(struct displaylink_output_surface *dst,
+						const uint32_t *src,
+						uint32_t src_stride_pixels,
+						uint32_t copy_width,
+						uint32_t copy_height)
+{
+	uint32_t row;
+
+	if (!dst || !dst->pixels || !src || copy_width == 0u || copy_height == 0u)
+		return;
+
+	for (row = 0u; row < copy_height; ++row) {
+		memcpy(dst->pixels + ((size_t)row * dst->stride_pixels),
+		       src + ((size_t)row * src_stride_pixels),
+		       (size_t)copy_width * sizeof(*src));
+	}
+}
+
+static int displaylink_output_ring_publish(struct udl_decode_runtime *decoder,
+					   const struct udl_sink_damage *damage,
+					   uint32_t visible_width,
+					   uint32_t visible_height)
+{
+	struct displaylink_output_ring_runtime *ring;
+	struct displaylink_output_damage published_damage;
+	struct displaylink_output_surface *surface;
+	bool full_damage = false;
+	int slot;
+
+	if (!decoder)
+		return -1;
+
+	ring = &decoder->output_ring;
+	if (!ring->enabled || !decoder->framebuffer_xrgb8888)
+		return 0;
+	if (visible_width == 0u)
+		visible_width = decoder->width;
+	if (visible_height == 0u)
+		visible_height = decoder->height;
+	if (visible_width > decoder->width)
+		visible_width = decoder->width;
+	if (visible_height > decoder->height)
+		visible_height = decoder->height;
+
+	pthread_mutex_lock(&ring->mutex);
+	full_damage = !ring->has_front;
+	if (!full_damage && ring->front_index < ring->surface_count) {
+		if (ring->surface_visible_width[ring->front_index] != visible_width ||
+		    ring->surface_visible_height[ring->front_index] != visible_height)
+			full_damage = true;
+	}
+	if ((!damage || !damage->touched) && !full_damage) {
+		pthread_mutex_unlock(&ring->mutex);
+		return 0;
+	}
+
+	while ((slot = displaylink_output_ring_find_writable_slot_locked(ring)) < 0) {
+		if (udl_decoder_stop_requested(decoder)) {
+			pthread_mutex_unlock(&ring->mutex);
+			return -1;
+		}
+		pthread_cond_wait(&ring->released, &ring->mutex);
+	}
+
+	surface = &ring->surfaces[(uint32_t)slot];
+	displaylink_output_ring_copy_frame(surface,
+						 decoder->framebuffer_xrgb8888,
+						 decoder->framebuffer_xrgb8888_stride_pixels,
+						 visible_width,
+						 visible_height);
+	if (full_damage)
+		displaylink_output_damage_mark_full(&published_damage, visible_width, visible_height);
+	else
+		displaylink_output_damage_from_sink(&published_damage, damage);
+
+	ring->next_sequence += 1u;
+	ring->surface_damage[(uint32_t)slot] = published_damage;
+	ring->surface_sequences[(uint32_t)slot] = ring->next_sequence;
+	ring->surface_visible_width[(uint32_t)slot] = visible_width;
+	ring->surface_visible_height[(uint32_t)slot] = visible_height;
+	ring->front_index = (uint32_t)slot;
+	ring->has_front = true;
+	pthread_mutex_unlock(&ring->mutex);
+	return 0;
+}
+
+static bool displaylink_output_ring_acquire_latest(
+				struct displaylink_output_ring_runtime *ring,
+				struct displaylink_output_frame *frame)
+{
+	uint32_t slot_index;
+
+	if (!ring || !frame || !ring->enabled || !ring->mutex_initialized)
+		return false;
+
+	pthread_mutex_lock(&ring->mutex);
+	if (!ring->has_front || ring->front_index >= ring->surface_count) {
+		pthread_mutex_unlock(&ring->mutex);
+		return false;
+	}
+
+	slot_index = ring->front_index;
+	ring->surface_readers[slot_index] += 1u;
+	memset(frame, 0, sizeof(*frame));
+	frame->surface = ring->surfaces[slot_index];
+	frame->damage = ring->surface_damage[slot_index];
+	frame->sequence = ring->surface_sequences[slot_index];
+	frame->slot_index = slot_index;
+	frame->visible_width = ring->surface_visible_width[slot_index];
+	frame->visible_height = ring->surface_visible_height[slot_index];
+	pthread_mutex_unlock(&ring->mutex);
+	return true;
+}
+
+static void displaylink_output_ring_release(struct displaylink_output_ring_runtime *ring,
+					const struct displaylink_output_frame *frame)
+{
+	if (!ring || !frame || !ring->enabled || !ring->mutex_initialized)
+		return;
+	if (frame->slot_index >= ring->surface_count)
+		return;
+
+	pthread_mutex_lock(&ring->mutex);
+	if (ring->surface_readers[frame->slot_index] > 0u) {
+		ring->surface_readers[frame->slot_index] -= 1u;
+		if (ring->surface_readers[frame->slot_index] == 0u &&
+		    ring->released_cond_initialized)
+			pthread_cond_broadcast(&ring->released);
+	}
+	pthread_mutex_unlock(&ring->mutex);
 }
 
 static void udl_decoder_maybe_log_performance(struct udl_decode_runtime *decoder)
@@ -575,10 +978,26 @@ static void usage(const char *argv0)
 		argv0);
 }
 
+static void on_session_wake_signal(int signo)
+{
+	(void)signo;
+}
+
+static void install_session_wake_signal_handler(void)
+{
+	struct sigaction action;
+
+	memset(&action, 0, sizeof(action));
+	action.sa_handler = on_session_wake_signal;
+	sigemptyset(&action.sa_mask);
+	sigaction(DISPLAYLINK_SESSION_WAKE_SIGNAL, &action, NULL);
+}
+
+#ifndef DISPLAYLINK_SESSION_NO_MAIN
 static void on_signal(int signo)
 {
 	(void)signo;
-	stop_requested = 1;
+	process_signal_stop_requested = 1;
 }
 
 static void install_signal_handlers(void)
@@ -593,6 +1012,7 @@ static void install_signal_handlers(void)
 	sigaction(SIGHUP, &action, NULL);
 	sigaction(SIGQUIT, &action, NULL);
 }
+#endif
 
 static int parse_hex16(const char *text, uint16_t *value)
 {
@@ -662,6 +1082,7 @@ static void public_options_from_internal(struct displaylink_session_options *dst
 	dst->decode_height = src->decode_height;
 	dst->window_scale = src->window_scale;
 	dst->output_surface = src->output_surface;
+	dst->output_ring = src->output_ring;
 	dst->decode_stream = src->decode_stream;
 	dst->show_window = src->show_window;
 	dst->startup_soft_reconnect = src->startup_soft_reconnect;
@@ -692,6 +1113,7 @@ static void internal_options_from_public(struct options *dst,
 	dst->decode_height = src->decode_height;
 	dst->window_scale = src->window_scale;
 	dst->output_surface = src->output_surface;
+	dst->output_ring = src->output_ring;
 	dst->decode_stream = src->decode_stream;
 	dst->show_window = src->show_window;
 	dst->startup_soft_reconnect = src->startup_soft_reconnect;
@@ -741,6 +1163,10 @@ static int validate_options(const struct options *opts)
 		fprintf(stderr, "--window-scale must be at least 1\n");
 		return -1;
 	}
+	if (opts->output_surface.pixels && opts->output_ring.surfaces) {
+		fprintf(stderr, "output_surface and output_ring are mutually exclusive\n");
+		return -1;
+	}
 	if (opts->output_surface.pixels) {
 		if (!opts->decode_stream) {
 			fprintf(stderr, "external output_surface requires decode support\n");
@@ -755,6 +1181,40 @@ static int validate_options(const struct options *opts)
 				opts->decode_height,
 				opts->decode_width);
 			return -1;
+		}
+	}
+	if ((opts->output_ring.surfaces && opts->output_ring.surface_count == 0u) ||
+	    (!opts->output_ring.surfaces && opts->output_ring.surface_count != 0u)) {
+		fprintf(stderr, "output_ring requires both surfaces and surface_count\n");
+		return -1;
+	}
+	if (opts->output_ring.surfaces) {
+		uint32_t index;
+
+		if (!opts->decode_stream) {
+			fprintf(stderr, "output_ring requires decode support\n");
+			return -1;
+		}
+		if (opts->output_ring.surface_count < 2u) {
+			fprintf(stderr, "output_ring requires at least two surfaces\n");
+			return -1;
+		}
+		for (index = 0u; index < opts->output_ring.surface_count; ++index) {
+			const struct displaylink_output_surface *surface =
+				&opts->output_ring.surfaces[index];
+
+			if (!surface->pixels ||
+			    surface->width < opts->decode_width ||
+			    surface->height < opts->decode_height ||
+			    surface->stride_pixels < opts->decode_width) {
+				fprintf(stderr,
+					"output_ring surface[%u] must be at least %ux%u with stride >= %u\n",
+					index,
+					opts->decode_width,
+					opts->decode_height,
+					opts->decode_width);
+				return -1;
+			}
 		}
 	}
 
@@ -797,9 +1257,26 @@ int displaylink_session_validate_options(const struct displaylink_session_option
 	return validate_options(&internal_opts);
 }
 
-void displaylink_session_request_stop(void)
+void displaylink_session_request_stop(struct displaylink_session *session)
 {
-	stop_requested = 1;
+	pthread_t owner_thread;
+	bool have_owner_thread;
+	int rc;
+
+	if (!session)
+		return;
+
+	atomic_store(&session->stop_requested, true);
+	udl_decoder_request_stop(&session->runtime.decoder);
+	have_owner_thread = displaylink_session_get_owner_thread(session, &owner_thread);
+	if (!have_owner_thread)
+		return;
+
+	rc = pthread_kill(owner_thread, DISPLAYLINK_SESSION_WAKE_SIGNAL);
+	if (rc != 0 && rc != ESRCH && session->runtime.verbose) {
+		errno = rc;
+		perror("pthread_kill displaylink session");
+	}
 }
 
 static int parse_args(int argc, char **argv, struct options *opts)
@@ -1073,6 +1550,11 @@ static int udl_decoder_feed(struct udl_decode_runtime *decoder, const uint8_t *d
 	visible_width = udl_decoder_visible_width(decoder);
 	visible_height = udl_decoder_visible_height(decoder);
 	snapshot_damage = damage;
+	if (displaylink_output_ring_publish(decoder, &snapshot_damage, visible_width, visible_height) != 0) {
+		udl_decoder_unlock(decoder);
+		fprintf(stderr, "Output ring publish failed\n");
+		return -1;
+	}
 	snapshot_start_nsec = collect_performance ? monotonic_nanoseconds() : 0u;
 	if (decoder->viewer_enabled &&
 	    decoder->framebuffer_xrgb8888 &&
@@ -1226,7 +1708,7 @@ static void *udl_decode_thread_main(void *arg)
 			udl_decoder_maybe_log_performance(decoder);
 
 		if (udl_decoder_feed(decoder, packet, packet_length) != 0) {
-			stop_requested = 1;
+			udl_decoder_request_stop(decoder);
 			break;
 		}
 	}
@@ -1289,7 +1771,7 @@ static int udl_decoder_submit(struct udl_decode_runtime *decoder,
 
 	pthread_mutex_lock(&decoder->packet_queue_mutex);
 	while (decoder->packet_queue_count == UDL_PACKET_QUEUE_CAPACITY &&
-	       !stop_requested &&
+	       !udl_decoder_stop_requested(decoder) &&
 	       !atomic_load(&decoder->decode_thread_stop)) {
 		uint64_t wait_start_nsec;
 		uint64_t wait_end_nsec;
@@ -1303,7 +1785,7 @@ static int udl_decoder_submit(struct udl_decode_runtime *decoder,
 			udl_decoder_record_counter(&decoder->perf_queue_wait_nsec,
 				wait_end_nsec - wait_start_nsec);
 	}
-	if (stop_requested || atomic_load(&decoder->decode_thread_stop)) {
+	if (udl_decoder_stop_requested(decoder) || atomic_load(&decoder->decode_thread_stop)) {
 		pthread_mutex_unlock(&decoder->packet_queue_mutex);
 		return -1;
 	}
@@ -1342,7 +1824,7 @@ static void *udl_viewer_thread_main(void *arg)
 	rc = SDL_Init(SDL_INIT_VIDEO);
 	if (rc != 0) {
 		fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
-		stop_requested = 1;
+		udl_decoder_request_stop(decoder);
 		return NULL;
 	}
 
@@ -1357,7 +1839,7 @@ static void *udl_viewer_thread_main(void *arg)
 	if (!window) {
 		fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError());
 		SDL_Quit();
-		stop_requested = 1;
+		udl_decoder_request_stop(decoder);
 		return NULL;
 	}
 
@@ -1368,7 +1850,7 @@ static void *udl_viewer_thread_main(void *arg)
 		fprintf(stderr, "SDL_CreateRenderer failed: %s\n", SDL_GetError());
 		SDL_DestroyWindow(window);
 		SDL_Quit();
-		stop_requested = 1;
+		udl_decoder_request_stop(decoder);
 		return NULL;
 	}
 
@@ -1382,11 +1864,11 @@ static void *udl_viewer_thread_main(void *arg)
 		SDL_DestroyRenderer(renderer);
 		SDL_DestroyWindow(window);
 		SDL_Quit();
-		stop_requested = 1;
+		udl_decoder_request_stop(decoder);
 		return NULL;
 	}
 
-	while (!stop_requested && !atomic_load(&decoder->viewer_thread_stop)) {
+	while (!udl_decoder_stop_requested(decoder) && !atomic_load(&decoder->viewer_thread_stop)) {
 		SDL_Event event;
 		uint32_t visible_width = decoder->width;
 		uint32_t visible_height = decoder->height;
@@ -1404,7 +1886,7 @@ static void *udl_viewer_thread_main(void *arg)
 
 		while (SDL_PollEvent(&event)) {
 			if (event.type == SDL_QUIT) {
-				stop_requested = 1;
+				udl_decoder_request_stop(decoder);
 				break;
 			}
 			if (event.type == SDL_WINDOWEVENT &&
@@ -1459,7 +1941,7 @@ static void *udl_viewer_thread_main(void *arg)
 					     (int)(decoder->width * sizeof(*decoder->viewer_surface.pixels))) != 0) {
 				pthread_mutex_unlock(&decoder->viewer_snapshot_mutex);
 				fprintf(stderr, "SDL_UpdateTexture failed: %s\n", SDL_GetError());
-				stop_requested = 1;
+				udl_decoder_request_stop(decoder);
 				break;
 			}
 			upload_end_nsec = monotonic_nanoseconds();
@@ -1537,9 +2019,12 @@ static void udl_decoder_stop_viewer(struct udl_decode_runtime *decoder)
 	decoder->viewer_thread_created = false;
 }
 
-static int udl_decoder_init(struct udl_decode_runtime *decoder, const struct options *opts)
+static int udl_decoder_init(struct udl_decode_runtime *decoder,
+			      const struct options *opts,
+			      atomic_bool *stop_requested)
 {
 	size_t pixel_count;
+	const bool use_output_ring = opts->output_ring.surfaces && opts->output_ring.surface_count != 0u;
 
 	memset(decoder, 0, sizeof(*decoder));
 	decoder->enabled = opts->decode_stream;
@@ -1551,6 +2036,7 @@ static int udl_decoder_init(struct udl_decode_runtime *decoder, const struct opt
 	decoder->viewer_enabled = opts->show_window;
 	decoder->window_scale = opts->window_scale;
 	decoder->framebuffer_xrgb8888_stride_pixels = opts->decode_width;
+	decoder->stop_requested = stop_requested;
 
 	if (!decoder->enabled)
 		return 0;
@@ -1563,7 +2049,13 @@ static int udl_decoder_init(struct udl_decode_runtime *decoder, const struct opt
 	decoder->framebuffer_rgb565 = calloc(pixel_count, sizeof(*decoder->framebuffer_rgb565));
 	if (!decoder->framebuffer_rgb565)
 		return -1;
-	if (opts->output_surface.pixels) {
+	if (use_output_ring) {
+		decoder->framebuffer_xrgb8888 = calloc(pixel_count, sizeof(*decoder->framebuffer_xrgb8888));
+		if (!decoder->framebuffer_xrgb8888)
+			goto fail;
+		decoder->framebuffer_xrgb8888_stride_pixels = decoder->width;
+		decoder->framebuffer_xrgb8888_owned = true;
+	} else if (opts->output_surface.pixels) {
 		decoder->framebuffer_xrgb8888 = opts->output_surface.pixels;
 		decoder->framebuffer_xrgb8888_stride_pixels = opts->output_surface.stride_pixels;
 		decoder->framebuffer_xrgb8888_owned = false;
@@ -1574,6 +2066,8 @@ static int udl_decoder_init(struct udl_decode_runtime *decoder, const struct opt
 		decoder->framebuffer_xrgb8888_stride_pixels = decoder->width;
 		decoder->framebuffer_xrgb8888_owned = true;
 	}
+	if (displaylink_output_ring_init(&decoder->output_ring, &opts->output_ring) != 0)
+		goto fail;
 	if (decoder->viewer_enabled) {
 		decoder->viewer_snapshot_xrgb8888 = calloc(pixel_count, sizeof(*decoder->viewer_snapshot_xrgb8888));
 		if (!decoder->viewer_snapshot_xrgb8888)
@@ -1686,6 +2180,7 @@ static void udl_decoder_destroy(struct udl_decode_runtime *decoder)
 		pthread_mutex_destroy(&decoder->framebuffer_mutex);
 		decoder->framebuffer_mutex_initialized = false;
 	}
+	displaylink_output_ring_destroy(&decoder->output_ring);
 	free(decoder->framebuffer_rgb565);
 	if (decoder->framebuffer_xrgb8888_owned)
 		free(decoder->framebuffer_xrgb8888);
@@ -2722,7 +3217,7 @@ static void *bulk_out_drain_thread_main(void *arg)
 			runtime->bulk_out_address);
 	}
 
-	while (!stop_requested && !atomic_load(&runtime->bulk_out_thread_stop)) {
+	while (!raw_runtime_stop_requested(runtime) && !atomic_load(&runtime->bulk_out_thread_stop)) {
 		int rc;
 		uint64_t capture_timestamp_nsec = 0u;
 		uint64_t read_start_nsec;
@@ -2739,18 +3234,20 @@ static void *bulk_out_drain_thread_main(void *arg)
 			udl_decoder_record_counter(&runtime->decoder.perf_usb_read_wait_nsec,
 				read_end_nsec - read_start_nsec);
 		if (rc < 0) {
-			if (errno == EINTR && !stop_requested)
+			if (errno == EINTR && !raw_runtime_stop_requested(runtime))
 				continue;
-			if (!stop_requested && !atomic_load(&runtime->bulk_out_thread_stop) && runtime->verbose)
+			if (!raw_runtime_stop_requested(runtime) &&
+			    !atomic_load(&runtime->bulk_out_thread_stop) &&
+			    runtime->verbose)
 				perror("ioctl USB_RAW_IOCTL_EP_READ");
 			break;
 		}
 		if (runtime->capture_stream_file) {
 			capture_timestamp_nsec = read_end_nsec != 0u ? read_end_nsec : monotonic_nanoseconds();
 			if (capture_stream_packet(runtime, io.data, (size_t)rc, capture_timestamp_nsec) != 0) {
-				if (!stop_requested)
+				if (!raw_runtime_stop_requested(runtime))
 					perror(runtime->capture_stream_path ? runtime->capture_stream_path : "capture stream");
-				stop_requested = 1;
+				raw_runtime_request_stop(runtime);
 				break;
 			}
 		}
@@ -3313,12 +3810,12 @@ static int handle_connect(struct raw_runtime *runtime)
 
 static int run_loop(struct raw_runtime *runtime)
 {
-	while (!stop_requested) {
+	while (!raw_runtime_stop_requested(runtime)) {
 		struct usb_raw_control_event event;
 		int rc = raw_event_fetch(runtime->fd, &event);
 
 		if (rc < 0) {
-			if (errno == EINTR && stop_requested)
+			if (errno == EINTR && raw_runtime_stop_requested(runtime))
 				break;
 			if (errno == EINTR)
 				continue;
@@ -3408,118 +3905,268 @@ static int run_loop(struct raw_runtime *runtime)
 	return 0;
 }
 
-int displaylink_session_run(const struct displaylink_session_options *session_opts)
+struct displaylink_session *displaylink_session_create(const struct displaylink_session_options *session_opts)
 {
-	struct options opts;
-	struct raw_runtime runtime;
-	char udc_driver[UDC_NAME_LENGTH_MAX] = {0};
-	char udc_device[UDC_NAME_LENGTH_MAX] = {0};
-	int ret = EXIT_FAILURE;
+	struct displaylink_session *session;
 
 	if (!session_opts)
-		return EXIT_FAILURE;
-	internal_options_from_public(&opts, session_opts);
-	if (validate_options(&opts) != 0)
-		return EXIT_FAILURE;
-	stop_requested = 0;
+		return NULL;
+	pthread_once(&wake_signal_handler_once, install_session_wake_signal_handler);
 
-	if ((!opts.udc_driver || !opts.udc_device) &&
-	    auto_detect_udc(udc_driver, sizeof(udc_driver), udc_device, sizeof(udc_device)) != 0) {
-		return EXIT_FAILURE;
+	session = calloc(1u, sizeof(*session));
+	if (!session)
+		return NULL;
+	if (pthread_mutex_init(&session->state_mutex, NULL) != 0) {
+		free(session);
+		return NULL;
 	}
-	if (opts.udc_driver &&
-	    snprintf(udc_driver, sizeof(udc_driver), "%s", opts.udc_driver) >= (int)sizeof(udc_driver))
-		return EXIT_FAILURE;
-	if (opts.udc_device &&
-	    snprintf(udc_device, sizeof(udc_device), "%s", opts.udc_device) >= (int)sizeof(udc_device))
+	session->state_mutex_initialized = true;
+	atomic_init(&session->execution_active, false);
+	atomic_init(&session->stop_requested, false);
+
+	internal_options_from_public(&session->opts, session_opts);
+	if (validate_options(&session->opts) != 0) {
+		pthread_mutex_destroy(&session->state_mutex);
+		free(session);
+		return NULL;
+	}
+
+	session->runtime.fd = -1;
+	session->runtime.bulk_out_handle = -1;
+	session->runtime.bulk_out_address = DEFAULT_BULK_OUT_ADDRESS;
+	session->runtime.stop_requested = &session->stop_requested;
+	atomic_init(&session->runtime.bulk_out_thread_stop, false);
+	session->exit_code = EXIT_FAILURE;
+	return session;
+}
+
+void displaylink_session_destroy(struct displaylink_session *session)
+{
+	if (!session)
+		return;
+	if (session->thread_started && !session->thread_joined) {
+		displaylink_session_request_stop(session);
+		(void)pthread_join(session->thread, NULL);
+		session->thread_joined = true;
+	}
+
+	shutdown_raw_gadget(&session->runtime, session->udc_device);
+	if (session->state_mutex_initialized)
+		pthread_mutex_destroy(&session->state_mutex);
+	free(session);
+}
+
+int displaylink_session_execute(struct displaylink_session *session)
+{
+	struct options *opts;
+	struct raw_runtime *runtime;
+	int ret = EXIT_FAILURE;
+
+	if (!session)
 		return EXIT_FAILURE;
 
-	memset(&runtime, 0, sizeof(runtime));
-	runtime.fd = -1;
-	runtime.udc_device = udc_device;
-	runtime.bulk_out_handle = -1;
-	runtime.bulk_out_address = DEFAULT_BULK_OUT_ADDRESS;
-	runtime.capture_stream_path = opts.capture_stream_path;
-	runtime.manufacturer_string = opts.manufacturer_string;
-	runtime.product_string = opts.product_string;
-	runtime.serial_string = opts.serial_string;
-	runtime.monitor_name = opts.monitor_name;
-	runtime.usb_speed = opts.usb_speed;
-	runtime.verbose = opts.verbose;
-	atomic_init(&runtime.bulk_out_thread_stop, false);
-	if (open_capture_stream(&runtime) != 0)
+	atomic_store(&session->execution_active, true);
+	displaylink_session_set_owner_thread(session, true);
+	opts = &session->opts;
+	runtime = &session->runtime;
+	process_signal_stop_requested = 0;
+
+	if ((!opts->udc_driver || !opts->udc_device) &&
+	    auto_detect_udc(session->udc_driver,
+			    sizeof(session->udc_driver),
+			    session->udc_device,
+			    sizeof(session->udc_device)) != 0) {
 		goto out;
-	if (udl_decoder_init(&runtime.decoder, &opts) != 0) {
+	}
+	if (opts->udc_driver &&
+	    snprintf(session->udc_driver,
+		     sizeof(session->udc_driver),
+		     "%s",
+		     opts->udc_driver) >= (int)sizeof(session->udc_driver))
+		goto out;
+	if (opts->udc_device &&
+	    snprintf(session->udc_device,
+		     sizeof(session->udc_device),
+		     "%s",
+		     opts->udc_device) >= (int)sizeof(session->udc_device))
+		goto out;
+
+	runtime->udc_device = session->udc_device;
+	runtime->capture_stream_path = opts->capture_stream_path;
+	runtime->manufacturer_string = opts->manufacturer_string;
+	runtime->product_string = opts->product_string;
+	runtime->serial_string = opts->serial_string;
+	runtime->monitor_name = opts->monitor_name;
+	runtime->usb_speed = opts->usb_speed;
+	runtime->verbose = opts->verbose;
+	runtime->stop_requested = &session->stop_requested;
+	if (open_capture_stream(runtime) != 0)
+		goto out;
+	if (udl_decoder_init(&runtime->decoder, opts, &session->stop_requested) != 0) {
 		fprintf(stderr, "Unable to initialize UDL decode runtime\n");
 		goto out;
 	}
-	if (udl_decoder_start_viewer(&runtime.decoder) != 0) {
+	if (udl_decoder_start_viewer(&runtime->decoder) != 0) {
 		fprintf(stderr, "Unable to start SDL viewer\n");
 		goto out;
 	}
-	build_default_edid(runtime.edid, opts.monitor_name);
-	if (opts.edid_path && load_edid_file(opts.edid_path, runtime.edid) != 0)
+	build_default_edid(runtime->edid, opts->monitor_name);
+	if (opts->edid_path && load_edid_file(opts->edid_path, runtime->edid) != 0)
 		goto out;
-	build_vendor_descriptor(&runtime, &opts);
-	build_device_descriptor(&runtime, &opts);
-	build_device_qualifier(&runtime);
-	build_bos_descriptor(&runtime);
+	build_vendor_descriptor(runtime, opts);
+	build_device_descriptor(runtime, opts);
+	build_device_qualifier(runtime);
+	build_bos_descriptor(runtime);
 
-	runtime.fd = open(opts.raw_device_path, O_RDWR);
-	if (runtime.fd < 0) {
-		report_raw_device_open_failure(opts.raw_device_path, errno);
+	runtime->fd = open(opts->raw_device_path, O_RDWR);
+	if (runtime->fd < 0) {
+		report_raw_device_open_failure(opts->raw_device_path, errno);
 		goto out;
 	}
 
-	if (raw_init(runtime.fd, opts.usb_speed, udc_driver, udc_device) != 0) {
+	if (raw_init(runtime->fd,
+		     opts->usb_speed,
+		     session->udc_driver,
+		     session->udc_device) != 0) {
 		perror("ioctl USB_RAW_IOCTL_INIT");
 		goto out;
 	}
-	if (raw_run(runtime.fd) != 0) {
-		report_raw_run_failure(udc_driver, udc_device, errno);
+	if (raw_run(runtime->fd) != 0) {
+		report_raw_run_failure(session->udc_driver, session->udc_device, errno);
 		goto out;
 	}
-	if (opts.startup_soft_reconnect)
-		force_udc_soft_reconnect(udc_device, runtime.verbose);
+	if (opts->startup_soft_reconnect)
+		force_udc_soft_reconnect(session->udc_device, runtime->verbose);
 	else
-		prime_udc_attach_state(udc_device, runtime.verbose);
-	diagnose_udc_attach_state(udc_device,
-				      opts.startup_soft_reconnect,
-				      runtime.verbose);
+		prime_udc_attach_state(session->udc_device, runtime->verbose);
+	diagnose_udc_attach_state(session->udc_device,
+				      opts->startup_soft_reconnect,
+				      runtime->verbose);
 
 	printf("DisplayLink Raw Gadget prepared. raw=%s udc_driver=%s udc_device=%s\n",
-	       opts.raw_device_path,
-	       udc_driver,
-	       udc_device);
+	       opts->raw_device_path,
+	       session->udc_driver,
+	       session->udc_device);
 	printf("Using %s-speed USB descriptors and endpoint settings.\n",
-	       usb_speed_name(opts.usb_speed));
-	if (opts.edid_path)
-		printf("Using EDID override from %s\n", opts.edid_path);
-	if (runtime.capture_stream_path)
-		printf("Bulk OUT capture will be written to %s\n", runtime.capture_stream_path);
+	       usb_speed_name(opts->usb_speed));
+	if (opts->edid_path)
+		printf("Using EDID override from %s\n", opts->edid_path);
+	if (runtime->capture_stream_path)
+		printf("Bulk OUT capture will be written to %s\n", runtime->capture_stream_path);
 	printf("Entering Raw Gadget event loop. Press Ctrl+C to stop.\n");
-	if (runtime.decoder.enabled) {
+	if (runtime->decoder.enabled) {
 		printf("UDL decode is enabled with sink storage %ux%u. Bulk OUT traffic will be decoded as it arrives.\n",
-		       runtime.decoder.width,
-		       runtime.decoder.height);
-		if (runtime.decoder.viewer_enabled)
+		       runtime->decoder.width,
+		       runtime->decoder.height);
+		if (runtime->decoder.viewer_enabled)
 			printf("A live SDL2 viewer window will be shown at %ux scale.\n",
-			       runtime.decoder.window_scale);
-		if (runtime.decoder.dump_image_path)
+			       runtime->decoder.window_scale);
+		if (runtime->decoder.dump_image_path)
 			printf("A decoded snapshot will be written to %s on exit.\n",
-			       runtime.decoder.dump_image_path);
+			       runtime->decoder.dump_image_path);
 	} else {
 		printf("UDL decode is disabled; bulk OUT traffic will only be drained.\n");
 	}
 
-	if (run_loop(&runtime) != 0)
+	if (run_loop(runtime) != 0)
 		goto out;
 
 	ret = EXIT_SUCCESS;
 
 out:
-	shutdown_raw_gadget(&runtime, udc_device);
+	displaylink_session_set_owner_thread(session, false);
+	atomic_store(&session->execution_active, false);
+	session->exit_code = ret;
 	return ret;
+}
+
+int displaylink_session_start(struct displaylink_session *session)
+{
+	int rc;
+
+	if (!session || session->thread_started)
+		return -1;
+
+	atomic_store(&session->execution_active, true);
+	rc = pthread_create(&session->thread, NULL, displaylink_session_thread_main, session);
+	if (rc != 0) {
+		atomic_store(&session->execution_active, false);
+		errno = rc;
+		perror("pthread_create displaylink session");
+		return -1;
+	}
+
+	session->thread_started = true;
+	session->thread_joined = false;
+	return 0;
+}
+
+int displaylink_session_join(struct displaylink_session *session)
+{
+	int rc;
+
+	if (!session)
+		return EXIT_FAILURE;
+	if (!session->thread_started)
+		return session->exit_code;
+	if (!session->thread_joined) {
+		rc = pthread_join(session->thread, NULL);
+		if (rc != 0) {
+			errno = rc;
+			perror("pthread_join displaylink session");
+			return EXIT_FAILURE;
+		}
+		session->thread_joined = true;
+	}
+
+	return session->exit_code;
+}
+
+bool displaylink_session_is_started(const struct displaylink_session *session)
+{
+	return session && session->thread_started && !session->thread_joined;
+}
+
+bool displaylink_session_is_running(const struct displaylink_session *session)
+{
+	return session && atomic_load(&session->execution_active);
+}
+
+int displaylink_session_get_exit_code(const struct displaylink_session *session)
+{
+	return session ? session->exit_code : EXIT_FAILURE;
+}
+
+bool displaylink_session_acquire_latest_output(struct displaylink_session *session,
+					       struct displaylink_output_frame *frame)
+{
+	if (!session)
+		return false;
+
+	return displaylink_output_ring_acquire_latest(&session->runtime.decoder.output_ring, frame);
+}
+
+void displaylink_session_release_output(struct displaylink_session *session,
+					 const struct displaylink_output_frame *frame)
+{
+	if (!session)
+		return;
+
+	displaylink_output_ring_release(&session->runtime.decoder.output_ring, frame);
+}
+
+int displaylink_session_run(const struct displaylink_session_options *session_opts)
+{
+	struct displaylink_session *session;
+	int rc;
+
+	session = displaylink_session_create(session_opts);
+	if (!session)
+		return EXIT_FAILURE;
+
+	rc = displaylink_session_execute(session);
+	displaylink_session_destroy(session);
+	return rc;
 }
 
 #ifndef DISPLAYLINK_SESSION_NO_MAIN
