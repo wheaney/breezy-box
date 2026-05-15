@@ -973,7 +973,8 @@ static void usage(const char *argv0)
 		"  --show-window           Display the decoded framebuffer in a live SDL2 window\n"
 		"  --window-scale FACTOR   Integer scale factor for the SDL2 viewer window (default: 1)\n"
 		"  --no-decode             Leave bulk traffic undecoded and only drain the endpoint\n"
-		"  --no-startup-reconnect  Do not force a startup soft disconnect/connect pulse\n"
+		"  --startup-reconnect     Force a startup soft disconnect/connect pulse\n"
+		"  --no-startup-reconnect  Deprecated alias for leaving the startup pulse disabled\n"
 		"  --verbose               Log control requests and endpoint discovery\n",
 		argv0);
 }
@@ -1135,7 +1136,7 @@ static void default_options(struct options *opts)
 	opts->decode_height = DEFAULT_DISPLAY_HEIGHT;
 	opts->window_scale = 1u;
 	opts->decode_stream = true;
-	opts->startup_soft_reconnect = true;
+	opts->startup_soft_reconnect = false;
 	opts->verbose = false;
 }
 
@@ -1300,6 +1301,7 @@ static int parse_args(int argc, char **argv, struct options *opts)
 		{ "show-window", no_argument, NULL, 's' },
 		{ "window-scale", required_argument, NULL, 'S' },
 		{ "no-decode", no_argument, NULL, 'x' },
+		{ "startup-reconnect", no_argument, NULL, 1004 },
 		{ "no-startup-reconnect", no_argument, NULL, 'n' },
 		{ "verbose", no_argument, NULL, 'V' },
 		{ "help", no_argument, NULL, 'h' },
@@ -1368,6 +1370,9 @@ static int parse_args(int argc, char **argv, struct options *opts)
 			break;
 		case 'x':
 			opts->decode_stream = false;
+			break;
+		case 1004:
+			opts->startup_soft_reconnect = true;
 			break;
 		case 'n':
 			opts->startup_soft_reconnect = false;

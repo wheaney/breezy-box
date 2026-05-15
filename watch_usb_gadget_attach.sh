@@ -61,26 +61,25 @@ read_one() {
 }
 
 resolve_otg_extcon() {
-    local supplier
-    local phy_name
-    local extcon_root
+    local direct_glob='/sys/devices/platform/ff770000.syscon/ff770000.syscon:usb2phy@e450/extcon/extcon*'
+    local path
 
-    supplier="/sys/devices/platform/usb@${UDC_DEVICE%.usb}/${UDC_DEVICE}/supplier:platform:ff770000.syscon:usb2phy@e450"
-    if [[ -e "$supplier" ]]; then
-        printf '/sys/devices/platform/ff770000.syscon/ff770000.syscon:usb2phy@e450/extcon/extcon1'
-        return 0
-    fi
-
-    phy_name="$(basename "$(readlink -f "/sys/class/udc/$UDC_DEVICE/device/supplier:phy:phy-ff770000.syscon:usb2phy@e450.8" 2>/dev/null || true)")"
-    if [[ -n "$phy_name" ]]; then
-        extcon_root="/sys/devices/platform/ff770000.syscon/ff770000.syscon:usb2phy@e450/extcon/extcon1"
-        if [[ -d "$extcon_root" ]]; then
-            printf '%s' "$extcon_root"
+    for path in $direct_glob; do
+        if [[ -d "$path" ]]; then
+            printf '%s' "$path"
             return 0
         fi
-    fi
+    done
 
-    printf '/sys/devices/platform/ff770000.syscon/ff770000.syscon:usb2phy@e450/extcon/extcon1'
+    for path in /sys/class/extcon/*; do
+        [[ -e "$path" ]] || continue
+        if [[ "$(readlink -f "$path/device" 2>/dev/null || true)" == *"usb2phy@e450"* ]]; then
+            printf '%s' "$path"
+            return 0
+        fi
+    done
+
+    printf '/sys/devices/platform/ff770000.syscon/ff770000.syscon:usb2phy@e450/extcon/extcon?'
 }
 
 OTG_EXTCON="$(resolve_otg_extcon)"

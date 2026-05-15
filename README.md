@@ -103,6 +103,27 @@ ls -la /sys/class/udc
 
 The expected good state is `dr_mode=peripheral` and a populated `/sys/class/udc/fe800000.usb`.
 
+When the Rock Pi falls into the persistent bad OTG state, restarting only the raw-gadget userspace process is not enough. The shorter discriminator is:
+
+- good: `current_speed=high-speed` and the OTG extcon behind `usb2phy@e450` reports `CDP=1`
+- bad: `current_speed=UNKNOWN` and the same OTG extcon reports `DCP=1`
+
+To attempt a deeper in-place recovery, unbind and rebind the `fe800000.usb` `dwc3` device together with its `usb2phy@e450` OTG PHY provider:
+
+```sh
+sudo ./reset_usb0_otg_stack.sh
+```
+
+The helper auto-detects the `dwc3` platform device behind the selected UDC, finds the matching `otg-port` PHY consumer under `/sys/class/phy`, unbinds both drivers in dependency order, rebinds them, then prints the resulting UDC and extcon state.
+
+If you only want to inspect what it would touch first:
+
+```sh
+sudo ./reset_usb0_otg_stack.sh --dry-run
+```
+
+If that recovery succeeds, the post-reset state should move away from `DCP=1`, the UDC should stop reporting `current_speed=UNKNOWN`, and the watcher should eventually show a fresh attach when the host retries enumeration.
+
 ```sh
 sudo ./displaylink_gadget_raw_gadget --udc-device fe800000.usb --verbose
 ```
