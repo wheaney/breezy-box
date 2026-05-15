@@ -492,34 +492,51 @@ int main(int argc, char **argv)
 
 	if (demo_opts.show_window) {
 		if (SDL_Init(SDL_INIT_VIDEO) != 0) {
-			fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
-			goto out;
-		}
-		window = SDL_CreateWindow("DisplayLink Multi-Session Demo",
+			fprintf(stderr,
+				"SDL_Init failed: %s; continuing without a preview window\n",
+				SDL_GetError());
+			demo_opts.show_window = false;
+		} else {
+			window = SDL_CreateWindow("DisplayLink Multi-Session Demo",
 					      SDL_WINDOWPOS_CENTERED,
 					      SDL_WINDOWPOS_CENTERED,
 					      (int)(demo_opts.canvas_width * demo_opts.window_scale),
 					      (int)(demo_opts.canvas_height * demo_opts.window_scale),
 					      SDL_WINDOW_RESIZABLE);
-		if (!window) {
-			fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError());
-			goto out;
-		}
-		renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
-		if (!renderer)
-			renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
-		if (!renderer) {
-			fprintf(stderr, "SDL_CreateRenderer failed: %s\n", SDL_GetError());
-			goto out;
-		}
-		texture = SDL_CreateTexture(renderer,
-					    SDL_PIXELFORMAT_ARGB8888,
-					    SDL_TEXTUREACCESS_STREAMING,
-					    (int)canvas.width,
-					    (int)canvas.height);
-		if (!texture) {
-			fprintf(stderr, "SDL_CreateTexture failed: %s\n", SDL_GetError());
-			goto out;
+			if (!window) {
+				fprintf(stderr,
+					"SDL_CreateWindow failed: %s; continuing without a preview window\n",
+					SDL_GetError());
+				demo_opts.show_window = false;
+			} else {
+				renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+				if (!renderer)
+					renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
+				if (!renderer) {
+					fprintf(stderr,
+						"SDL_CreateRenderer failed: %s; continuing without a preview window\n",
+						SDL_GetError());
+					SDL_DestroyWindow(window);
+					window = NULL;
+					demo_opts.show_window = false;
+				} else {
+					texture = SDL_CreateTexture(renderer,
+						    SDL_PIXELFORMAT_ARGB8888,
+						    SDL_TEXTUREACCESS_STREAMING,
+						    (int)canvas.width,
+						    (int)canvas.height);
+					if (!texture) {
+						fprintf(stderr,
+							"SDL_CreateTexture failed: %s; continuing without a preview window\n",
+							SDL_GetError());
+						SDL_DestroyRenderer(renderer);
+						SDL_DestroyWindow(window);
+						renderer = NULL;
+						window = NULL;
+						demo_opts.show_window = false;
+					}
+				}
+			}
 		}
 	}
 
@@ -611,7 +628,7 @@ out:
 		SDL_DestroyRenderer(renderer);
 	if (window)
 		SDL_DestroyWindow(window);
-	if (demo_opts.show_window)
+	if (demo_opts.show_window || texture || renderer || window)
 		SDL_Quit();
 	displaylink_compositor_surface_destroy(&canvas);
 	for (index = 0u; index < session_count; ++index)

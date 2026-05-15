@@ -2577,6 +2577,71 @@ static int auto_detect_udc(char *driver_buffer,
 	return 0;
 }
 
+static int resolve_udc_driver_for_device(const char *udc_device,
+					 char *driver_buffer,
+					 size_t driver_capacity)
+{
+	char uevent_path[512];
+	char symlink_path[512];
+	char driver_target[512];
+	ssize_t link_len;
+
+	if (!udc_device || !driver_buffer || driver_capacity == 0u)
+		return -1;
+	if (snprintf(uevent_path,
+		     sizeof(uevent_path),
+		     "/sys/class/udc/%s/uevent",
+		     udc_device) >= (int)sizeof(uevent_path))
+		return -1;
+	if (read_uevent_value(uevent_path,
+			      "USB_UDC_NAME",
+			      driver_buffer,
+			      driver_capacity) == 0)
+		return 0;
+
+	if (snprintf(symlink_path,
+		     sizeof(symlink_path),
+		     "/sys/class/udc/%s/device/driver",
+		     udc_device) >= (int)sizeof(symlink_path))
+		return -1;
+	link_len = readlink(symlink_path, driver_target, sizeof(driver_target) - 1u);
+	if (link_len < 0)
+		return -1;
+
+	driver_target[link_len] = '\0';
+	if (snprintf(driver_buffer,
+		     driver_capacity,
+		     "%s",
+		     path_basename(driver_target)) >= (int)driver_capacity)
+		return -1;
+	return 0;
+}
+
+static void maybe_normalize_udc_driver(struct displaylink_session *session)
+{
+	char detected_driver[UDC_NAME_LENGTH_MAX];
+
+	if (!session || session->udc_device[0] == '\0')
+		return;
+	if (resolve_udc_driver_for_device(session->udc_device,
+					 detected_driver,
+					 sizeof(detected_driver)) != 0)
+		return;
+	if (session->udc_driver[0] == '\0' || strcmp(session->udc_driver, detected_driver) != 0) {
+		if (session->runtime.verbose && session->udc_driver[0] != '\0') {
+			fprintf(stderr,
+				"Using kernel-reported UDC driver '%s' for device '%s' instead of '%s'\n",
+				detected_driver,
+				session->udc_device,
+				session->udc_driver);
+		}
+		(void)snprintf(session->udc_driver,
+			       sizeof(session->udc_driver),
+			       "%s",
+			       detected_driver);
+	}
+}
+
 static int set_udc_soft_connect(const char *udc_device,
 				const char *command,
 				bool verbose,
@@ -3995,6 +4060,7 @@ int displaylink_session_execute(struct displaylink_session *session)
 		     "%s",
 		     opts->udc_device) >= (int)sizeof(session->udc_device))
 		goto out;
+	maybe_normalize_udc_driver(session);
 
 	runtime->udc_device = session->udc_device;
 	runtime->capture_stream_path = opts->capture_stream_path;
