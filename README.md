@@ -164,6 +164,8 @@ There is now also a small in-process demo binary at `displaylink_multi_session_d
 
 Each session is started inside the same process with its own `--session` block, and the demo composites the latest published frames side-by-side into one canvas. By default it runs headless and can dump a final composite image on exit; add `--show-window` to preview the composed output in a single SDL2 window.
 
+The hardware constraint is unchanged: this demo still needs one distinct, existing UDC per live raw-gadget session. If `/sys/class/udc` only shows one controller, the board can only host one live DisplayLink raw-gadget session at a time. The demo now preflights that and fails early when a requested `--udc-device` does not exist or when two sessions name the same UDC.
+
 Example with one shared viewer window:
 
 ```sh
@@ -179,6 +181,8 @@ sudo ./displaylink_multi_session_demo --dump-image /tmp/composite.ppm \
 	--session --udc-device fe800000.usb --udc-driver fe800000.usb --monitor-name Left \
 	--session --udc-device fe900000.usb --udc-driver fe900000.usb --monitor-name Right
 ```
+
+If your board only exposes one UDC such as `fe800000.usb`, use a single live session here. A two-session live demo requires two entries under `/sys/class/udc`.
 
 The current demo is intentionally small: it uses the new in-process `displaylink_session` object model, renderer-owned ring buffers, and a simple horizontal layout. It is a test seam, not the final DRM/KMS presenter.
 

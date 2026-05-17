@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 
+#include <dirent.h>
 #include <errno.h>
 #include <getopt.h>
 #include <pthread.h>
@@ -9,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -384,6 +386,106 @@ static void demo_layout_slots(struct demo_session_slot *slots,
 		*canvas_height = max_height;
 }
 
+static const char *demo_session_label(const struct demo_session_slot *slot,
+				      size_t index)
+{
+	if (slot && slot->options.monitor_name && slot->options.monitor_name[0] != '\0')
+		return slot->options.monitor_name;
+	if (slot && slot->options.serial_string && slot->options.serial_string[0] != '\0')
+		return slot->options.serial_string;
+	(void)index;
+	return "session";
+}
+
+static int demo_count_available_udcs(void)
+{
+	DIR *directory;
+	struct dirent *entry;
+	int count = 0;
+
+	directory = opendir("/sys/class/udc");
+	if (!directory)
+		return -1;
+
+	while ((entry = readdir(directory)) != NULL) {
+		if (entry->d_name[0] == '.')
+			continue;
+		count += 1;
+	}
+
+	closedir(directory);
+	return count;
+}
+
+static bool demo_udc_exists(const char *udc_device)
+{
+	char path[512];
+	struct stat st;
+
+	if (!udc_device || udc_device[0] == '\0')
+		return false;
+	if (snprintf(path, sizeof(path), "/sys/class/udc/%s", udc_device) >= (int)sizeof(path))
+		return false;
+	return stat(path, &st) == 0;
+}
+
+static int demo_validate_udc_requests(const struct demo_session_slot *slots, size_t slot_count)
+{
+	int available_udcs;
+	size_t index;
+	size_t other_index;
+
+	if (!slots || slot_count == 0u)
+		return -1;
+
+	available_udcs = demo_count_available_udcs();
+	if (available_udcs == 0) {
+		fprintf(stderr,
+			"No gadget-capable UDCs are exposed under /sys/class/udc, so the demo cannot start any DisplayLink sessions.\n");
+		return -1;
+	}
+	if (slot_count > 1u && available_udcs > 0 && available_udcs < (int)slot_count) {
+		fprintf(stderr,
+			"The demo was asked to start %zu sessions, but only %d UDC instance(s) are currently exposed under /sys/class/udc. This board/image cannot run that many raw-gadget sessions at once.\n",
+			slot_count,
+			available_udcs);
+	}
+
+	for (index = 0u; index < slot_count; ++index) {
+		if (!slots[index].options.udc_device || slots[index].options.udc_device[0] == '\0') {
+			if (slot_count > 1u) {
+				fprintf(stderr,
+					"%s is missing --udc-device. Multi-session runs should name each UDC explicitly so the demo can verify they are distinct and present.\n",
+					demo_session_label(&slots[index], index));
+				return -1;
+			}
+			continue;
+		}
+		if (!demo_udc_exists(slots[index].options.udc_device)) {
+			fprintf(stderr,
+				"%s requested UDC '%s', but /sys/class/udc/%s does not exist on this system.\n",
+				demo_session_label(&slots[index], index),
+				slots[index].options.udc_device,
+				slots[index].options.udc_device);
+			return -1;
+		}
+		for (other_index = index + 1u; other_index < slot_count; ++other_index) {
+			if (slots[other_index].options.udc_device &&
+			    strcmp(slots[index].options.udc_device,
+				   slots[other_index].options.udc_device) == 0) {
+				fprintf(stderr,
+					"%s and %s both requested UDC '%s'. Each raw-gadget session needs its own distinct UDC.\n",
+					demo_session_label(&slots[index], index),
+					demo_session_label(&slots[other_index], other_index),
+					slots[index].options.udc_device);
+				return -1;
+			}
+		}
+	}
+
+	return 0;
+}
+
 static bool demo_frame_to_damage(const struct displaylink_output_frame *frame,
 				struct udl_sink_damage *damage)
 {
@@ -479,6 +581,8 @@ int main(int argc, char **argv)
 		demo_usage(argv[0]);
 		goto out;
 	}
+	if (demo_validate_udc_requests(slots, session_count) != 0)
+		goto out;
 
 	demo_layout_slots(slots, session_count, &demo_opts.canvas_width, &demo_opts.canvas_height);
 	if (demo_opts.canvas_width == 0u || demo_opts.canvas_height == 0u) {
