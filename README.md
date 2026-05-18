@@ -210,6 +210,8 @@ Host firewall note:
 
 The relay bridge converts the WFD RTSP session into local H.264 RTP for the renderer. Because of that, the decoder fragment for the standards-based path should be an H.264 decoder such as `mppvideodec` or a stateless V4L2 H.264 decoder.
 
+Internally, the helper now drives the source with a minimal RTSP `OPTIONS` / `DESCRIBE` / `SETUP` / `PLAY` exchange and receives the WFD media on fixed local RTP/RTCP ports (default `16384/16385`) before repayloading the H.264 elementary stream to the renderer's local relay port.
+
 If you need GNOME virtual-display extension semantics rather than GNOME Network Displays discovery, keep using `wired_projection_gnome_sender.py`. GNOME Network Displays streams an existing selected monitor; it does not replace Mutter's compositor-level virtual-display path.
 
 ### 3. Choose A Decoder Path That Produces DMABuf NV12

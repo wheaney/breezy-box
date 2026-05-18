@@ -5,6 +5,7 @@ import hashlib
 import importlib
 import logging
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -26,6 +27,9 @@ DEFAULT_RTSP_PORT = 7236
 DEFAULT_RTSP_PATH = "/wfd1.0/streamid=0"
 DEFAULT_RTSP_READY_TIMEOUT_SEC = 5.0
 DEFAULT_RTSP_CONNECT_TIMEOUT_SEC = 0.75
+DEFAULT_RTSP_SOCKET_TIMEOUT_SEC = 5.0
+DEFAULT_RTSP_KEEPALIVE_INTERVAL_SEC = 15
+DEFAULT_WFD_CLIENT_RTP_PORT = 16384
 DEFAULT_RELAY_HOST = "127.0.0.1"
 DEFAULT_RELAY_PORT = 5600
 DEFAULT_PAYLOAD_TYPE = 96
@@ -40,6 +44,17 @@ class MiceProtocolError(Exception):
     pass
 
 
+class RtspSessionError(Exception):
+    pass
+
+
+class RtspStatusError(RtspSessionError):
+    def __init__(self, status_code, reason):
+        super().__init__(f"RTSP {status_code} {reason}")
+        self.status_code = status_code
+        self.reason = reason
+
+
 @dataclass
 class SourceReadyMessage:
     version: int
@@ -48,6 +63,14 @@ class SourceReadyMessage:
     rtsp_port: int
     source_id: str
     tlvs: Dict[int, bytes]
+
+
+@dataclass
+class RtspResponse:
+    status_code: int
+    reason: str
+    headers: Dict[str, list[str]]
+    body: bytes
 
 
 def ensure_runtime_dependencies():
@@ -217,10 +240,49 @@ def build_rtsp_url(source_host, rtsp_port, rtsp_path):
     return f"rtsp://{source_host}:{rtsp_port}{normalize_rtsp_path(rtsp_path)}"
 
 
-def is_rtsp_not_found_error(err, debug):
-    err_text = str(err).lower()
-    debug_text = (debug or "").lower()
-    return "404" in err_text or "not found" in err_text or "404" in debug_text or "not found" in debug_text
+def rtsp_header_value(headers, name, default=None):
+    values = headers.get(name.lower())
+    if not values:
+        return default
+    return values[0]
+
+
+def parse_rtsp_headers(lines):
+    headers = {}
+    for line in lines:
+        if ":" not in line:
+            continue
+        name, value = line.split(":", 1)
+        headers.setdefault(name.strip().lower(), []).append(value.strip())
+    return headers
+
+
+def resolve_rtsp_url(base_url, control_value):
+    if not control_value or control_value == "*":
+        return base_url
+    if control_value.startswith("rtsp://"):
+        return control_value
+    if control_value.startswith("/"):
+        match = re.match(r"^(rtsp://[^/]+)", base_url)
+        if not match:
+            raise RtspSessionError(f"unable to resolve absolute RTSP control path against {base_url!r}")
+        return f"{match.group(1)}{control_value}"
+    return f"{base_url.rstrip('/')}/{control_value}"
+
+
+def resolve_rtsp_control_url(base_url, response_headers, sdp_text):
+    content_base = rtsp_header_value(response_headers, "content-base", base_url)
+    control_values = []
+    for line in sdp_text.splitlines():
+        line = line.strip()
+        if line.startswith("a=control:"):
+            control_value = line[len("a=control:"):].strip()
+            if control_value and control_value != "*":
+                control_values.append(control_value)
+
+    if control_values:
+        return resolve_rtsp_url(content_base, control_values[-1])
+    return resolve_rtsp_url(content_base, "streamid=0")
 
 
 def wait_for_tcp_endpoint(host, port, ready_timeout_sec, connect_timeout_sec):
@@ -279,11 +341,11 @@ def build_renderer_command(args):
     return argv
 
 
-def build_relay_pipeline_description(args, source_host, rtsp_port, rtsp_path):
-    location = build_rtsp_url(source_host, rtsp_port, rtsp_path)
+def build_relay_pipeline_description(args):
     return (
-        'rtspsrc location="{location}" latency={latency_ms} do-rtsp-keep-alive=true name=src '
-        'src. ! queue max-size-buffers=8 ! '
+        'udpsrc port={wfd_client_rtp_port} '
+        'caps="application/x-rtp,media=video,encoding-name=MP2T,payload=33,clock-rate=90000" ! '
+        'queue max-size-buffers=8 ! '
         'application/x-rtp,media=video,encoding-name=MP2T,payload=33,clock-rate=90000 ! '
         'rtpmp2tdepay ! tsdemux name=demux '
         'demux. ! queue max-size-buffers=8 leaky=downstream ! '
@@ -291,8 +353,7 @@ def build_relay_pipeline_description(args, source_host, rtsp_port, rtsp_path):
         'rtph264pay pt={payload_type} config-interval=1 ! '
         'udpsink host={relay_host} port={relay_port} sync=false async=false'
     ).format(
-        location=location,
-        latency_ms=args.latency_ms,
+        wfd_client_rtp_port=args.wfd_client_rtp_port,
         payload_type=args.payload_type,
         relay_host=args.relay_host,
         relay_port=args.relay_port,
@@ -374,22 +435,40 @@ class RtspRelay:
         self.current_source_ready = None
         self.path_candidates = []
         self.path_index = 0
-        self.retry_source_id = 0
+        self.control_socket = None
+        self.control_reader = None
+        self.rtcp_socket = None
+        self.cseq = 0
+        self.session_id = None
+        self.aggregate_url = None
+        self.keepalive_source_id = 0
 
     def start(self, source_host, source_ready):
         self.stop()
         self.current_source_host = source_host
         self.current_source_ready = source_ready
         self.path_candidates = build_rtsp_path_candidates(self.args.rtsp_path)
-        self.path_index = 0
-        self._start_current_candidate()
 
-    def _start_current_candidate(self):
-        rtsp_path = self.path_candidates[self.path_index]
-        description = build_relay_pipeline_description(self.args,
-                                                       self.current_source_host,
-                                                       self.current_source_ready.rtsp_port,
-                                                       rtsp_path)
+        for index, rtsp_path in enumerate(self.path_candidates):
+            self.path_index = index
+            try:
+                self._start_current_candidate(rtsp_path)
+                return
+            except RtspStatusError as exc:
+                failed_url = self.current_url
+                self.stop()
+                if exc.status_code == 404 and index + 1 < len(self.path_candidates):
+                    next_url = build_rtsp_url(self.current_source_host,
+                                              self.current_source_ready.rtsp_port,
+                                              self.path_candidates[index + 1])
+                    LOGGER.warning("RTSP path %s returned 404; retrying with %s", failed_url, next_url)
+                    continue
+                raise
+
+        raise RtspSessionError("exhausted RTSP path candidates without establishing a session")
+
+    def _start_current_candidate(self, rtsp_path):
+        description = build_relay_pipeline_description(self.args)
         next_url = build_rtsp_url(self.current_source_host,
                                   self.current_source_ready.rtsp_port,
                                   rtsp_path)
@@ -408,6 +487,7 @@ class RtspRelay:
                               self.args.rtsp_ready_timeout_sec,
                               self.args.rtsp_connect_timeout_sec)
 
+        self._bind_rtcp_socket()
         self.pipeline = Gst.parse_launch(description)
         self.bus = self.pipeline.get_bus()
         self.bus.add_signal_watch()
@@ -416,48 +496,215 @@ class RtspRelay:
         if state_result == Gst.StateChangeReturn.FAILURE:
             self.stop()
             raise RuntimeError(f"failed to start relay pipeline for {next_url}")
+
+        self._open_control_connection()
+        self.aggregate_url = next_url
         self.current_url = next_url
 
-    def _retry_next_candidate(self):
-        self.retry_source_id = 0
-        if self.current_source_host is None or self.current_source_ready is None:
-            return GLib.SOURCE_REMOVE
-        if self.path_index + 1 >= len(self.path_candidates):
-            return GLib.SOURCE_REMOVE
+        self._request_expect_ok("OPTIONS", next_url)
 
-        self.path_index += 1
+        describe_response = self._request_expect_ok(
+            "DESCRIBE",
+            next_url,
+            headers={"Accept": "application/sdp"},
+        )
+        sdp_text = describe_response.body.decode("utf-8", errors="replace")
+        self.aggregate_url = rtsp_header_value(describe_response.headers, "content-base", next_url)
+        control_url = resolve_rtsp_control_url(self.aggregate_url, describe_response.headers, sdp_text)
+
+        setup_response = self._request_expect_ok(
+            "SETUP",
+            control_url,
+            headers={
+                "Transport": (
+                    f"RTP/AVP/UDP;unicast;client_port="
+                    f"{self.args.wfd_client_rtp_port}-{self.args.wfd_client_rtp_port + 1}"
+                )
+            },
+        )
+        session_header = rtsp_header_value(setup_response.headers, "session")
+        if not session_header:
+            raise RtspSessionError("RTSP SETUP response did not include a Session header")
+        self.session_id = session_header.split(";", 1)[0].strip()
+
+        self._request_expect_ok(
+            "PLAY",
+            self.aggregate_url,
+            headers={"Range": "npt=0.000-"},
+        )
+        self.keepalive_source_id = GLib.timeout_add_seconds(
+            self.args.rtsp_keepalive_interval_sec,
+            self._keepalive,
+        )
+
+    def _bind_rtcp_socket(self):
+        self.rtcp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.rtcp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.rtcp_socket.bind(("", self.args.wfd_client_rtp_port + 1))
+
+    def _open_control_connection(self):
+        self.control_socket = socket.create_connection(
+            (self.current_source_host, self.current_source_ready.rtsp_port),
+            timeout=self.args.rtsp_connect_timeout_sec,
+        )
+        self.control_socket.settimeout(DEFAULT_RTSP_SOCKET_TIMEOUT_SEC)
+        self.control_reader = self.control_socket.makefile("rb")
+        self.cseq = 0
+
+    def _send_bytes(self, payload):
+        if self.control_socket is None:
+            raise RtspSessionError("RTSP control socket is not connected")
+        self.control_socket.sendall(payload)
+
+    def _request_expect_ok(self, method, uri, headers=None, body=b""):
+        response = self._send_request(method, uri, headers=headers, body=body)
+        if response.status_code != 200:
+            raise RtspStatusError(response.status_code, response.reason)
+        return response
+
+    def _send_request(self, method, uri, headers=None, body=b""):
+        if headers is None:
+            headers = {}
+
+        body = body or b""
+        self.cseq += 1
+        lines = [
+            f"{method} {uri} RTSP/1.0",
+            f"CSeq: {self.cseq}",
+            "User-Agent: BreezyBox/0.1",
+        ]
+        if self.session_id and method not in ("OPTIONS", "DESCRIBE"):
+            lines.append(f"Session: {self.session_id}")
+        for name, value in headers.items():
+            lines.append(f"{name}: {value}")
+        if body:
+            lines.append(f"Content-Length: {len(body)}")
+        lines.append("")
+        lines.append("")
+
+        payload = "\r\n".join(lines).encode("utf-8") + body
+        if self.args.verbose:
+            print(f"RTSP request: {method} {uri}", flush=True)
+        self._send_bytes(payload)
+        return self._read_response()
+
+    def _read_response(self):
+        while True:
+            first_line, headers, body = self._read_message()
+            if first_line.startswith("RTSP/"):
+                parts = first_line.split(" ", 2)
+                if len(parts) < 3:
+                    raise RtspSessionError(f"malformed RTSP status line: {first_line!r}")
+                return RtspResponse(status_code=int(parts[1]),
+                                    reason=parts[2],
+                                    headers=headers,
+                                    body=body)
+
+            self._handle_server_request(first_line, headers)
+
+    def _read_message(self):
+        if self.control_reader is None:
+            raise RtspSessionError("RTSP control reader is unavailable")
+
+        first_line = self.control_reader.readline()
+        if not first_line:
+            raise RtspSessionError("RTSP control connection closed unexpectedly")
+        first_line = first_line.decode("utf-8", errors="replace").rstrip("\r\n")
+
+        header_lines = []
+        while True:
+            line = self.control_reader.readline()
+            if not line:
+                raise RtspSessionError("RTSP control connection closed while reading headers")
+            line = line.decode("utf-8", errors="replace").rstrip("\r\n")
+            if not line:
+                break
+            header_lines.append(line)
+
+        headers = parse_rtsp_headers(header_lines)
+        content_length = int(rtsp_header_value(headers, "content-length", "0") or "0")
+        body = self.control_reader.read(content_length) if content_length > 0 else b""
+        if content_length > 0 and len(body) != content_length:
+            raise RtspSessionError("RTSP control connection closed while reading body")
+
+        return first_line, headers, body
+
+    def _handle_server_request(self, first_line, headers):
+        parts = first_line.split(" ", 2)
+        if len(parts) < 3:
+            raise RtspSessionError(f"malformed RTSP request line: {first_line!r}")
+
+        method = parts[0]
+        if self.args.verbose:
+            print(f"RTSP server request: {first_line}", flush=True)
+
+        response_headers = {}
+        if method == "OPTIONS":
+            response_headers["Public"] = "OPTIONS, DESCRIBE, SETUP, PLAY, PAUSE, TEARDOWN, GET_PARAMETER, SET_PARAMETER"
+        elif method == "GET_PARAMETER":
+            response_headers["Content-Type"] = "text/parameters"
+
+        self._send_server_response(headers, 200, "OK", response_headers)
+
+    def _send_server_response(self, request_headers, status_code, reason, extra_headers=None, body=b""):
+        if extra_headers is None:
+            extra_headers = {}
+
+        body = body or b""
+        lines = [f"RTSP/1.0 {status_code} {reason}"]
+        cseq = rtsp_header_value(request_headers, "cseq")
+        if cseq is not None:
+            lines.append(f"CSeq: {cseq}")
+        if self.session_id:
+            lines.append(f"Session: {self.session_id}")
+        for name, value in extra_headers.items():
+            lines.append(f"{name}: {value}")
+        if body:
+            lines.append(f"Content-Length: {len(body)}")
+        lines.append("")
+        lines.append("")
+        self._send_bytes("\r\n".join(lines).encode("utf-8") + body)
+
+    def _keepalive(self):
         try:
-            self._start_current_candidate()
+            self._request_expect_ok(
+                "GET_PARAMETER",
+                self.aggregate_url or self.current_url,
+                headers={"Content-Type": "text/parameters"},
+            )
         except Exception as exc:
-            LOGGER.error("failed to retry WFD relay: %s", exc)
-        return GLib.SOURCE_REMOVE
+            LOGGER.error("RTSP keepalive failed: %s", exc)
+            self.stop()
+            return GLib.SOURCE_REMOVE
+        return GLib.SOURCE_CONTINUE
 
     def stop(self):
-        if self.retry_source_id:
-            GLib.source_remove(self.retry_source_id)
-            self.retry_source_id = 0
+        if self.keepalive_source_id:
+            GLib.source_remove(self.keepalive_source_id)
+            self.keepalive_source_id = 0
+        if self.control_reader is not None:
+            self.control_reader.close()
+            self.control_reader = None
+        if self.control_socket is not None:
+            self.control_socket.close()
+            self.control_socket = None
+        if self.rtcp_socket is not None:
+            self.rtcp_socket.close()
+            self.rtcp_socket = None
         if self.bus is not None:
             self.bus.remove_signal_watch()
             self.bus = None
         if self.pipeline is not None:
             self.pipeline.set_state(Gst.State.NULL)
             self.pipeline = None
+        self.session_id = None
+        self.aggregate_url = None
         self.current_url = None
 
     def _on_message(self, bus, message):
         del bus
         if message.type == Gst.MessageType.ERROR:
             err, debug = message.parse_error()
-            failed_url = self.current_url
-            if is_rtsp_not_found_error(err, debug) and self.path_index + 1 < len(self.path_candidates):
-                next_path = self.path_candidates[self.path_index + 1]
-                next_url = build_rtsp_url(self.current_source_host,
-                                          self.current_source_ready.rtsp_port,
-                                          next_path)
-                LOGGER.warning("RTSP path %s returned 404; retrying with %s", failed_url, next_url)
-                self.stop()
-                self.retry_source_id = GLib.idle_add(self._retry_next_candidate)
-                return
             LOGGER.error("relay pipeline error: %s", err)
             if debug:
                 LOGGER.error("relay pipeline debug info: %s", debug)
@@ -566,7 +813,7 @@ def validate_environment(args):
         raise RuntimeError("avahi-publish-service is required unless --disable-discovery is used")
 
     for element_name in (
-        "rtspsrc",
+        "udpsrc",
         "rtpmp2tdepay",
         "tsdemux",
         "h264parse",
@@ -621,13 +868,21 @@ def run_self_test(args):
     if "rtph264depay" not in renderer_pipeline:
         raise AssertionError("renderer pipeline did not include rtph264depay")
 
-    relay_pipeline = build_relay_pipeline_description(args, "192.168.2.1", DEFAULT_RTSP_PORT, args.rtsp_path)
-    if "rtspsrc" not in relay_pipeline or "rtpmp2tdepay" not in relay_pipeline:
+    relay_pipeline = build_relay_pipeline_description(args)
+    if "udpsrc" not in relay_pipeline or "rtpmp2tdepay" not in relay_pipeline:
         raise AssertionError("relay pipeline is missing required WFD elements")
 
     path_candidates = build_rtsp_path_candidates(DEFAULT_RTSP_PATH)
     if path_candidates != ["/wfd1.0/streamid=0", "/wfd1.0"]:
         raise AssertionError(f"unexpected RTSP path candidates {path_candidates!r}")
+
+    control_url = resolve_rtsp_control_url(
+        "rtsp://192.168.2.1:7236/wfd1.0",
+        {"content-base": ["rtsp://192.168.2.1:7236/wfd1.0/"]},
+        "v=0\r\na=control:*\r\nm=video 0 RTP/AVP 33\r\na=control:streamid=0\r\n",
+    )
+    if control_url != "rtsp://192.168.2.1:7236/wfd1.0/streamid=0":
+        raise AssertionError(f"unexpected RTSP control URL {control_url!r}")
 
     try:
         wait_for_tcp_endpoint("127.0.0.1", 9, ready_timeout_sec=0.0, connect_timeout_sec=0.01)
@@ -650,9 +905,10 @@ def parse_args(argv):
     parser.add_argument("--bind-host", default="0.0.0.0", help="TCP address to bind the MICE signalling listener to (default: 0.0.0.0)")
     parser.add_argument("--signalling-port", type=int, default=DEFAULT_SIGNALLING_PORT, help=f"MICE signalling TCP port (default: {DEFAULT_SIGNALLING_PORT})")
     parser.add_argument("--rtsp-path", default=DEFAULT_RTSP_PATH, help=f"RTSP path exposed by the source (default: {DEFAULT_RTSP_PATH})")
-    parser.add_argument("--latency-ms", type=int, default=120, help="rtspsrc latency for the relay client in milliseconds (default: 120)")
     parser.add_argument("--rtsp-ready-timeout-sec", type=float, default=DEFAULT_RTSP_READY_TIMEOUT_SEC, help=f"how long to wait for the source RTSP TCP port to become reachable before failing (default: {DEFAULT_RTSP_READY_TIMEOUT_SEC})")
     parser.add_argument("--rtsp-connect-timeout-sec", type=float, default=DEFAULT_RTSP_CONNECT_TIMEOUT_SEC, help=f"per-attempt TCP connect timeout for the source RTSP probe (default: {DEFAULT_RTSP_CONNECT_TIMEOUT_SEC})")
+    parser.add_argument("--rtsp-keepalive-interval-sec", type=int, default=DEFAULT_RTSP_KEEPALIVE_INTERVAL_SEC, help=f"interval for RTSP GET_PARAMETER keepalives once playback starts (default: {DEFAULT_RTSP_KEEPALIVE_INTERVAL_SEC})")
+    parser.add_argument("--wfd-client-rtp-port", type=int, default=DEFAULT_WFD_CLIENT_RTP_PORT, help=f"local RTP port exposed to the source during SETUP; RTCP uses the next port (default: {DEFAULT_WFD_CLIENT_RTP_PORT})")
     parser.add_argument("--relay-host", default=DEFAULT_RELAY_HOST, help=f"host address for the local RTP relay (default: {DEFAULT_RELAY_HOST})")
     parser.add_argument("--relay-port", type=int, default=DEFAULT_RELAY_PORT, help=f"UDP port for the local RTP relay (default: {DEFAULT_RELAY_PORT})")
     parser.add_argument("--payload-type", type=int, default=DEFAULT_PAYLOAD_TYPE, help=f"RTP payload type for the relay stream (default: {DEFAULT_PAYLOAD_TYPE})")
@@ -678,12 +934,14 @@ def parse_args(argv):
         parser.error("--relay-port must be between 1 and 65535")
     if args.payload_type < 0 or args.payload_type > 127:
         parser.error("--payload-type must be between 0 and 127")
-    if args.latency_ms < 0:
-        parser.error("--latency-ms must be non-negative")
     if args.rtsp_ready_timeout_sec < 0:
         parser.error("--rtsp-ready-timeout-sec must be non-negative")
     if args.rtsp_connect_timeout_sec <= 0:
         parser.error("--rtsp-connect-timeout-sec must be greater than zero")
+    if args.rtsp_keepalive_interval_sec <= 0:
+        parser.error("--rtsp-keepalive-interval-sec must be greater than zero")
+    if args.wfd_client_rtp_port < 1 or args.wfd_client_rtp_port > 65534:
+        parser.error("--wfd-client-rtp-port must be between 1 and 65534")
 
     return args
 
