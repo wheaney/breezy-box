@@ -203,6 +203,11 @@ Once that helper is running:
 * GNOME Network Displays should discover the sink on the USB network and use the WFD-MICE path.
 * Windows should discover it through the Miracast over Infrastructure path on the same link.
 
+Host firewall note:
+
+* GNOME Network Displays' upstream firewalld integration explicitly expects the source-side RTSP server to be reachable on TCP port `7236`.
+* If the host has UFW, firewalld, or another inbound firewall policy enabled, allow TCP `7236` from the SBC to the host or the WFD bridge will fail before the RTSP session starts.
+
 The relay bridge converts the WFD RTSP session into local H.264 RTP for the renderer. Because of that, the decoder fragment for the standards-based path should be an H.264 decoder such as `mppvideodec` or a stateless V4L2 H.264 decoder.
 
 If you need GNOME virtual-display extension semantics rather than GNOME Network Displays discovery, keep using `wired_projection_gnome_sender.py`. GNOME Network Displays streams an existing selected monitor; it does not replace Mutter's compositor-level virtual-display path.

@@ -13,6 +13,7 @@ import socketserver
 import subprocess
 import sys
 import threading
+import time
 from dataclasses import dataclass
 from typing import Dict, Optional
 
@@ -23,6 +24,8 @@ DEFAULT_SERVICE_NAME = "Breezy Box"
 DEFAULT_SIGNALLING_PORT = 7250
 DEFAULT_RTSP_PORT = 7236
 DEFAULT_RTSP_PATH = "/wfd1.0/streamid=0"
+DEFAULT_RTSP_READY_TIMEOUT_SEC = 5.0
+DEFAULT_RTSP_CONNECT_TIMEOUT_SEC = 0.75
 DEFAULT_RELAY_HOST = "127.0.0.1"
 DEFAULT_RELAY_PORT = 5600
 DEFAULT_PAYLOAD_TYPE = 96
@@ -220,6 +223,26 @@ def is_rtsp_not_found_error(err, debug):
     return "404" in err_text or "not found" in err_text or "404" in debug_text or "not found" in debug_text
 
 
+def wait_for_tcp_endpoint(host, port, ready_timeout_sec, connect_timeout_sec):
+    deadline = time.monotonic() + ready_timeout_sec
+    last_error = None
+
+    while True:
+        try:
+            with socket.create_connection((host, port), timeout=connect_timeout_sec):
+                return
+        except OSError as exc:
+            last_error = exc
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.25)
+
+    raise RuntimeError(
+        f"unable to reach source RTSP server at {host}:{port}; last socket error: {last_error}. "
+        f"This usually means the source has not opened TCP {port} yet or a host firewall is blocking it."
+    )
+
+
 def build_renderer_pipeline(args):
     return (
         'udpsrc address={relay_host} port={relay_port} '
@@ -379,6 +402,11 @@ class RtspRelay:
         )
         if self.args.verbose:
             print(f"GStreamer relay pipeline: {description}", flush=True)
+
+        wait_for_tcp_endpoint(self.current_source_host,
+                              self.current_source_ready.rtsp_port,
+                              self.args.rtsp_ready_timeout_sec,
+                              self.args.rtsp_connect_timeout_sec)
 
         self.pipeline = Gst.parse_launch(description)
         self.bus = self.pipeline.get_bus()
@@ -601,6 +629,14 @@ def run_self_test(args):
     if path_candidates != ["/wfd1.0/streamid=0", "/wfd1.0"]:
         raise AssertionError(f"unexpected RTSP path candidates {path_candidates!r}")
 
+    try:
+        wait_for_tcp_endpoint("127.0.0.1", 9, ready_timeout_sec=0.0, connect_timeout_sec=0.01)
+    except RuntimeError as exc:
+        if "last socket error" not in str(exc):
+            raise AssertionError(f"unexpected RTSP probe error message {exc!r}") from exc
+    else:
+        raise AssertionError("expected TCP endpoint probe to fail for discard port test")
+
     print("self-test passed", flush=True)
 
 
@@ -615,6 +651,8 @@ def parse_args(argv):
     parser.add_argument("--signalling-port", type=int, default=DEFAULT_SIGNALLING_PORT, help=f"MICE signalling TCP port (default: {DEFAULT_SIGNALLING_PORT})")
     parser.add_argument("--rtsp-path", default=DEFAULT_RTSP_PATH, help=f"RTSP path exposed by the source (default: {DEFAULT_RTSP_PATH})")
     parser.add_argument("--latency-ms", type=int, default=120, help="rtspsrc latency for the relay client in milliseconds (default: 120)")
+    parser.add_argument("--rtsp-ready-timeout-sec", type=float, default=DEFAULT_RTSP_READY_TIMEOUT_SEC, help=f"how long to wait for the source RTSP TCP port to become reachable before failing (default: {DEFAULT_RTSP_READY_TIMEOUT_SEC})")
+    parser.add_argument("--rtsp-connect-timeout-sec", type=float, default=DEFAULT_RTSP_CONNECT_TIMEOUT_SEC, help=f"per-attempt TCP connect timeout for the source RTSP probe (default: {DEFAULT_RTSP_CONNECT_TIMEOUT_SEC})")
     parser.add_argument("--relay-host", default=DEFAULT_RELAY_HOST, help=f"host address for the local RTP relay (default: {DEFAULT_RELAY_HOST})")
     parser.add_argument("--relay-port", type=int, default=DEFAULT_RELAY_PORT, help=f"UDP port for the local RTP relay (default: {DEFAULT_RELAY_PORT})")
     parser.add_argument("--payload-type", type=int, default=DEFAULT_PAYLOAD_TYPE, help=f"RTP payload type for the relay stream (default: {DEFAULT_PAYLOAD_TYPE})")
@@ -642,6 +680,10 @@ def parse_args(argv):
         parser.error("--payload-type must be between 0 and 127")
     if args.latency_ms < 0:
         parser.error("--latency-ms must be non-negative")
+    if args.rtsp_ready_timeout_sec < 0:
+        parser.error("--rtsp-ready-timeout-sec must be non-negative")
+    if args.rtsp_connect_timeout_sec <= 0:
+        parser.error("--rtsp-connect-timeout-sec must be greater than zero")
 
     return args
 
