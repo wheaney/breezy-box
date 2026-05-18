@@ -1,0 +1,32 @@
+{
+  "interface": "usb0",
+  "poll_interval_sec": 1.0,
+  "receiver_command": [
+    "/usr/local/bin/replace-with-your-receiver-daemon",
+    "--bind-address",
+    "{bind_ip}",
+    "--name",
+    "{name}"
+  ],
+  "defaults": {
+    "prefix_length": 24,
+    "environment": {
+      "BREEZY_BOX_BIND_IP": "{bind_ip}",
+      "BREEZY_BOX_MONITOR_NAME": "{name}"
+    }
+  },
+  "displays": [
+    {
+      "name": "SBC Monitor 1",
+      "bind_ip": "192.168.2.2"
+    },
+    {
+      "name": "SBC Monitor 2",
+      "bind_ip": "192.168.2.3"
+    },
+    {
+      "name": "SBC Monitor 3",
+      "bind_ip": "192.168.2.4"
+    }
+  ]
+}
