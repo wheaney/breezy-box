@@ -190,8 +190,34 @@ def parse_source_ready_message(payload):
     )
 
 
+def normalize_rtsp_path(rtsp_path):
+    if not rtsp_path:
+        return "/"
+    if rtsp_path.startswith("/"):
+        return rtsp_path
+    return f"/{rtsp_path}"
+
+
+def build_rtsp_path_candidates(rtsp_path):
+    primary = normalize_rtsp_path(rtsp_path)
+    candidates = [primary]
+
+    if primary.endswith("/streamid=0"):
+        fallback = primary[: -len("/streamid=0")] or "/"
+        if fallback not in candidates:
+            candidates.append(fallback)
+
+    return candidates
+
+
 def build_rtsp_url(source_host, rtsp_port, rtsp_path):
-    return f"rtsp://{source_host}:{rtsp_port}{rtsp_path}"
+    return f"rtsp://{source_host}:{rtsp_port}{normalize_rtsp_path(rtsp_path)}"
+
+
+def is_rtsp_not_found_error(err, debug):
+    err_text = str(err).lower()
+    debug_text = (debug or "").lower()
+    return "404" in err_text or "not found" in err_text or "404" in debug_text or "not found" in debug_text
 
 
 def build_renderer_pipeline(args):
@@ -230,8 +256,8 @@ def build_renderer_command(args):
     return argv
 
 
-def build_relay_pipeline_description(args, source_host, rtsp_port):
-    location = build_rtsp_url(source_host, rtsp_port, args.rtsp_path)
+def build_relay_pipeline_description(args, source_host, rtsp_port, rtsp_path):
+    location = build_rtsp_url(source_host, rtsp_port, rtsp_path)
     return (
         'rtspsrc location="{location}" latency={latency_ms} do-rtsp-keep-alive=true name=src '
         'src. ! queue max-size-buffers=8 ! '
@@ -321,17 +347,35 @@ class RtspRelay:
         self.pipeline = None
         self.bus = None
         self.current_url = None
+        self.current_source_host = None
+        self.current_source_ready = None
+        self.path_candidates = []
+        self.path_index = 0
+        self.retry_source_id = 0
 
     def start(self, source_host, source_ready):
-        description = build_relay_pipeline_description(self.args, source_host, source_ready.rtsp_port)
-        next_url = build_rtsp_url(source_host, source_ready.rtsp_port, self.args.rtsp_path)
         self.stop()
+        self.current_source_host = source_host
+        self.current_source_ready = source_ready
+        self.path_candidates = build_rtsp_path_candidates(self.args.rtsp_path)
+        self.path_index = 0
+        self._start_current_candidate()
+
+    def _start_current_candidate(self):
+        rtsp_path = self.path_candidates[self.path_index]
+        description = build_relay_pipeline_description(self.args,
+                                                       self.current_source_host,
+                                                       self.current_source_ready.rtsp_port,
+                                                       rtsp_path)
+        next_url = build_rtsp_url(self.current_source_host,
+                                  self.current_source_ready.rtsp_port,
+                                  rtsp_path)
 
         LOGGER.info(
             "starting WFD relay from %s (source='%s', source-id='%s')",
             next_url,
-            source_ready.friendly_name or "unknown",
-            source_ready.source_id or "unknown",
+            self.current_source_ready.friendly_name or "unknown",
+            self.current_source_ready.source_id or "unknown",
         )
         if self.args.verbose:
             print(f"GStreamer relay pipeline: {description}", flush=True)
@@ -346,7 +390,24 @@ class RtspRelay:
             raise RuntimeError(f"failed to start relay pipeline for {next_url}")
         self.current_url = next_url
 
+    def _retry_next_candidate(self):
+        self.retry_source_id = 0
+        if self.current_source_host is None or self.current_source_ready is None:
+            return GLib.SOURCE_REMOVE
+        if self.path_index + 1 >= len(self.path_candidates):
+            return GLib.SOURCE_REMOVE
+
+        self.path_index += 1
+        try:
+            self._start_current_candidate()
+        except Exception as exc:
+            LOGGER.error("failed to retry WFD relay: %s", exc)
+        return GLib.SOURCE_REMOVE
+
     def stop(self):
+        if self.retry_source_id:
+            GLib.source_remove(self.retry_source_id)
+            self.retry_source_id = 0
         if self.bus is not None:
             self.bus.remove_signal_watch()
             self.bus = None
@@ -359,6 +420,16 @@ class RtspRelay:
         del bus
         if message.type == Gst.MessageType.ERROR:
             err, debug = message.parse_error()
+            failed_url = self.current_url
+            if is_rtsp_not_found_error(err, debug) and self.path_index + 1 < len(self.path_candidates):
+                next_path = self.path_candidates[self.path_index + 1]
+                next_url = build_rtsp_url(self.current_source_host,
+                                          self.current_source_ready.rtsp_port,
+                                          next_path)
+                LOGGER.warning("RTSP path %s returned 404; retrying with %s", failed_url, next_url)
+                self.stop()
+                self.retry_source_id = GLib.idle_add(self._retry_next_candidate)
+                return
             LOGGER.error("relay pipeline error: %s", err)
             if debug:
                 LOGGER.error("relay pipeline debug info: %s", debug)
@@ -522,9 +593,13 @@ def run_self_test(args):
     if "rtph264depay" not in renderer_pipeline:
         raise AssertionError("renderer pipeline did not include rtph264depay")
 
-    relay_pipeline = build_relay_pipeline_description(args, "192.168.2.1", DEFAULT_RTSP_PORT)
+    relay_pipeline = build_relay_pipeline_description(args, "192.168.2.1", DEFAULT_RTSP_PORT, args.rtsp_path)
     if "rtspsrc" not in relay_pipeline or "rtpmp2tdepay" not in relay_pipeline:
         raise AssertionError("relay pipeline is missing required WFD elements")
+
+    path_candidates = build_rtsp_path_candidates(DEFAULT_RTSP_PATH)
+    if path_candidates != ["/wfd1.0/streamid=0", "/wfd1.0"]:
+        raise AssertionError(f"unexpected RTSP path candidates {path_candidates!r}")
 
     print("self-test passed", flush=True)
 
