@@ -221,6 +221,127 @@ static double monotonic_seconds(void)
     return (double)now.tv_sec + (double)now.tv_nsec / 1000000000.0;
 }
 
+static const char *egl_error_string(EGLint error)
+{
+    switch (error) {
+    case EGL_SUCCESS:
+        return "EGL_SUCCESS";
+    case EGL_NOT_INITIALIZED:
+        return "EGL_NOT_INITIALIZED";
+    case EGL_BAD_ACCESS:
+        return "EGL_BAD_ACCESS";
+    case EGL_BAD_ALLOC:
+        return "EGL_BAD_ALLOC";
+    case EGL_BAD_ATTRIBUTE:
+        return "EGL_BAD_ATTRIBUTE";
+    case EGL_BAD_CONTEXT:
+        return "EGL_BAD_CONTEXT";
+    case EGL_BAD_CONFIG:
+        return "EGL_BAD_CONFIG";
+    case EGL_BAD_CURRENT_SURFACE:
+        return "EGL_BAD_CURRENT_SURFACE";
+    case EGL_BAD_DISPLAY:
+        return "EGL_BAD_DISPLAY";
+    case EGL_BAD_SURFACE:
+        return "EGL_BAD_SURFACE";
+    case EGL_BAD_MATCH:
+        return "EGL_BAD_MATCH";
+    case EGL_BAD_PARAMETER:
+        return "EGL_BAD_PARAMETER";
+    case EGL_BAD_NATIVE_PIXMAP:
+        return "EGL_BAD_NATIVE_PIXMAP";
+    case EGL_BAD_NATIVE_WINDOW:
+        return "EGL_BAD_NATIVE_WINDOW";
+    case EGL_CONTEXT_LOST:
+        return "EGL_CONTEXT_LOST";
+    default:
+        return "EGL_UNKNOWN_ERROR";
+    }
+}
+
+static void log_egl_failure(const char *operation)
+{
+    const EGLint error = eglGetError();
+
+    fprintf(stderr,
+            "%s failed: 0x%04x (%s)\n",
+            operation,
+            error,
+            egl_error_string(error));
+}
+
+static int match_config_to_visual(EGLDisplay display,
+                                  EGLint visual_id,
+                                  const EGLConfig *configs,
+                                  EGLint count)
+{
+    EGLint index;
+
+    for (index = 0; index < count; ++index) {
+        EGLint native_visual_id = 0;
+
+        if (!eglGetConfigAttrib(display,
+                                configs[index],
+                                EGL_NATIVE_VISUAL_ID,
+                                &native_visual_id)) {
+            continue;
+        }
+
+        if (native_visual_id == visual_id) {
+            return (int)index;
+        }
+    }
+
+    return -1;
+}
+
+static bool choose_egl_config(EGLDisplay display,
+                              const EGLint *attributes,
+                              EGLint visual_id,
+                              EGLConfig *config_out)
+{
+    EGLConfig *configs = NULL;
+    EGLint total = 0;
+    EGLint matched = 0;
+    int config_index = -1;
+    bool ok = false;
+
+    if (!eglGetConfigs(display, NULL, 0, &total) || total < 1) {
+        log_egl_failure("eglGetConfigs");
+        return false;
+    }
+
+    configs = calloc((size_t)total, sizeof(*configs));
+    if (!configs) {
+        fprintf(stderr, "unable to allocate EGL config list\n");
+        return false;
+    }
+
+    if (!eglChooseConfig(display, attributes, configs, total, &matched) || matched < 1) {
+        log_egl_failure("eglChooseConfig");
+        goto done;
+    }
+
+    if (visual_id == 0) {
+        config_index = 0;
+    } else {
+        config_index = match_config_to_visual(display, visual_id, configs, matched);
+        if (config_index == -1) {
+            fprintf(stderr,
+                    "no EGL config matched GBM visual 0x%04x\n",
+                    (unsigned int)visual_id);
+            goto done;
+        }
+    }
+
+    *config_out = configs[config_index];
+    ok = true;
+
+done:
+    free(configs);
+    return ok;
+}
+
 static void mat4_identity(float *out)
 {
     memset(out, 0, sizeof(float) * 16u);
@@ -575,7 +696,6 @@ static int renderer_init(struct renderer *renderer, const struct options *opts)
         EGL_NONE,
     };
     EGLConfig config = NULL;
-    EGLint num_configs = 0;
     PFNEGLGETPLATFORMDISPLAYEXTPROC get_platform_display = NULL;
 
     memset(renderer, 0, sizeof(*renderer));
@@ -630,22 +750,19 @@ static int renderer_init(struct renderer *renderer, const struct options *opts)
     }
 
     if (!eglInitialize(renderer->egl_display, NULL, NULL)) {
-        fprintf(stderr, "eglInitialize failed\n");
-        return -1;
-    }
-
-    if (!eglChooseConfig(renderer->egl_display,
-                         config_attributes,
-                         &config,
-                         1,
-                         &num_configs) ||
-        num_configs != 1) {
-        fprintf(stderr, "eglChooseConfig failed\n");
+        log_egl_failure("eglInitialize");
         return -1;
     }
 
     if (!eglBindAPI(EGL_OPENGL_ES_API)) {
-        fprintf(stderr, "eglBindAPI failed\n");
+        log_egl_failure("eglBindAPI");
+        return -1;
+    }
+
+    if (!choose_egl_config(renderer->egl_display,
+                           config_attributes,
+                           GBM_FORMAT_XRGB8888,
+                           &config)) {
         return -1;
     }
 
@@ -654,7 +771,7 @@ static int renderer_init(struct renderer *renderer, const struct options *opts)
                                              EGL_NO_CONTEXT,
                                              context_attributes);
     if (renderer->egl_context == EGL_NO_CONTEXT) {
-        fprintf(stderr, "eglCreateContext failed\n");
+        log_egl_failure("eglCreateContext");
         return -1;
     }
 
@@ -663,7 +780,7 @@ static int renderer_init(struct renderer *renderer, const struct options *opts)
                                                    (EGLNativeWindowType)renderer->gbm_surface,
                                                    NULL);
     if (renderer->egl_surface == EGL_NO_SURFACE) {
-        fprintf(stderr, "eglCreateWindowSurface failed\n");
+        log_egl_failure("eglCreateWindowSurface");
         return -1;
     }
 
@@ -671,7 +788,7 @@ static int renderer_init(struct renderer *renderer, const struct options *opts)
                         renderer->egl_surface,
                         renderer->egl_surface,
                         renderer->egl_context)) {
-        fprintf(stderr, "eglMakeCurrent failed\n");
+        log_egl_failure("eglMakeCurrent");
         return -1;
     }
 
