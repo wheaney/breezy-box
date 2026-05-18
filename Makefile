@@ -5,6 +5,7 @@ CPPFLAGS ?=
 CFLAGS ?= -O2 -g -std=c11 -Wall -Wextra -Wpedantic
 GST_PKG_DEPS := gstreamer-1.0 gstreamer-app-1.0 gstreamer-video-1.0 gstreamer-allocators-1.0
 HAVE_GSTREAMER := $(shell $(PKG_CONFIG) --exists $(GST_PKG_DEPS) && printf 1 || printf 0)
+PYTHON_HELPERS := network_display_receiver_supervisor.py wired_projection_gnome_sender.py wfd_mice_sink.py
 
 SUPERVISOR := network_display_receiver_supervisor.py
 USB_GADGET_SETUP := setup_usb_network_gadget.sh
@@ -31,7 +32,7 @@ $(SCENE_DEMO_TARGET): $(SCENE_DEMO_SOURCES)
 	$(CC) $(CPPFLAGS) $(SCENE_DEMO_CPPFLAGS) $(CFLAGS) $(SCENE_DEMO_CFLAGS) $(DRM_CFLAGS) -o $@ $(SCENE_DEMO_SOURCES) $(DRM_LIBS) $(SCENE_DEMO_LIBS) -lm
 
 validate: $(SCENE_DEMO_TARGET)
-	$(PYTHON) -m py_compile $(SUPERVISOR)
+	$(PYTHON) -m py_compile $(PYTHON_HELPERS)
 
 dry-run-example:
 	$(PYTHON) ./$(SUPERVISOR) ./$(EXAMPLE_CONFIG) --dry-run

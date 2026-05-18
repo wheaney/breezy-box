@@ -69,6 +69,22 @@ Or build just the native renderer target:
 make breezy_drm_scene_demo
 ```
 
+Host-side helper dependencies for the GNOME virtual-monitor sender:
+
+```sh
+sudo apt install python3-pydbus python3-gi gir1.2-gstreamer-1.0 \
+	gstreamer1.0-pipewire gstreamer1.0-plugins-base \
+	gstreamer1.0-plugins-good gstreamer1.0-plugins-bad
+```
+
+Sink-side helper dependencies for the WFD-MICE bridge that targets Windows and GNOME Network Displays:
+
+```sh
+sudo apt install python3-gi gir1.2-gstreamer-1.0 avahi-utils \
+	gstreamer1.0-tools gstreamer1.0-plugins-base \
+	gstreamer1.0-plugins-good gstreamer1.0-plugins-bad
+```
+
 ## Run
 
 The demo must run on a Linux console where it can become DRM master on a real KMS device.
@@ -98,12 +114,41 @@ sudo ./breezy_drm_scene_demo --stream-count 4 --frames 300 --verbose
 
 The current renderer is not a custom socket server on its own. The network endpoint is the GStreamer source element you supply via `--stream-pipeline`.
 
+Important protocol note:
+
+`CDC-NCM + IP` by itself still is not enough. The USB Ethernet link only provides transport. The SBC also needs to implement an actual receiver protocol that the host knows how to discover and speak.
+
+The nuance is:
+
+* GNOME Network Displays now has multiple discovery/provider paths. Its source tree includes Wi-Fi Direct Miracast, Chromecast discovery via mDNS on `_googlecast._tcp`, and WFD-MICE discovery via mDNS/DNS-SD on `_display._tcp`.
+* Windows supports Miracast over Infrastructure (MICE), which is the relevant Miracast-over-IP path for a CDC-NCM link.
+* macOS AirPlay is still a separate receiver protocol family.
+
+So a CDC-NCM link can be auto-discoverable to GNOME Network Displays and Windows if the SBC implements a real WFD-MICE sink over the USB Ethernet network. The repo now includes a first WFD-MICE bridge in `wfd_mice_sink.py`.
+
+That helper does all of the following:
+
+* advertise `_display._tcp` on the USB network with the expected TXT metadata such as `p2pMAC`,
+* listen for MICE signalling on TCP port `7250`,
+* parse the sender's `SOURCE_READY` message,
+* connect back to the sender's WFD RTSP server on port `7236`,
+* relay the WFD H.264 stream to a fixed local RTP port that `breezy_drm_scene_demo` already knows how to decode.
+
+This is intentionally a bridge into the current renderer rather than a full native WFD stack inside `breezy_drm_scene_demo.c`. The present limitations are:
+
+* the sink side currently handles the `SOURCE_READY` bootstrap and normal RTSP playback path, not the full WFD control surface,
+* the bridge currently relays video only and ignores WFD audio,
+* the standards-based path is H.264-oriented because WFD sources expose H.264 over MPEG-TS/RTSP.
+
+That means the auto-discoverable Windows/GNOME path now exists in this repo, but the older custom H.265/VP9 RTP path is still separate and still relevant when you control both ends of the link. There is still no single current `CDC-NCM + Miracast/AirPlay` endpoint in this repo that GNOME, Windows, and macOS will all discover almost out of the box.
+
 That means the practical receiver model is:
 
 1. Bring up one transport interface to the board, such as USB OTG networking with `setup_usb_network_gadget.sh`.
 2. Give the SBC an IP on that interface.
-3. Start `breezy_drm_scene_demo` with one `--stream-pipeline` per incoming stream.
-4. Have the sender push an encoded stream to the address/port that each pipeline is listening on.
+3. Start either the manual RTP renderer path or the new `wfd_mice_sink.py` bridge.
+4. For WFD-MICE, let GNOME Network Displays or Windows discover the sink and initiate the stream.
+5. For custom senders, keep using the direct RTP pipelines described below.
 
 For the current in-process renderer, one interface plus one port per stream is the simplest shape. Multiple IP aliases are still possible, but they are optional unless you specifically need per-stream bind addresses.
 
@@ -133,7 +178,36 @@ sudo ip addr add 192.168.2.4/24 dev usb0
 
 The older `network_display_receiver_supervisor.py` helper is still useful if you want those addresses managed for out-of-process receiver daemons, but it is not required for the in-process GStreamer renderer path.
 
-### 2. Choose A Decoder Path That Produces DMABuf NV12
+### 2. Start The WFD-MICE Bridge For Windows And GNOME
+
+The simplest Windows/GNOME bring-up path on the SBC is:
+
+```sh
+python3 ./wfd_mice_sink.py \
+	--interface usb0 \
+	--launch-renderer \
+	--renderer-device /dev/dri/card0 \
+	--renderer-decoder-fragment mppvideodec
+```
+
+That command does three things:
+
+* publishes a discoverable `_display._tcp` sink with `p2pMAC=<usb0-mac>`,
+* listens for MICE `SOURCE_READY` on TCP `7250`,
+* auto-launches `breezy_drm_scene_demo` with a static local relay pipeline on `127.0.0.1:5600`.
+
+If you prefer to launch the renderer yourself, omit `--launch-renderer`. The helper prints the exact renderer command it expects.
+
+Once that helper is running:
+
+* GNOME Network Displays should discover the sink on the USB network and use the WFD-MICE path.
+* Windows should discover it through the Miracast over Infrastructure path on the same link.
+
+The relay bridge converts the WFD RTSP session into local H.264 RTP for the renderer. Because of that, the decoder fragment for the standards-based path should be an H.264 decoder such as `mppvideodec` or a stateless V4L2 H.264 decoder.
+
+If you need GNOME virtual-display extension semantics rather than GNOME Network Displays discovery, keep using `wired_projection_gnome_sender.py`. GNOME Network Displays streams an existing selected monitor; it does not replace Mutter's compositor-level virtual-display path.
+
+### 3. Choose A Decoder Path That Produces DMABuf NV12
 
 Your pipeline fragment must stop at the decoder stage. The renderer appends its own:
 
@@ -146,12 +220,12 @@ So do not add your own sink when using `--stream-pipeline`.
 On Rockchip, the exact decoder element name depends on the image and installed plugins. Check the target with:
 
 ```sh
-gst-inspect-1.0 | grep -E 'mpp|v4l2.*(265|vp9)|h265dec|vp9dec'
+gst-inspect-1.0 | grep -E 'mpp|v4l2.*(264|265|vp9)|h264dec|h265dec|vp9dec'
 ```
 
-Typical candidates are `mppvideodec`, `v4l2slh265dec`, or `v4l2slvp9dec`.
+Typical candidates are `mppvideodec`, `v4l2slh264dec`, `v4l2slh265dec`, or `v4l2slvp9dec`.
 
-### 3. Start The Receiver Renderer
+### 4. Start The Receiver Renderer
 
 Example H.265 RTP receiver on the SBC:
 
@@ -174,7 +248,41 @@ sudo ./breezy_drm_scene_demo \
 
 If your target uses stateless V4L2 decoders instead of MPP, replace `mppvideodec` with the appropriate decoder element reported by `gst-inspect-1.0`.
 
-### 4. Send A Test Stream From The Host
+## Wired GNOME Projection
+
+If your host is GNOME on Wayland, the repo now includes a helper that creates a GNOME virtual monitor and sends that monitor over the CDC-NCM link.
+
+Start the SBC receiver first:
+
+```sh
+sudo ./breezy_drm_scene_demo \
+	--device /dev/dri/card0 \
+	--verbose \
+	--stream-pipeline 'udpsrc port=5600 caps="application/x-rtp,media=video,encoding-name=H265,payload=96,clock-rate=90000" ! rtph265depay ! h265parse ! mppvideodec'
+```
+
+Then on the GNOME host:
+
+```sh
+python3 ./wired_projection_gnome_sender.py \
+	--sink-host 192.168.2.2 \
+	--sink-port 5600 \
+	--width 1920 \
+	--height 1080 \
+	--framerate 60 \
+	--codec h265
+```
+
+The helper asks Mutter to create a virtual display. GNOME should then expose that display in Settings > Displays, where you can arrange it as an extended monitor. Once Mutter exposes the PipeWire stream for that virtual display, the helper encodes it and sends it over RTP to the SBC.
+
+Current scope of this wired path:
+
+* GNOME/Wayland host support only.
+* The host-side auto-discovery UI is not GNOME Network Displays; the desktop-recognized monitor comes from Mutter's virtual-display API.
+* The repo now also has a separate WFD-MICE bridge for GNOME Network Displays and Windows auto-discovery over the CDC-NCM link.
+* macOS AirPlay discovery would still need its own separate sink/source integration; it is not interchangeable with the wired GNOME path or with WFD-MICE.
+
+### 5. Send A Test Stream From The Host
 
 Example host-side sender for stream 1:
 
