@@ -3,6 +3,7 @@
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <GLES2/gl2.h>
+#include <GLES2/gl2ext.h>
 #include <fcntl.h>
 #include <gbm.h>
 #include <getopt.h>
@@ -20,22 +21,61 @@
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 
+#ifdef BREEZY_HAVE_GSTREAMER
+#include <gst/allocators/gstdmabuf.h>
+#include <gst/app/gstappsink.h>
+#include <gst/gst.h>
+#include <gst/video/video.h>
+#include <gst/video/gstvideometa.h>
+#endif
+
 #define ARRAY_SIZE(values) (sizeof(values) / sizeof((values)[0]))
 
 #define DEFAULT_DRM_DEVICE "/dev/dri/card0"
 #define DEFAULT_STREAM_COUNT 3u
 #define DEFAULT_STREAM_WIDTH 320u
 #define DEFAULT_STREAM_HEIGHT 180u
+#define MAX_STREAM_INPUTS 8u
 #define DEMO_PI 3.14159265358979323846f
+
+#ifndef EGL_LINUX_DMA_BUF_EXT
+#define EGL_LINUX_DMA_BUF_EXT 0x3270
+#endif
+
+#ifndef EGL_LINUX_DRM_FOURCC_EXT
+#define EGL_LINUX_DRM_FOURCC_EXT 0x3271
+#endif
+
+#ifndef EGL_DMA_BUF_PLANE0_FD_EXT
+#define EGL_DMA_BUF_PLANE0_FD_EXT 0x3272
+#define EGL_DMA_BUF_PLANE0_OFFSET_EXT 0x3273
+#define EGL_DMA_BUF_PLANE0_PITCH_EXT 0x3274
+#define EGL_DMA_BUF_PLANE1_FD_EXT 0x3275
+#define EGL_DMA_BUF_PLANE1_OFFSET_EXT 0x3276
+#define EGL_DMA_BUF_PLANE1_PITCH_EXT 0x3277
+#endif
 
 static volatile sig_atomic_t stop_requested = 0;
 
+enum stream_input_kind {
+    STREAM_INPUT_SYNTHETIC = 0,
+    STREAM_INPUT_GSTREAMER_PIPELINE,
+};
+
+struct stream_input_spec {
+    enum stream_input_kind kind;
+    const char *value;
+};
+
 struct options {
     const char *drm_device_path;
+    struct stream_input_spec stream_inputs[MAX_STREAM_INPUTS];
+    unsigned int stream_input_count;
     unsigned int stream_count;
     unsigned int stream_width;
     unsigned int stream_height;
     unsigned int max_frames;
+    bool stream_count_explicit;
     bool verbose;
 };
 
@@ -59,12 +99,20 @@ struct renderer {
     EGLDisplay egl_display;
     EGLContext egl_context;
     EGLSurface egl_surface;
-    GLuint program;
+    GLuint rgba_program;
+    GLuint nv12_program;
     GLuint vertex_buffer;
-    GLint uniform_mvp;
-    GLint uniform_sampler;
+    GLint rgba_uniform_mvp;
+    GLint rgba_uniform_sampler;
+    GLint nv12_uniform_mvp;
+    GLint nv12_uniform_y_sampler;
+    GLint nv12_uniform_uv_sampler;
     GLuint attrib_position;
     GLuint attrib_texcoord;
+    PFNEGLCREATEIMAGEKHRPROC eglCreateImageKHR;
+    PFNEGLDESTROYIMAGEKHRPROC eglDestroyImageKHR;
+    PFNGLEGLIMAGETARGETTEXTURE2DOESPROC glEGLImageTargetTexture2DOES;
+    bool dmabuf_import_supported;
     struct gbm_bo *previous_bo;
     uint32_t width;
     uint32_t height;
@@ -72,10 +120,25 @@ struct renderer {
 
 struct stream_surface {
     GLuint texture_id;
+    GLuint nv12_textures[2];
     uint8_t *pixels;
     uint32_t width;
     uint32_t height;
     float phase_offset;
+    enum stream_input_kind input_kind;
+    const char *input_value;
+    bool has_dmabuf_frame;
+#ifdef BREEZY_HAVE_GSTREAMER
+    GstElement *gst_pipeline;
+    GstElement *gst_sink;
+    GstBus *gst_bus;
+    GstSample *gst_sample;
+    GstVideoInfo gst_video_info;
+    bool gst_video_info_valid;
+    bool warned_bad_caps;
+    bool warned_bad_memory;
+    bool gst_eos;
+#endif
 };
 
 struct vertex {
@@ -121,6 +184,8 @@ static void usage(const char *argv0)
             "  --stream-count <count>   Number of textured panels to render (default: %u)\n"
             "  --stream-width <pixels>  Width of each demo texture (default: %u)\n"
             "  --stream-height <pixels> Height of each demo texture (default: %u)\n"
+            "  --stream-pipeline <gst>  Repeated GStreamer pipeline fragments that\n"
+            "                           decode to video/x-raw(memory:DMABuf),format=NV12\n"
             "  --frames <count>         Exit after rendering N frames (default: run until SIGINT)\n"
             "  --verbose                Print selected mode and renderer info\n"
             "  -h, --help               Show this help text\n",
@@ -129,6 +194,30 @@ static void usage(const char *argv0)
             DEFAULT_STREAM_COUNT,
             DEFAULT_STREAM_WIDTH,
             DEFAULT_STREAM_HEIGHT);
+}
+
+static bool has_extension(const char *list, const char *extension)
+{
+    const char *cursor = list;
+    const size_t length = strlen(extension);
+
+    if (!cursor || !*cursor) {
+        return false;
+    }
+
+    for (;;) {
+        cursor = strstr(cursor, extension);
+        if (!cursor) {
+            return false;
+        }
+
+        if ((cursor == list || cursor[-1] == ' ') &&
+            (cursor[length] == '\0' || cursor[length] == ' ')) {
+            return true;
+        }
+
+        cursor += length;
+    }
 }
 
 static int parse_unsigned_arg(const char *text, unsigned int *out)
@@ -156,6 +245,7 @@ static int parse_args(int argc, char **argv, struct options *opts)
         {"stream-count", required_argument, NULL, 'n'},
         {"stream-width", required_argument, NULL, 'w'},
         {"stream-height", required_argument, NULL, 'h'},
+        {"stream-pipeline", required_argument, NULL, 'p'},
         {"frames", required_argument, NULL, 'f'},
         {"verbose", no_argument, NULL, 'v'},
         {"help", no_argument, NULL, '?'},
@@ -174,6 +264,7 @@ static int parse_args(int argc, char **argv, struct options *opts)
                 fprintf(stderr, "invalid --stream-count value: %s\n", optarg);
                 return -1;
             }
+            opts->stream_count_explicit = true;
             break;
         case 'w':
             if (parse_unsigned_arg(optarg, &opts->stream_width) != 0) {
@@ -186,6 +277,15 @@ static int parse_args(int argc, char **argv, struct options *opts)
                 fprintf(stderr, "invalid --stream-height value: %s\n", optarg);
                 return -1;
             }
+            break;
+        case 'p':
+            if (opts->stream_input_count >= MAX_STREAM_INPUTS) {
+                fprintf(stderr, "too many --stream-pipeline options; max is %u\n", MAX_STREAM_INPUTS);
+                return -1;
+            }
+            opts->stream_inputs[opts->stream_input_count].kind = STREAM_INPUT_GSTREAMER_PIPELINE;
+            opts->stream_inputs[opts->stream_input_count].value = optarg;
+            opts->stream_input_count += 1u;
             break;
         case 'f':
             if (parse_unsigned_arg(optarg, &opts->max_frames) != 0) {
@@ -209,6 +309,25 @@ static int parse_args(int argc, char **argv, struct options *opts)
         usage(argv[0]);
         return -1;
     }
+
+    if (!opts->stream_count_explicit && opts->stream_input_count > 0u) {
+        opts->stream_count = opts->stream_input_count;
+    }
+
+    if (opts->stream_input_count > opts->stream_count) {
+        fprintf(stderr,
+                "stream-count %u is smaller than the %u configured stream pipelines\n",
+                opts->stream_count,
+                opts->stream_input_count);
+        return -1;
+    }
+
+#ifndef BREEZY_HAVE_GSTREAMER
+    if (opts->stream_input_count > 0u) {
+        fprintf(stderr, "this build does not include GStreamer support\n");
+        return -1;
+    }
+#endif
 
     return 0;
 }
@@ -596,26 +715,10 @@ static GLuint compile_shader(GLenum type, const char *source)
     return shader;
 }
 
-static int renderer_create_program(struct renderer *renderer)
+static int link_program(const char *vertex_source,
+                        const char *fragment_source,
+                        GLuint *program_out)
 {
-    static const char *vertex_source =
-        "attribute vec3 a_position;\n"
-        "attribute vec2 a_texcoord;\n"
-        "uniform mat4 u_mvp;\n"
-        "varying vec2 v_texcoord;\n"
-        "void main(void) {\n"
-        "  gl_Position = u_mvp * vec4(a_position, 1.0);\n"
-        "  v_texcoord = a_texcoord;\n"
-        "}\n";
-    static const char *fragment_source =
-        "precision mediump float;\n"
-        "uniform sampler2D u_texture;\n"
-        "varying vec2 v_texcoord;\n"
-        "void main(void) {\n"
-        "  vec4 color = texture2D(u_texture, v_texcoord);\n"
-        "  float vignette = 0.88 + 0.12 * smoothstep(0.0, 0.55, 1.0 - distance(v_texcoord, vec2(0.5)));\n"
-        "  gl_FragColor = vec4(color.rgb * vignette, 1.0);\n"
-        "}\n";
     GLuint vertex_shader = 0u;
     GLuint fragment_shader = 0u;
     GLuint program = 0u;
@@ -652,19 +755,9 @@ static int renderer_create_program(struct renderer *renderer)
         goto fail;
     }
 
-    renderer->program = program;
-    renderer->attrib_position = 0u;
-    renderer->attrib_texcoord = 1u;
-    renderer->uniform_mvp = glGetUniformLocation(program, "u_mvp");
-    renderer->uniform_sampler = glGetUniformLocation(program, "u_texture");
-
-    glGenBuffers(1, &renderer->vertex_buffer);
-    glBindBuffer(GL_ARRAY_BUFFER, renderer->vertex_buffer);
-    glBufferData(GL_ARRAY_BUFFER, sizeof(quad_vertices), quad_vertices, GL_STATIC_DRAW);
-    glBindBuffer(GL_ARRAY_BUFFER, 0u);
-
     glDeleteShader(vertex_shader);
     glDeleteShader(fragment_shader);
+    *program_out = program;
     return 0;
 
 fail:
@@ -678,6 +771,69 @@ fail:
         glDeleteShader(fragment_shader);
     }
     return -1;
+}
+
+static int renderer_create_program(struct renderer *renderer)
+{
+    static const char *vertex_source =
+        "attribute vec3 a_position;\n"
+        "attribute vec2 a_texcoord;\n"
+        "uniform mat4 u_mvp;\n"
+        "varying vec2 v_texcoord;\n"
+        "void main(void) {\n"
+        "  gl_Position = u_mvp * vec4(a_position, 1.0);\n"
+        "  v_texcoord = a_texcoord;\n"
+        "}\n";
+    static const char *fragment_source =
+        "precision mediump float;\n"
+        "uniform sampler2D u_texture;\n"
+        "varying vec2 v_texcoord;\n"
+        "void main(void) {\n"
+        "  vec4 color = texture2D(u_texture, v_texcoord);\n"
+        "  float vignette = 0.88 + 0.12 * smoothstep(0.0, 0.55, 1.0 - distance(v_texcoord, vec2(0.5)));\n"
+        "  gl_FragColor = vec4(color.rgb * vignette, 1.0);\n"
+        "}\n";
+    static const char *nv12_fragment_source =
+        "#extension GL_OES_EGL_image_external : require\n"
+        "precision mediump float;\n"
+        "uniform samplerExternalOES u_tex_y;\n"
+        "uniform samplerExternalOES u_tex_uv;\n"
+        "varying vec2 v_texcoord;\n"
+        "mat4 csc = mat4(1.0,  0.0,    1.402, -0.701,\n"
+        "                1.0, -0.344, -0.714,  0.529,\n"
+        "                1.0,  1.772,  0.0,   -0.886,\n"
+        "                0.0,  0.0,    0.0,    0.0);\n"
+        "void main(void) {\n"
+        "  vec4 yuv;\n"
+        "  yuv.x = texture2D(u_tex_y, v_texcoord).x;\n"
+        "  yuv.yz = texture2D(u_tex_uv, v_texcoord).xy;\n"
+        "  yuv.w = 1.0;\n"
+        "  vec3 rgb = (yuv * csc).rgb;\n"
+        "  float vignette = 0.88 + 0.12 * smoothstep(0.0, 0.55, 1.0 - distance(v_texcoord, vec2(0.5)));\n"
+        "  gl_FragColor = vec4(rgb * vignette, 1.0);\n"
+        "}\n";
+
+    if (link_program(vertex_source, fragment_source, &renderer->rgba_program) != 0) {
+        return -1;
+    }
+
+    if (link_program(vertex_source, nv12_fragment_source, &renderer->nv12_program) != 0) {
+        return -1;
+    }
+
+    renderer->attrib_position = 0u;
+    renderer->attrib_texcoord = 1u;
+    renderer->rgba_uniform_mvp = glGetUniformLocation(renderer->rgba_program, "u_mvp");
+    renderer->rgba_uniform_sampler = glGetUniformLocation(renderer->rgba_program, "u_texture");
+    renderer->nv12_uniform_mvp = glGetUniformLocation(renderer->nv12_program, "u_mvp");
+    renderer->nv12_uniform_y_sampler = glGetUniformLocation(renderer->nv12_program, "u_tex_y");
+    renderer->nv12_uniform_uv_sampler = glGetUniformLocation(renderer->nv12_program, "u_tex_uv");
+
+    glGenBuffers(1, &renderer->vertex_buffer);
+    glBindBuffer(GL_ARRAY_BUFFER, renderer->vertex_buffer);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(quad_vertices), quad_vertices, GL_STATIC_DRAW);
+    glBindBuffer(GL_ARRAY_BUFFER, 0u);
+    return 0;
 }
 
 static int renderer_init(struct renderer *renderer, const struct options *opts)
@@ -792,6 +948,24 @@ static int renderer_init(struct renderer *renderer, const struct options *opts)
         return -1;
     }
 
+    {
+        const char *egl_extensions = eglQueryString(renderer->egl_display, EGL_EXTENSIONS);
+        const char *gl_extensions = (const char *)glGetString(GL_EXTENSIONS);
+
+        renderer->eglCreateImageKHR = (PFNEGLCREATEIMAGEKHRPROC)eglGetProcAddress("eglCreateImageKHR");
+        renderer->eglDestroyImageKHR = (PFNEGLDESTROYIMAGEKHRPROC)eglGetProcAddress("eglDestroyImageKHR");
+        renderer->glEGLImageTargetTexture2DOES =
+            (PFNGLEGLIMAGETARGETTEXTURE2DOESPROC)eglGetProcAddress("glEGLImageTargetTexture2DOES");
+        renderer->dmabuf_import_supported =
+            has_extension(egl_extensions, "EGL_KHR_image_base") &&
+            has_extension(egl_extensions, "EGL_EXT_image_dma_buf_import") &&
+            has_extension(gl_extensions, "GL_OES_EGL_image") &&
+            has_extension(gl_extensions, "GL_OES_EGL_image_external") &&
+            renderer->eglCreateImageKHR &&
+            renderer->eglDestroyImageKHR &&
+            renderer->glEGLImageTargetTexture2DOES;
+    }
+
     if (renderer_create_program(renderer) != 0) {
         return -1;
     }
@@ -810,6 +984,7 @@ static int renderer_init(struct renderer *renderer, const struct options *opts)
                renderer->pipeline.crtc_id);
         printf("GL vendor: %s\n", glGetString(GL_VENDOR));
         printf("GL renderer: %s\n", glGetString(GL_RENDERER));
+        printf("DMABUF import: %s\n", renderer->dmabuf_import_supported ? "available" : "unavailable");
     }
 
     return 0;
@@ -822,9 +997,13 @@ static void renderer_destroy(struct renderer *renderer)
         renderer->previous_bo = NULL;
     }
 
-    if (renderer->program != 0u) {
-        glDeleteProgram(renderer->program);
-        renderer->program = 0u;
+    if (renderer->rgba_program != 0u) {
+        glDeleteProgram(renderer->rgba_program);
+        renderer->rgba_program = 0u;
+    }
+    if (renderer->nv12_program != 0u) {
+        glDeleteProgram(renderer->nv12_program);
+        renderer->nv12_program = 0u;
     }
     if (renderer->vertex_buffer != 0u) {
         glDeleteBuffers(1, &renderer->vertex_buffer);
@@ -878,10 +1057,325 @@ static void renderer_destroy(struct renderer *renderer)
     }
 }
 
+#ifdef BREEZY_HAVE_GSTREAMER
+static void log_gst_message(struct stream_surface *stream, GstMessage *message, bool verbose)
+{
+    switch (GST_MESSAGE_TYPE(message)) {
+    case GST_MESSAGE_ERROR:
+    case GST_MESSAGE_WARNING: {
+        GError *error = NULL;
+        gchar *debug_info = NULL;
+        const char *prefix = GST_MESSAGE_TYPE(message) == GST_MESSAGE_ERROR ? "ERROR" : "WARNING";
+
+        if (GST_MESSAGE_TYPE(message) == GST_MESSAGE_ERROR) {
+            gst_message_parse_error(message, &error, &debug_info);
+        } else {
+            gst_message_parse_warning(message, &error, &debug_info);
+        }
+
+        fprintf(stderr,
+                "stream pipeline %s: %s (%s)\n",
+                prefix,
+                error ? error->message : "unknown error",
+                debug_info ? debug_info : "no debug info");
+        if (error) {
+            g_clear_error(&error);
+        }
+        g_free(debug_info);
+        break;
+    }
+    case GST_MESSAGE_EOS:
+        stream->gst_eos = true;
+        if (verbose) {
+            fprintf(stderr, "stream pipeline reached EOS\n");
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+static void pump_gst_bus(struct stream_surface *stream, bool verbose)
+{
+    GstMessage *message;
+
+    if (!stream->gst_bus) {
+        return;
+    }
+
+    while ((message = gst_bus_pop_filtered(stream->gst_bus,
+                                           GST_MESSAGE_ERROR |
+                                           GST_MESSAGE_WARNING |
+                                           GST_MESSAGE_EOS)) != NULL) {
+        log_gst_message(stream, message, verbose);
+        gst_message_unref(message);
+    }
+}
+
+static void stream_surface_release_sample(struct stream_surface *stream)
+{
+    if (stream->gst_sample) {
+        gst_sample_unref(stream->gst_sample);
+        stream->gst_sample = NULL;
+    }
+}
+
+static void stream_surface_destroy_gst(struct stream_surface *stream)
+{
+    stream_surface_release_sample(stream);
+
+    if (stream->gst_bus) {
+        gst_object_unref(stream->gst_bus);
+        stream->gst_bus = NULL;
+    }
+    if (stream->gst_sink) {
+        gst_object_unref(stream->gst_sink);
+        stream->gst_sink = NULL;
+    }
+    if (stream->gst_pipeline) {
+        gst_element_set_state(stream->gst_pipeline, GST_STATE_NULL);
+        gst_object_unref(stream->gst_pipeline);
+        stream->gst_pipeline = NULL;
+    }
+}
+
+static int stream_surface_init_gst_pipeline(struct stream_surface *stream,
+                                            const struct options *opts)
+{
+    static const char *pipeline_suffix =
+        " ! queue max-size-buffers=2 leaky=downstream"
+        " ! video/x-raw(memory:DMABuf),format=NV12"
+        " ! appsink name=sink max-buffers=1 drop=true sync=false"
+        " enable-last-sample=false wait-on-eos=false";
+    char *pipeline_description = NULL;
+    GError *error = NULL;
+    int length;
+
+    length = snprintf(NULL,
+                      0,
+                      "%s%s",
+                      stream->input_value,
+                      pipeline_suffix);
+    if (length < 0) {
+        return -1;
+    }
+
+    pipeline_description = calloc((size_t)length + 1u, 1u);
+    if (!pipeline_description) {
+        fprintf(stderr, "unable to allocate pipeline description\n");
+        return -1;
+    }
+
+    snprintf(pipeline_description,
+             (size_t)length + 1u,
+             "%s%s",
+             stream->input_value,
+             pipeline_suffix);
+
+    stream->gst_pipeline = gst_parse_launch(pipeline_description, &error);
+    free(pipeline_description);
+    if (!stream->gst_pipeline) {
+        fprintf(stderr,
+                "failed to create GStreamer pipeline: %s\n",
+                error ? error->message : "unknown error");
+        if (error) {
+            g_clear_error(&error);
+        }
+        return -1;
+    }
+
+    stream->gst_sink = gst_bin_get_by_name(GST_BIN(stream->gst_pipeline), "sink");
+    if (!stream->gst_sink) {
+        fprintf(stderr, "pipeline did not create an appsink named 'sink'\n");
+        return -1;
+    }
+
+    stream->gst_bus = gst_element_get_bus(stream->gst_pipeline);
+    if (gst_element_set_state(stream->gst_pipeline, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
+        fprintf(stderr, "failed to start GStreamer pipeline\n");
+        return -1;
+    }
+
+    if (opts->verbose) {
+        printf("stream pipeline: %s\n", stream->input_value);
+    }
+
+    return 0;
+}
+
+static bool import_nv12_sample(struct renderer *renderer,
+                               struct stream_surface *stream,
+                               GstSample *sample)
+{
+    GstBuffer *buffer = gst_sample_get_buffer(sample);
+    GstCaps *caps = gst_sample_get_caps(sample);
+    GstVideoInfo info;
+    GstVideoMeta *meta;
+    GstMemory *mem0;
+    GstMemory *mem1;
+    int fd0 = -1;
+    int fd1 = -1;
+    EGLImageKHR image_y = EGL_NO_IMAGE_KHR;
+    EGLImageKHR image_uv = EGL_NO_IMAGE_KHR;
+    EGLint attr_y[] = {
+        EGL_WIDTH, 0,
+        EGL_HEIGHT, 0,
+        EGL_LINUX_DRM_FOURCC_EXT, DRM_FORMAT_R8,
+        EGL_DMA_BUF_PLANE0_FD_EXT, -1,
+        EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0,
+        EGL_DMA_BUF_PLANE0_PITCH_EXT, 0,
+        EGL_NONE,
+    };
+    EGLint attr_uv[] = {
+        EGL_WIDTH, 0,
+        EGL_HEIGHT, 0,
+        EGL_LINUX_DRM_FOURCC_EXT, DRM_FORMAT_GR88,
+        EGL_DMA_BUF_PLANE0_FD_EXT, -1,
+        EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0,
+        EGL_DMA_BUF_PLANE0_PITCH_EXT, 0,
+        EGL_NONE,
+    };
+
+    if (!buffer || !caps) {
+        return false;
+    }
+
+    if (!gst_video_info_from_caps(&info, caps) || GST_VIDEO_INFO_FORMAT(&info) != GST_VIDEO_FORMAT_NV12) {
+        if (!stream->warned_bad_caps) {
+            fprintf(stderr, "stream pipeline must output NV12 video/x-raw(memory:DMABuf) buffers\n");
+            stream->warned_bad_caps = true;
+        }
+        return false;
+    }
+
+    meta = gst_buffer_get_video_meta(buffer);
+    mem0 = gst_buffer_peek_memory(buffer, 0u);
+    mem1 = gst_buffer_n_memory(buffer) > 1u ? gst_buffer_peek_memory(buffer, 1u) : mem0;
+
+    if (!mem0 || !mem1 || !gst_is_dmabuf_memory(mem0) || !gst_is_dmabuf_memory(mem1)) {
+        if (!stream->warned_bad_memory) {
+            fprintf(stderr, "stream pipeline did not produce DMABuf-backed NV12 planes\n");
+            stream->warned_bad_memory = true;
+        }
+        return false;
+    }
+
+    fd0 = dup(gst_dmabuf_memory_get_fd(mem0));
+    fd1 = dup(gst_dmabuf_memory_get_fd(mem1));
+    if (fd0 < 0 || fd1 < 0) {
+        perror("dup");
+        goto fail;
+    }
+
+    attr_y[1] = (EGLint)GST_VIDEO_INFO_WIDTH(&info);
+    attr_y[3] = (EGLint)GST_VIDEO_INFO_HEIGHT(&info);
+    attr_y[7] = fd0;
+    attr_y[9] = (EGLint)(meta ? meta->offset[0] : GST_VIDEO_INFO_PLANE_OFFSET(&info, 0));
+    attr_y[11] = (EGLint)(meta ? meta->stride[0] : GST_VIDEO_INFO_PLANE_STRIDE(&info, 0));
+
+    attr_uv[1] = (EGLint)(GST_VIDEO_INFO_WIDTH(&info) / 2u);
+    attr_uv[3] = (EGLint)(GST_VIDEO_INFO_HEIGHT(&info) / 2u);
+    attr_uv[7] = fd1;
+    attr_uv[9] = (EGLint)(gst_buffer_n_memory(buffer) > 1u ? 0u : (meta ? meta->offset[1] : GST_VIDEO_INFO_PLANE_OFFSET(&info, 1)));
+    attr_uv[11] = (EGLint)(meta ? meta->stride[1] : GST_VIDEO_INFO_PLANE_STRIDE(&info, 1));
+
+    image_y = renderer->eglCreateImageKHR(renderer->egl_display,
+                                          EGL_NO_CONTEXT,
+                                          EGL_LINUX_DMA_BUF_EXT,
+                                          NULL,
+                                          attr_y);
+    if (image_y == EGL_NO_IMAGE_KHR) {
+        log_egl_failure("eglCreateImageKHR(Y)");
+        goto fail;
+    }
+
+    image_uv = renderer->eglCreateImageKHR(renderer->egl_display,
+                                           EGL_NO_CONTEXT,
+                                           EGL_LINUX_DMA_BUF_EXT,
+                                           NULL,
+                                           attr_uv);
+    if (image_uv == EGL_NO_IMAGE_KHR) {
+        log_egl_failure("eglCreateImageKHR(UV)");
+        goto fail;
+    }
+
+    if (stream->nv12_textures[0] == 0u) {
+        glGenTextures(2, stream->nv12_textures);
+    }
+
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_EXTERNAL_OES, stream->nv12_textures[0]);
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    renderer->glEGLImageTargetTexture2DOES(GL_TEXTURE_EXTERNAL_OES, image_y);
+
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_EXTERNAL_OES, stream->nv12_textures[1]);
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    renderer->glEGLImageTargetTexture2DOES(GL_TEXTURE_EXTERNAL_OES, image_uv);
+
+    renderer->eglDestroyImageKHR(renderer->egl_display, image_y);
+    renderer->eglDestroyImageKHR(renderer->egl_display, image_uv);
+    close(fd0);
+    close(fd1);
+
+    stream_surface_release_sample(stream);
+    stream->gst_sample = sample;
+    stream->gst_video_info = info;
+    stream->gst_video_info_valid = true;
+    stream->has_dmabuf_frame = true;
+    stream->width = GST_VIDEO_INFO_WIDTH(&info);
+    stream->height = GST_VIDEO_INFO_HEIGHT(&info);
+    return true;
+
+fail:
+    if (image_y != EGL_NO_IMAGE_KHR) {
+        renderer->eglDestroyImageKHR(renderer->egl_display, image_y);
+    }
+    if (image_uv != EGL_NO_IMAGE_KHR) {
+        renderer->eglDestroyImageKHR(renderer->egl_display, image_uv);
+    }
+    if (fd0 >= 0) {
+        close(fd0);
+    }
+    if (fd1 >= 0) {
+        close(fd1);
+    }
+    return false;
+}
+
+static void stream_surface_try_pull_gst_frame(struct renderer *renderer,
+                                              struct stream_surface *stream,
+                                              const struct options *opts)
+{
+    GstSample *sample;
+
+    pump_gst_bus(stream, opts->verbose);
+    if (!stream->gst_sink) {
+        return;
+    }
+
+    sample = gst_app_sink_try_pull_sample(GST_APP_SINK(stream->gst_sink), 0);
+    if (!sample) {
+        return;
+    }
+
+    if (!import_nv12_sample(renderer, stream, sample)) {
+        gst_sample_unref(sample);
+    }
+}
+#endif
+
 static int stream_surfaces_init(struct stream_surface *streams,
                                 unsigned int stream_count,
                                 uint32_t width,
-                                uint32_t height)
+                                uint32_t height,
+                                const struct options *opts)
 {
     unsigned int index;
 
@@ -889,6 +1383,12 @@ static int stream_surfaces_init(struct stream_surface *streams,
         streams[index].width = width;
         streams[index].height = height;
         streams[index].phase_offset = (float)index * 1.7f;
+        if (index < opts->stream_input_count) {
+            streams[index].input_kind = opts->stream_inputs[index].kind;
+            streams[index].input_value = opts->stream_inputs[index].value;
+        } else {
+            streams[index].input_kind = STREAM_INPUT_SYNTHETIC;
+        }
         streams[index].pixels = calloc((size_t)width * (size_t)height, 4u);
         if (!streams[index].pixels) {
             fprintf(stderr, "unable to allocate stream pixels\n");
@@ -910,6 +1410,13 @@ static int stream_surfaces_init(struct stream_surface *streams,
                      GL_RGBA,
                      GL_UNSIGNED_BYTE,
                      streams[index].pixels);
+
+#ifdef BREEZY_HAVE_GSTREAMER
+        if (streams[index].input_kind == STREAM_INPUT_GSTREAMER_PIPELINE &&
+            stream_surface_init_gst_pipeline(&streams[index], opts) != 0) {
+            return -1;
+        }
+#endif
     }
 
     glBindTexture(GL_TEXTURE_2D, 0u);
@@ -928,6 +1435,12 @@ static void stream_surfaces_destroy(struct stream_surface *streams, unsigned int
         if (streams[index].texture_id != 0u) {
             glDeleteTextures(1, &streams[index].texture_id);
         }
+        if (streams[index].nv12_textures[0] != 0u) {
+            glDeleteTextures(2, streams[index].nv12_textures);
+        }
+#ifdef BREEZY_HAVE_GSTREAMER
+        stream_surface_destroy_gst(&streams[index]);
+#endif
         free(streams[index].pixels);
     }
 }
@@ -974,6 +1487,54 @@ static void stream_surface_upload(const struct stream_surface *stream)
                     GL_RGBA,
                     GL_UNSIGNED_BYTE,
                     stream->pixels);
+}
+
+static void stream_surface_refresh(struct renderer *renderer,
+                                   struct stream_surface *stream,
+                                   unsigned int stream_index,
+                                   double scene_time,
+                                   const struct options *opts)
+{
+#ifdef BREEZY_HAVE_GSTREAMER
+    if (stream->input_kind == STREAM_INPUT_GSTREAMER_PIPELINE) {
+        stream_surface_try_pull_gst_frame(renderer, stream, opts);
+    }
+#else
+    (void)renderer;
+    (void)opts;
+#endif
+
+    if (!stream->has_dmabuf_frame) {
+        stream_surface_update_pixels(stream, stream_index, scene_time);
+        stream_surface_upload(stream);
+    }
+}
+
+static void renderer_draw_rgba_stream(struct renderer *renderer,
+                                      const struct stream_surface *stream,
+                                      const float *mvp)
+{
+    glUseProgram(renderer->rgba_program);
+    glUniformMatrix4fv(renderer->rgba_uniform_mvp, 1, GL_FALSE, mvp);
+    glUniform1i(renderer->rgba_uniform_sampler, 0);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, stream->texture_id);
+    glDrawArrays(GL_TRIANGLES, 0, (GLsizei)ARRAY_SIZE(quad_vertices));
+}
+
+static void renderer_draw_nv12_stream(struct renderer *renderer,
+                                      const struct stream_surface *stream,
+                                      const float *mvp)
+{
+    glUseProgram(renderer->nv12_program);
+    glUniformMatrix4fv(renderer->nv12_uniform_mvp, 1, GL_FALSE, mvp);
+    glUniform1i(renderer->nv12_uniform_y_sampler, 0);
+    glUniform1i(renderer->nv12_uniform_uv_sampler, 1);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_EXTERNAL_OES, stream->nv12_textures[0]);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_EXTERNAL_OES, stream->nv12_textures[1]);
+    glDrawArrays(GL_TRIANGLES, 0, (GLsizei)ARRAY_SIZE(quad_vertices));
 }
 
 static void build_panel_mvp(float *out,
@@ -1061,13 +1622,13 @@ static int renderer_present(struct renderer *renderer)
 static int renderer_draw_scene(struct renderer *renderer,
                                struct stream_surface *streams,
                                unsigned int stream_count,
-                               double scene_time)
+                               double scene_time,
+                               const struct options *opts)
 {
     unsigned int index;
 
     glViewport(0, 0, (GLsizei)renderer->width, (GLsizei)renderer->height);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-    glUseProgram(renderer->program);
     glBindBuffer(GL_ARRAY_BUFFER, renderer->vertex_buffer);
     glEnableVertexAttribArray(renderer->attrib_position);
     glEnableVertexAttribArray(renderer->attrib_texcoord);
@@ -1084,14 +1645,10 @@ static int renderer_draw_scene(struct renderer *renderer,
                           (GLsizei)sizeof(struct vertex),
                           (const void *)offsetof(struct vertex, uv));
 
-    glUniform1i(renderer->uniform_sampler, 0);
-    glActiveTexture(GL_TEXTURE0);
-
     for (index = 0u; index < stream_count; ++index) {
         float mvp[16];
 
-        stream_surface_update_pixels(&streams[index], index, scene_time);
-        stream_surface_upload(&streams[index]);
+        stream_surface_refresh(renderer, &streams[index], index, scene_time, opts);
         build_panel_mvp(mvp,
                         renderer->width,
                         renderer->height,
@@ -1100,12 +1657,15 @@ static int renderer_draw_scene(struct renderer *renderer,
                         stream_count,
                         scene_time);
 
-        glBindTexture(GL_TEXTURE_2D, streams[index].texture_id);
-        glUniformMatrix4fv(renderer->uniform_mvp, 1, GL_FALSE, mvp);
-        glDrawArrays(GL_TRIANGLES, 0, (GLsizei)ARRAY_SIZE(quad_vertices));
+        if (streams[index].has_dmabuf_frame) {
+            renderer_draw_nv12_stream(renderer, &streams[index], mvp);
+        } else {
+            renderer_draw_rgba_stream(renderer, &streams[index], mvp);
+        }
     }
 
     glBindTexture(GL_TEXTURE_2D, 0u);
+    glBindTexture(GL_TEXTURE_EXTERNAL_OES, 0u);
     glBindBuffer(GL_ARRAY_BUFFER, 0u);
     glDisableVertexAttribArray(renderer->attrib_position);
     glDisableVertexAttribArray(renderer->attrib_texcoord);
@@ -1127,10 +1687,23 @@ int main(int argc, char **argv)
         return status < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
     }
 
+#ifdef BREEZY_HAVE_GSTREAMER
+    if (opts.stream_input_count > 0u) {
+        gst_init(NULL, NULL);
+    }
+#endif
+
     signal(SIGINT, request_stop);
     signal(SIGTERM, request_stop);
 
     if (renderer_init(&renderer, &opts) != 0) {
+        renderer_destroy(&renderer);
+        return EXIT_FAILURE;
+    }
+
+    if (opts.stream_input_count > 0u && !renderer.dmabuf_import_supported) {
+        fprintf(stderr,
+                "this EGL/GLES stack does not expose the dma-buf import path needed for NV12 stream textures\n");
         renderer_destroy(&renderer);
         return EXIT_FAILURE;
     }
@@ -1145,7 +1718,8 @@ int main(int argc, char **argv)
     if (stream_surfaces_init(streams,
                              opts.stream_count,
                              opts.stream_width,
-                             opts.stream_height) != 0) {
+                             opts.stream_height,
+                             &opts) != 0) {
         stream_surfaces_destroy(streams, opts.stream_count);
         free(streams);
         renderer_destroy(&renderer);
@@ -1156,7 +1730,7 @@ int main(int argc, char **argv)
     while (!stop_requested) {
         const double scene_time = monotonic_seconds() - start_time;
 
-        if (renderer_draw_scene(&renderer, streams, opts.stream_count, scene_time) != 0) {
+        if (renderer_draw_scene(&renderer, streams, opts.stream_count, scene_time, &opts) != 0) {
             status = EXIT_FAILURE;
             goto done;
         }
