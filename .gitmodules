@@ -1,0 +1,3 @@
+[submodule "modules/kmscube"]
+	path = modules/kmscube
+	url = https://gitlab.freedesktop.org/mesa/kmscube.git

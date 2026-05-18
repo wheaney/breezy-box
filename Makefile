@@ -7,8 +7,8 @@ CFLAGS ?= -O2 -g -std=c11 -Wall -Wextra -Wpedantic
 SUPERVISOR := network_display_receiver_supervisor.py
 USB_GADGET_SETUP := setup_usb_network_gadget.sh
 EXAMPLE_CONFIG := network_display_receivers.example.json
-SCENE_DEMO_TARGET := kmscube_stream_scene_demo
-SCENE_DEMO_SOURCES := kmscube_stream_scene_demo.c
+SCENE_DEMO_TARGET := breezy_drm_scene_demo
+SCENE_DEMO_SOURCES := breezy_drm_scene_demo.c
 DRM_CFLAGS ?= $(shell $(PKG_CONFIG) --cflags libdrm gbm egl glesv2)
 DRM_LIBS ?= $(shell $(PKG_CONFIG) --libs libdrm gbm egl glesv2)
 

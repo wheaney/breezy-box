@@ -112,9 +112,9 @@ static void usage(const char *argv0)
     fprintf(stderr,
             "Usage: %s [options]\n"
             "\n"
-            "A small DRM/KMS + GBM/EGL/GLES scene demo aligned with a kmscube-style\n"
-            "rendering stack. Each demo stream is uploaded as a texture and rendered\n"
-            "onto its own floating panel in a 3D scene.\n"
+            "A small Breezy Box DRM/KMS + GBM/EGL/GLES scene demo. Each demo\n"
+            "stream is uploaded as a texture and rendered onto its own floating\n"
+            "panel in a 3D scene.\n"
             "\n"
             "Options:\n"
             "  --device <path>          DRM device node (default: %s)\n"

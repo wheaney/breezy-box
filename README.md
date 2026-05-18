@@ -2,7 +2,7 @@
 
 Breezy Box is an XR dock prototype for a single-board computer. The active direction in this repo is back to a native DRM/KMS renderer that can present multiple network display streams as textures inside one 3D scene.
 
-The current code now provides a compileable `kmscube`-style render scaffold. It does not ingest real network video yet; it renders synthetic per-stream textures so the display, scene, and scanout path can be developed in-process first.
+The current code now provides a self-owned DRM/KMS render scaffold. It does not ingest real network video yet; it renders synthetic per-stream textures so the display, scene, and scanout path can be developed in-process first.
 
 ## Target Architecture
 
@@ -15,9 +15,9 @@ The intended shape is:
 
 ## Current Renderer Anchor
 
-`kmscube_stream_scene_demo.c` is the current render anchor.
+`breezy_drm_scene_demo.c` is the current render anchor.
 
-It is intentionally shaped like the part of a `kmscube` fork you would want to keep:
+It owns the renderer directly instead of wrapping a third-party demo app:
 
 * DRM connector and CRTC selection.
 * GBM device and scanout surface creation.
@@ -27,18 +27,19 @@ It is intentionally shaped like the part of a `kmscube` fork you would want to k
 
 Right now the per-stream textures are synthetic and CPU-generated. That makes this file a safe place to stabilize the renderer contract before wiring in real receiver output.
 
-## Kmscube Fork Fit
+## Reference Submodule
 
-If you plan to use a `kmscube` fork, that is the right base layer for this repo.
+The upstream `kmscube` source under `modules/kmscube` is reference material only. It is not part of the Breezy Box build and is not invoked by the top-level `Makefile`.
 
-The practical split should be:
+The most relevant files for the Breezy Box renderer are:
 
-* Let the fork keep owning DRM device setup, GBM/EGL initialization, swap, and scanout.
-* Replace `stream_surface_update_pixels()` with a real frame source fed by network receivers.
-* Keep `build_panel_mvp()` or an equivalent scene-graph layer as the Breezy Box-specific placement logic.
-* Keep the final renderer single-process so multiple stream textures can be composed into one XR scene without crossing process boundaries.
+* `modules/kmscube/kmscube.c`: the main app entry that wires DRM backend, GBM/EGL init, and the selected render mode together.
+* `modules/kmscube/common.h`: the core extension boundary, especially `struct cube`, `struct gbm`, and `struct egl`.
+* `modules/kmscube/drm-common.c`, `drm-legacy.c`, and `drm-atomic.c`: the scanout and present backends.
+* `modules/kmscube/cube-video.c`: the closest existing example of a texture-fed render path inside the kmscube abstraction.
+* `modules/kmscube/gst-decoder.c`: the current GStreamer-to-GL texture bridge used by `cube-video.c`.
 
-The current demo mirrors that split so the fork integration can stay local instead of rewriting the whole repo around the fork later.
+That reference is there to inform the next steps in the self-owned renderer, not to become a required dependency.
 
 ## Build
 
@@ -57,7 +58,7 @@ make
 Or build just the native renderer target:
 
 ```sh
-make kmscube_stream_scene_demo
+make breezy_drm_scene_demo
 ```
 
 ## Run
@@ -67,7 +68,7 @@ The demo must run on a Linux console where it can become DRM master on a real KM
 Example:
 
 ```sh
-sudo ./kmscube_stream_scene_demo --stream-count 3 --device /dev/dri/card0
+sudo ./breezy_drm_scene_demo --stream-count 3 --device /dev/dri/card0
 ```
 
 Useful options:
@@ -81,7 +82,7 @@ Useful options:
 Example short run for bring-up:
 
 ```sh
-sudo ./kmscube_stream_scene_demo --stream-count 4 --frames 300 --verbose
+sudo ./breezy_drm_scene_demo --stream-count 4 --frames 300 --verbose
 ```
 
 ## Network Ingress Helpers
