@@ -25,7 +25,7 @@ DEFAULT_SERVICE_NAME = "Breezy Box"
 DEFAULT_SIGNALLING_PORT = 7250
 DEFAULT_RTSP_PORT = 7236
 DEFAULT_RTSP_PATH = "/wfd1.0/streamid=0"
-DEFAULT_RTSP_READY_TIMEOUT_SEC = 5.0
+DEFAULT_RTSP_READY_TIMEOUT_SEC = 30.0
 DEFAULT_RTSP_CONNECT_TIMEOUT_SEC = 0.75
 DEFAULT_RTSP_SOCKET_TIMEOUT_SEC = 5.0
 DEFAULT_RTSP_KEEPALIVE_INTERVAL_SEC = 15
@@ -288,20 +288,46 @@ def resolve_rtsp_control_url(base_url, response_headers, sdp_text):
 def wait_for_tcp_endpoint(host, port, ready_timeout_sec, connect_timeout_sec):
     deadline = time.monotonic() + ready_timeout_sec
     last_error = None
+    start_time = time.monotonic()
+    next_log_after = start_time
+
+    LOGGER.info(
+        "waiting up to %.1fs for source RTSP server at %s:%u",
+        ready_timeout_sec,
+        host,
+        port,
+    )
 
     while True:
         try:
             with socket.create_connection((host, port), timeout=connect_timeout_sec):
+                LOGGER.info(
+                    "source RTSP server at %s:%u became reachable after %.2fs",
+                    host,
+                    port,
+                    time.monotonic() - start_time,
+                )
                 return
         except OSError as exc:
             last_error = exc
-            if time.monotonic() >= deadline:
+            now = time.monotonic()
+            if now >= next_log_after:
+                LOGGER.info(
+                    "source RTSP server at %s:%u not reachable yet after %.2fs: %s",
+                    host,
+                    port,
+                    now - start_time,
+                    exc,
+                )
+                next_log_after = now + 2.0
+            if now >= deadline:
                 break
             time.sleep(0.25)
 
     raise RuntimeError(
         f"unable to reach source RTSP server at {host}:{port}; last socket error: {last_error}. "
-        f"This usually means the source has not opened TCP {port} yet or a host firewall is blocking it."
+        f"This usually means the source has not opened TCP {port} yet or a host firewall is blocking it. "
+        f"If the host is still showing 'connecting', try a larger --rtsp-ready-timeout-sec value."
     )
 
 
@@ -951,7 +977,7 @@ def main(argv):
 
     args = parse_args(argv)
     logging.basicConfig(
-        level=logging.INFO if args.verbose else logging.WARNING,
+        level=logging.INFO,
         format="%(levelname)s: %(message)s",
     )
 
