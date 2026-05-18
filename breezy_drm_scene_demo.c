@@ -128,6 +128,8 @@ struct stream_surface {
     enum stream_input_kind input_kind;
     const char *input_value;
     bool has_dmabuf_frame;
+    bool verbose;
+    bool logged_first_sample;
 #ifdef BREEZY_HAVE_GSTREAMER
     GstElement *gst_pipeline;
     GstElement *gst_sink;
@@ -1058,6 +1060,85 @@ static void renderer_destroy(struct renderer *renderer)
 }
 
 #ifdef BREEZY_HAVE_GSTREAMER
+static void configure_decoder_io_modes(GstElement *element, bool verbose)
+{
+    GParamSpec *capture_io_mode;
+    GParamSpec *output_io_mode;
+    GstElementFactory *factory;
+    const char *factory_name = NULL;
+
+    if (!element) {
+        return;
+    }
+
+    factory = gst_element_get_factory(element);
+    if (factory) {
+        factory_name = gst_plugin_feature_get_name(GST_PLUGIN_FEATURE(factory));
+    }
+
+    capture_io_mode = g_object_class_find_property(G_OBJECT_GET_CLASS(element), "capture-io-mode");
+    if (capture_io_mode) {
+        gst_util_set_object_arg(G_OBJECT(element), "capture-io-mode", "dmabuf");
+        if (verbose) {
+            printf("configured %s (%s) capture-io-mode=dmabuf\n",
+                   GST_OBJECT_NAME(element),
+                   factory_name ? factory_name : "unknown-factory");
+        }
+    }
+
+    output_io_mode = g_object_class_find_property(G_OBJECT_GET_CLASS(element), "output-io-mode");
+    if (output_io_mode) {
+        gst_util_set_object_arg(G_OBJECT(element), "output-io-mode", "dmabuf");
+        if (verbose) {
+            printf("configured %s (%s) output-io-mode=dmabuf\n",
+                   GST_OBJECT_NAME(element),
+                   factory_name ? factory_name : "unknown-factory");
+        }
+    }
+}
+
+static void configure_bin_decoder_io_modes(GstBin *bin, bool verbose)
+{
+    GstIterator *iterator;
+    GValue value = G_VALUE_INIT;
+    gboolean done = FALSE;
+
+    if (!bin) {
+        return;
+    }
+
+    iterator = gst_bin_iterate_recurse(bin);
+    while (!done) {
+        switch (gst_iterator_next(iterator, &value)) {
+        case GST_ITERATOR_OK: {
+            GstElement *element = g_value_get_object(&value);
+
+            configure_decoder_io_modes(element, verbose);
+            g_value_reset(&value);
+            break;
+        }
+        case GST_ITERATOR_RESYNC:
+            gst_iterator_resync(iterator);
+            break;
+        case GST_ITERATOR_ERROR:
+        case GST_ITERATOR_DONE:
+            done = TRUE;
+            break;
+        }
+    }
+
+    g_value_unset(&value);
+    gst_iterator_free(iterator);
+}
+
+static void pipeline_element_added_cb(GstBin *bin, GstElement *element, gpointer user_data)
+{
+    struct stream_surface *stream = user_data;
+
+    (void)bin;
+    configure_decoder_io_modes(element, stream->verbose);
+}
+
 static void log_gst_message(struct stream_surface *stream, GstMessage *message, bool verbose)
 {
     switch (GST_MESSAGE_TYPE(message)) {
@@ -1189,6 +1270,13 @@ static int stream_surface_init_gst_pipeline(struct stream_surface *stream,
         fprintf(stderr, "pipeline did not create an appsink named 'sink'\n");
         return -1;
     }
+
+    stream->verbose = opts->verbose;
+    g_signal_connect(stream->gst_pipeline,
+                     "deep-element-added",
+                     G_CALLBACK(pipeline_element_added_cb),
+                     stream);
+    configure_bin_decoder_io_modes(GST_BIN(stream->gst_pipeline), opts->verbose);
 
     stream->gst_bus = gst_element_get_bus(stream->gst_pipeline);
     if (gst_element_set_state(stream->gst_pipeline, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
@@ -1363,6 +1451,18 @@ static void stream_surface_try_pull_gst_frame(struct renderer *renderer,
     sample = gst_app_sink_try_pull_sample(GST_APP_SINK(stream->gst_sink), 0);
     if (!sample) {
         return;
+    }
+
+    if (!stream->logged_first_sample) {
+        GstCaps *caps = gst_sample_get_caps(sample);
+        gchar *caps_text = caps ? gst_caps_to_string(caps) : NULL;
+        GstBuffer *buffer = gst_sample_get_buffer(sample);
+
+        printf("stream received first sample: caps=%s memories=%u\n",
+               caps_text ? caps_text : "(none)",
+               buffer ? gst_buffer_n_memory(buffer) : 0u);
+        g_free(caps_text);
+        stream->logged_first_sample = true;
     }
 
     if (!import_nv12_sample(renderer, stream, sample)) {
