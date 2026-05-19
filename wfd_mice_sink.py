@@ -7,6 +7,7 @@ import importlib
 import ipaddress
 import logging
 import os
+import random
 import re
 import shlex
 import shutil
@@ -458,12 +459,8 @@ class ServicePublisher:
         if not publisher or not address_publisher:
             raise RuntimeError("avahi-publish-service and avahi-publish-address are required for WFD-MICE discovery")
 
-        argv = [publisher]
-        if self.host_name:
-            argv.extend(["-H", self.host_name])
-        argv.extend([self.service_name, SERVICE_TYPE, str(self.signalling_port)])
-        argv.extend(self.txt_records)
         if self.host_name and self.host_address:
+            self.host_name = self._start_address_with_retry(address_publisher, self.host_name, self.host_address)
             LOGGER.info(
                 "publishing %s on %s via Avahi as %s -> %s",
                 self.service_name,
@@ -471,10 +468,44 @@ class ServicePublisher:
                 self.host_name,
                 self.host_address,
             )
-            self.address_process = subprocess.Popen([address_publisher, self.host_name, self.host_address])
         else:
             LOGGER.info("publishing %s on %s via Avahi", self.service_name, SERVICE_TYPE)
+
+        argv = [publisher]
+        if self.host_name:
+            argv.extend(["-H", self.host_name])
+        argv.extend([self.service_name, SERVICE_TYPE, str(self.signalling_port)])
+        argv.extend(self.txt_records)
         self.service_process = subprocess.Popen(argv)
+
+    def _start_address_with_retry(self, address_publisher, host_name, host_address):
+        base_host_name = host_name.removesuffix(".local")
+        for attempt in range(6):
+            candidate = host_name if attempt == 0 else f"{base_host_name}-{random.randint(1000, 9999)}.local"
+            address_process = subprocess.Popen(
+                [address_publisher, candidate, host_address],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            time.sleep(0.2)
+            exit_code = address_process.poll()
+            if exit_code is None:
+                self.address_process = address_process
+                return candidate
+
+            stderr_output = ""
+            if address_process.stderr is not None:
+                stderr_output = address_process.stderr.read().strip()
+            if "Local name collision" in stderr_output and attempt < 5:
+                LOGGER.warning("mDNS host name %s collided locally; retrying with a fresh name", candidate)
+                continue
+            raise RuntimeError(
+                f"failed to publish mDNS host record {candidate} -> {host_address}: "
+                f"{stderr_output or f'exit code {exit_code}'}"
+            )
+
+        raise RuntimeError(f"failed to publish a unique mDNS host record for {host_address}")
 
     def stop(self):
         for process in (self.service_process, self.address_process):
