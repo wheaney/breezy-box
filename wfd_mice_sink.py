@@ -538,6 +538,12 @@ class RendererProcess:
         LOGGER.info("starting renderer: %s", format_command(argv))
         self.process = subprocess.Popen(argv)
 
+    def restart(self):
+        if not self.args.launch_renderer:
+            return
+        self.stop()
+        self.ensure_started()
+
     def stop(self):
         if self.process is None or self.process.poll() is not None:
             return
@@ -1068,7 +1074,10 @@ class Application:
 
     def _start_session(self, source_host, source_ready):
         try:
-            self.renderer.ensure_started()
+            if self.args.launch_renderer:
+                self.renderer.restart()
+            else:
+                self.renderer.ensure_started()
             self.relay.start(source_host, source_ready)
         except Exception as exc:
             LOGGER.error("failed to start WFD relay: %s", exc)
