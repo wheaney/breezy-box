@@ -568,6 +568,7 @@ class RtspRelay:
         self.keepalive_source_id = 0
         self.demux = None
         self.video_queue = None
+        self.auxiliary_elements = []
 
     def start(self, source_host, source_ready):
         self.stop()
@@ -705,7 +706,9 @@ class RtspRelay:
         return pipeline
 
     def _on_demux_pad_added(self, demux, pad, video_queue):
-        del demux
+        pipeline = demux.get_parent()
+        if pipeline is None:
+            raise RuntimeError("failed to look up relay pipeline for tsdemux pad handling")
         caps = pad.get_current_caps() or pad.query_caps(None)
         structure_name = None
         if caps is not None and caps.get_size() > 0:
@@ -714,6 +717,7 @@ class RtspRelay:
         if structure_name != "video/x-h264":
             if self.args.verbose:
                 print(f"Ignoring demux pad with caps: {caps.to_string() if caps is not None else 'unknown'}", flush=True)
+            self._attach_auxiliary_pad_branch(pipeline, pad, caps)
             return
 
         sink_pad = video_queue.get_static_pad("sink")
@@ -727,6 +731,41 @@ class RtspRelay:
             raise RuntimeError(f"failed to link tsdemux video pad to relay queue: {link_result.value_nick}")
         if self.args.verbose:
             print(f"Linked demux video pad with caps: {caps.to_string() if caps is not None else 'unknown'}", flush=True)
+
+    def _attach_auxiliary_pad_branch(self, pipeline, pad, caps):
+        if pad.is_linked():
+            return
+
+        queue_name = f"wfd_aux_queue_{len(self.auxiliary_elements)}"
+        sink_name = f"wfd_aux_sink_{len(self.auxiliary_elements)}"
+        queue = Gst.ElementFactory.make("queue", queue_name)
+        sink = Gst.ElementFactory.make("fakesink", sink_name)
+        if queue is None or sink is None:
+            raise RuntimeError("failed to create auxiliary relay elements for non-video demux pad")
+
+        queue.set_property("max-size-buffers", 8)
+        queue.set_property("leaky", 2)
+        sink.set_property("sync", False)
+        sink.set_property("async", False)
+
+        pipeline.add(queue)
+        pipeline.add(sink)
+        if not queue.link(sink):
+            raise RuntimeError("failed to link auxiliary relay queue to fakesink")
+
+        queue.sync_state_with_parent()
+        sink.sync_state_with_parent()
+
+        sink_pad = queue.get_static_pad("sink")
+        if sink_pad is None:
+            raise RuntimeError("failed to look up auxiliary relay queue sink pad")
+        link_result = pad.link(sink_pad)
+        if link_result != Gst.PadLinkReturn.OK:
+            raise RuntimeError(f"failed to link auxiliary demux pad: {link_result.value_nick}")
+
+        self.auxiliary_elements.extend([queue, sink])
+        if self.args.verbose:
+            print(f"Draining auxiliary demux pad with caps: {caps.to_string() if caps is not None else 'unknown'}", flush=True)
 
     def _describe_with_fallback(self):
         last_error = None
@@ -936,6 +975,7 @@ class RtspRelay:
         self.current_url = None
         self.demux = None
         self.video_queue = None
+        self.auxiliary_elements = []
 
     def _on_message(self, bus, message):
         del bus
@@ -1055,6 +1095,7 @@ def validate_environment(args):
         "udpsrc",
         "rtpmp2tdepay",
         "tsdemux",
+        "fakesink",
         "h264parse",
         "rtph264pay",
         "udpsink",
