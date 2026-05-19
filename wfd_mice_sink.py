@@ -425,17 +425,106 @@ def build_relay_pipeline_description(args):
         'queue max-size-buffers=8 ! '
         'application/x-rtp,media=video,encoding-name=MP2T,payload=33,clock-rate=90000 ! '
         'rtpmp2tdepay ! tsdemux name=demux '
-        '[dynamic video/x-h264 pad] ! queue max-size-buffers=8 leaky=downstream ! '
+        '[dynamic video/x-h264 pad] ! queue max-size-buffers=8 leaky=downstream ! tee name=video_tee '
+        'video_tee. ! queue max-size-buffers=8 leaky=downstream ! '
         'h264parse config-interval=-1 disable-passthrough=true ! '
         'video/x-h264,stream-format=byte-stream,alignment=au ! '
         'rtph264pay pt={payload_type} config-interval=1 ! '
-        'udpsink host={relay_host} port={relay_port} sync=false async=false'
+        'udpsink host={relay_host} port={relay_port} sync=false async=false '
+        'video_tee. ! queue max-size-buffers=1 leaky=downstream ! '
+        'decodebin ! videoconvert ! video/x-raw,format=RGBA ! '
+        'appsink name=probe_sink max-buffers=1 drop=true sync=false emit-signals=true'
     ).format(
         wfd_client_rtp_port=args.wfd_client_rtp_port,
         payload_type=args.payload_type,
         relay_host=args.relay_host,
         relay_port=args.relay_port,
     )
+
+
+def summarize_rgba_buffer(buffer, caps):
+    if buffer is None or caps is None or caps.get_size() == 0:
+        return None
+
+    structure = caps.get_structure(0)
+    success_width, width = structure.get_int("width")
+    success_height, height = structure.get_int("height")
+    pixel_format = structure.get_string("format")
+    if not success_width or not success_height or width <= 0 or height <= 0:
+        return None
+    if pixel_format != "RGBA":
+        return {
+            "width": width,
+            "height": height,
+            "format": pixel_format,
+            "error": "unexpected-format",
+        }
+
+    success, map_info = buffer.map(Gst.MapFlags.READ)
+    if not success:
+        return {
+            "width": width,
+            "height": height,
+            "format": pixel_format,
+            "error": "map-failed",
+        }
+
+    try:
+        data = map_info.data
+        if len(data) < width * height * 4:
+            return {
+                "width": width,
+                "height": height,
+                "format": pixel_format,
+                "error": "buffer-too-small",
+                "size": len(data),
+            }
+
+        stride = len(data) // height
+        if stride < width * 4:
+            return {
+                "width": width,
+                "height": height,
+                "format": pixel_format,
+                "error": "stride-too-small",
+                "stride": stride,
+            }
+
+        total_red = 0
+        total_green = 0
+        total_blue = 0
+        sampled_pixels = 0
+        step_y = max(1, height // 8)
+        step_x = max(1, width // 8)
+
+        for y in range(0, height, step_y):
+            row_offset = y * stride
+            for x in range(0, width, step_x):
+                offset = row_offset + x * 4
+                total_red += data[offset + 0]
+                total_green += data[offset + 1]
+                total_blue += data[offset + 2]
+                sampled_pixels += 1
+
+        points = []
+        for x, y in ((0, 0), (width // 2, height // 2), (width - 1, height - 1)):
+            offset = y * stride + x * 4
+            points.append((data[offset + 0], data[offset + 1], data[offset + 2], data[offset + 3]))
+
+        return {
+            "width": width,
+            "height": height,
+            "format": pixel_format,
+            "stride": stride,
+            "avg_rgb": (
+                total_red // max(sampled_pixels, 1),
+                total_green // max(sampled_pixels, 1),
+                total_blue // max(sampled_pixels, 1),
+            ),
+            "points": points,
+        }
+    finally:
+        buffer.unmap(map_info)
 
 
 def format_command(argv):
@@ -579,6 +668,7 @@ class RtspRelay:
         self.demux = None
         self.video_queue = None
         self.auxiliary_elements = []
+        self.probe_logged = False
 
     def start(self, source_host, source_ready):
         self.stop()
@@ -664,12 +754,36 @@ class RtspRelay:
         depay = Gst.ElementFactory.make("rtpmp2tdepay", "wfd_rtpmp2tdepay")
         demux = Gst.ElementFactory.make("tsdemux", "wfd_tsdemux")
         video_queue = Gst.ElementFactory.make("queue", "wfd_video_queue")
+        video_tee = Gst.ElementFactory.make("tee", "wfd_video_tee")
+        relay_queue = Gst.ElementFactory.make("queue", "wfd_relay_queue")
         parser = Gst.ElementFactory.make("h264parse", "wfd_h264parse")
         capsfilter = Gst.ElementFactory.make("capsfilter", "wfd_h264_caps")
         pay = Gst.ElementFactory.make("rtph264pay", "wfd_rtph264pay")
         sink = Gst.ElementFactory.make("udpsink", "wfd_udpsink")
+        probe_queue = Gst.ElementFactory.make("queue", "wfd_probe_queue")
+        probe_decodebin = Gst.ElementFactory.make("decodebin", "wfd_probe_decodebin")
+        probe_convert = Gst.ElementFactory.make("videoconvert", "wfd_probe_videoconvert")
+        probe_caps = Gst.ElementFactory.make("capsfilter", "wfd_probe_caps")
+        probe_sink = Gst.ElementFactory.make("appsink", "wfd_probe_sink")
 
-        elements = [udpsrc, source_queue, depay, demux, video_queue, parser, capsfilter, pay, sink]
+        elements = [
+            udpsrc,
+            source_queue,
+            depay,
+            demux,
+            video_queue,
+            video_tee,
+            relay_queue,
+            parser,
+            capsfilter,
+            pay,
+            sink,
+            probe_queue,
+            probe_decodebin,
+            probe_convert,
+            probe_caps,
+            probe_sink,
+        ]
         if any(element is None for element in elements):
             raise RuntimeError("failed to create one or more WFD relay GStreamer elements")
 
@@ -683,6 +797,8 @@ class RtspRelay:
         source_queue.set_property("max-size-buffers", 8)
         video_queue.set_property("max-size-buffers", 8)
         video_queue.set_property("leaky", 2)
+        relay_queue.set_property("max-size-buffers", 8)
+        relay_queue.set_property("leaky", 2)
         parser.set_property("config-interval", -1)
         parser.set_property("disable-passthrough", True)
         capsfilter.set_property(
@@ -695,33 +811,108 @@ class RtspRelay:
         sink.set_property("port", self.args.relay_port)
         sink.set_property("sync", False)
         sink.set_property("async", False)
+        probe_queue.set_property("max-size-buffers", 1)
+        probe_queue.set_property("leaky", 2)
+        probe_caps.set_property("caps", Gst.Caps.from_string("video/x-raw,format=RGBA"))
+        probe_sink.set_property("emit-signals", True)
+        probe_sink.set_property("max-buffers", 1)
+        probe_sink.set_property("drop", True)
+        probe_sink.set_property("sync", False)
 
         pipeline.add(udpsrc)
         pipeline.add(source_queue)
         pipeline.add(depay)
         pipeline.add(demux)
         pipeline.add(video_queue)
+        pipeline.add(video_tee)
+        pipeline.add(relay_queue)
         pipeline.add(parser)
         pipeline.add(capsfilter)
         pipeline.add(pay)
         pipeline.add(sink)
+        pipeline.add(probe_queue)
+        pipeline.add(probe_decodebin)
+        pipeline.add(probe_convert)
+        pipeline.add(probe_caps)
+        pipeline.add(probe_sink)
 
         for upstream, downstream in ((udpsrc, source_queue),
                                      (source_queue, depay),
                                      (depay, demux),
-                                     (video_queue, parser),
+                                     (video_queue, video_tee),
+                                     (relay_queue, parser),
                                      (parser, capsfilter),
                                      (capsfilter, pay),
-                                     (pay, sink)):
+                                     (pay, sink),
+                                     (probe_queue, probe_decodebin),
+                                     (probe_convert, probe_caps),
+                                     (probe_caps, probe_sink)):
             if not upstream.link(downstream):
                 raise RuntimeError(
                     f"failed to link WFD relay element {upstream.get_name()} -> {downstream.get_name()}"
                 )
 
+        relay_pad = video_tee.request_pad_simple("src_%u")
+        probe_pad = video_tee.request_pad_simple("src_%u")
+        relay_sink_pad = relay_queue.get_static_pad("sink")
+        probe_sink_pad = probe_queue.get_static_pad("sink")
+        if relay_pad is None or probe_pad is None or relay_sink_pad is None or probe_sink_pad is None:
+            raise RuntimeError("failed to request tee pads for relay pipeline branches")
+        if relay_pad.link(relay_sink_pad) != Gst.PadLinkReturn.OK:
+            raise RuntimeError("failed to link relay tee branch")
+        if probe_pad.link(probe_sink_pad) != Gst.PadLinkReturn.OK:
+            raise RuntimeError("failed to link probe tee branch")
+
         demux.connect("pad-added", self._on_demux_pad_added, video_queue)
+        probe_decodebin.connect("pad-added", self._on_probe_decodebin_pad_added, probe_convert)
+        probe_sink.connect("new-sample", self._on_probe_sample)
         self.demux = demux
         self.video_queue = video_queue
         return pipeline
+
+    def _on_probe_decodebin_pad_added(self, decodebin, pad, probe_convert):
+        del decodebin
+        sink_pad = probe_convert.get_static_pad("sink")
+        if sink_pad is None or sink_pad.is_linked():
+            return
+        link_result = pad.link(sink_pad)
+        if link_result != Gst.PadLinkReturn.OK:
+            raise RuntimeError(f"failed to link probe decodebin pad: {link_result.value_nick}")
+
+    def _on_probe_sample(self, sink):
+        if self.probe_logged:
+            return Gst.FlowReturn.OK
+
+        sample = sink.emit("pull-sample")
+        if sample is None:
+            return Gst.FlowReturn.ERROR
+
+        try:
+            summary = summarize_rgba_buffer(sample.get_buffer(), sample.get_caps())
+            if summary is None:
+                print("Relay probe frame summary: unavailable", flush=True)
+            elif "error" in summary:
+                print(
+                    "Relay probe frame summary: "
+                    f"{summary.get('width', 0)}x{summary.get('height', 0)} "
+                    f"format={summary.get('format')} error={summary['error']}",
+                    flush=True,
+                )
+            else:
+                p0, p1, p2 = summary["points"]
+                avg_r, avg_g, avg_b = summary["avg_rgb"]
+                print(
+                    "Relay probe frame summary: "
+                    f"{summary['width']}x{summary['height']} "
+                    f"stride={summary['stride']} "
+                    f"avg_rgb=({avg_r},{avg_g},{avg_b}) "
+                    f"p0={p0} p1={p1} p2={p2}",
+                    flush=True,
+                )
+            self.probe_logged = True
+            return Gst.FlowReturn.OK
+        finally:
+            sample.unref()
 
     def _on_demux_pad_added(self, demux, pad, video_queue):
         pipeline = demux.get_parent()
@@ -994,6 +1185,7 @@ class RtspRelay:
         self.demux = None
         self.video_queue = None
         self.auxiliary_elements = []
+        self.probe_logged = False
 
     def _on_message(self, bus, message):
         del bus
