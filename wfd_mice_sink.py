@@ -483,7 +483,7 @@ class ServicePublisher:
         for attempt in range(6):
             candidate = host_name if attempt == 0 else f"{base_host_name}-{random.randint(1000, 9999)}.local"
             address_process = subprocess.Popen(
-                [address_publisher, candidate, host_address],
+                [address_publisher, "--no-reverse", candidate, host_address],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
                 text=True,
