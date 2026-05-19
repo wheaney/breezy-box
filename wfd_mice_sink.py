@@ -400,7 +400,7 @@ def build_relay_pipeline_description(args):
         'queue max-size-buffers=8 ! '
         'application/x-rtp,media=video,encoding-name=MP2T,payload=33,clock-rate=90000 ! '
         'rtpmp2tdepay ! tsdemux name=demux '
-        'demux. ! queue max-size-buffers=8 leaky=downstream ! '
+        '[dynamic video/x-h264 pad] ! queue max-size-buffers=8 leaky=downstream ! '
         'h264parse config-interval=-1 ! '
         'rtph264pay pt={payload_type} config-interval=1 ! '
         'udpsink host={relay_host} port={relay_port} sync=false async=false'
@@ -494,6 +494,8 @@ class RtspRelay:
         self.session_id = None
         self.aggregate_url = None
         self.keepalive_source_id = 0
+        self.demux = None
+        self.video_queue = None
 
     def start(self, source_host, source_ready):
         self.stop()
@@ -524,7 +526,7 @@ class RtspRelay:
                              self.args.rtsp_connect_timeout_sec)
 
         self._bind_rtcp_socket()
-        self.pipeline = Gst.parse_launch(description)
+        self.pipeline = self._build_relay_pipeline()
         self.bus = self.pipeline.get_bus()
         self.bus.add_signal_watch()
         self.bus.connect("message", self._on_message)
@@ -568,6 +570,91 @@ class RtspRelay:
             self.args.rtsp_keepalive_interval_sec,
             self._keepalive,
         )
+
+    def _build_relay_pipeline(self):
+        pipeline = Gst.Pipeline.new("wfd-relay")
+        if pipeline is None:
+            raise RuntimeError("failed to create WFD relay pipeline")
+
+        udpsrc = Gst.ElementFactory.make("udpsrc", "wfd_udpsrc")
+        source_queue = Gst.ElementFactory.make("queue", "wfd_source_queue")
+        depay = Gst.ElementFactory.make("rtpmp2tdepay", "wfd_rtpmp2tdepay")
+        demux = Gst.ElementFactory.make("tsdemux", "wfd_tsdemux")
+        video_queue = Gst.ElementFactory.make("queue", "wfd_video_queue")
+        parser = Gst.ElementFactory.make("h264parse", "wfd_h264parse")
+        pay = Gst.ElementFactory.make("rtph264pay", "wfd_rtph264pay")
+        sink = Gst.ElementFactory.make("udpsink", "wfd_udpsink")
+
+        elements = [udpsrc, source_queue, depay, demux, video_queue, parser, pay, sink]
+        if any(element is None for element in elements):
+            raise RuntimeError("failed to create one or more WFD relay GStreamer elements")
+
+        udpsrc.set_property(
+            "caps",
+            Gst.Caps.from_string(
+                "application/x-rtp,media=video,encoding-name=MP2T,payload=33,clock-rate=90000"
+            ),
+        )
+        udpsrc.set_property("port", self.args.wfd_client_rtp_port)
+        source_queue.set_property("max-size-buffers", 8)
+        video_queue.set_property("max-size-buffers", 8)
+        video_queue.set_property("leaky", 2)
+        parser.set_property("config-interval", -1)
+        pay.set_property("pt", self.args.payload_type)
+        pay.set_property("config-interval", 1)
+        sink.set_property("host", self.args.relay_host)
+        sink.set_property("port", self.args.relay_port)
+        sink.set_property("sync", False)
+        sink.set_property("async", False)
+
+        pipeline.add(udpsrc)
+        pipeline.add(source_queue)
+        pipeline.add(depay)
+        pipeline.add(demux)
+        pipeline.add(video_queue)
+        pipeline.add(parser)
+        pipeline.add(pay)
+        pipeline.add(sink)
+
+        for upstream, downstream in ((udpsrc, source_queue),
+                                     (source_queue, depay),
+                                     (depay, demux),
+                                     (video_queue, parser),
+                                     (parser, pay),
+                                     (pay, sink)):
+            if not upstream.link(downstream):
+                raise RuntimeError(
+                    f"failed to link WFD relay element {upstream.get_name()} -> {downstream.get_name()}"
+                )
+
+        demux.connect("pad-added", self._on_demux_pad_added, video_queue)
+        self.demux = demux
+        self.video_queue = video_queue
+        return pipeline
+
+    def _on_demux_pad_added(self, demux, pad, video_queue):
+        del demux
+        caps = pad.get_current_caps() or pad.query_caps(None)
+        structure_name = None
+        if caps is not None and caps.get_size() > 0:
+            structure_name = caps.get_structure(0).get_name()
+
+        if structure_name != "video/x-h264":
+            if self.args.verbose:
+                print(f"Ignoring demux pad with caps: {caps.to_string() if caps is not None else 'unknown'}", flush=True)
+            return
+
+        sink_pad = video_queue.get_static_pad("sink")
+        if sink_pad is None:
+            raise RuntimeError("failed to look up WFD relay video queue sink pad")
+        if sink_pad.is_linked():
+            return
+
+        link_result = pad.link(sink_pad)
+        if link_result != Gst.PadLinkReturn.OK:
+            raise RuntimeError(f"failed to link tsdemux video pad to relay queue: {link_result.value_nick}")
+        if self.args.verbose:
+            print(f"Linked demux video pad with caps: {caps.to_string() if caps is not None else 'unknown'}", flush=True)
 
     def _describe_with_fallback(self):
         last_error = None
@@ -775,6 +862,8 @@ class RtspRelay:
         self.session_id = None
         self.aggregate_url = None
         self.current_url = None
+        self.demux = None
+        self.video_queue = None
 
     def _on_message(self, bus, message):
         del bus
