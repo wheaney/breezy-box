@@ -128,6 +128,7 @@ struct stream_surface {
     enum stream_input_kind input_kind;
     const char *input_value;
     bool has_dmabuf_frame;
+    bool has_video_frame;
     bool verbose;
     bool logged_first_sample;
 #ifdef BREEZY_HAVE_GSTREAMER
@@ -220,6 +221,17 @@ static bool has_extension(const char *list, const char *extension)
 
         cursor += length;
     }
+}
+
+static uint8_t clamp_u8(int value)
+{
+    if (value < 0) {
+        return 0u;
+    }
+    if (value > 255) {
+        return 255u;
+    }
+    return (uint8_t)value;
 }
 
 static int parse_unsigned_arg(const char *text, unsigned int *out)
@@ -1197,6 +1209,8 @@ static void pump_gst_bus(struct stream_surface *stream, bool verbose)
     }
 }
 
+static void stream_surface_upload(const struct stream_surface *stream);
+
 static void stream_surface_release_sample(struct stream_surface *stream)
 {
     if (stream->gst_sample) {
@@ -1229,7 +1243,7 @@ static int stream_surface_init_gst_pipeline(struct stream_surface *stream,
 {
     static const char *pipeline_suffix =
         " ! queue max-size-buffers=2 leaky=downstream"
-        " ! video/x-raw(memory:DMABuf),format=NV12"
+        " ! video/x-raw,format=NV12"
         " ! appsink name=sink max-buffers=1 drop=true sync=false"
         " enable-last-sample=false wait-on-eos=false";
     char *pipeline_description = NULL;
@@ -1295,6 +1309,64 @@ static int stream_surface_init_gst_pipeline(struct stream_surface *stream,
     return 0;
 }
 
+static bool upload_nv12_sample_cpu(struct stream_surface *stream,
+                                   GstSample *sample,
+                                   const GstVideoInfo *info)
+{
+    GstBuffer *buffer = gst_sample_get_buffer(sample);
+    GstVideoFrame frame;
+    uint32_t width;
+    uint32_t height;
+    uint32_t y;
+
+    if (!buffer) {
+        return false;
+    }
+
+    if (!gst_video_frame_map(&frame, info, buffer, GST_MAP_READ)) {
+        fprintf(stderr, "failed to map NV12 sample for CPU upload\n");
+        return false;
+    }
+
+    width = GST_VIDEO_INFO_WIDTH(info);
+    height = GST_VIDEO_INFO_HEIGHT(info);
+    for (y = 0u; y < height; ++y) {
+        const uint8_t *y_row = (const uint8_t *)GST_VIDEO_FRAME_PLANE_DATA(&frame, 0) +
+                               (ptrdiff_t)y * GST_VIDEO_FRAME_PLANE_STRIDE(&frame, 0);
+        const uint8_t *uv_row = (const uint8_t *)GST_VIDEO_FRAME_PLANE_DATA(&frame, 1) +
+                                (ptrdiff_t)(y / 2u) * GST_VIDEO_FRAME_PLANE_STRIDE(&frame, 1);
+        uint32_t x;
+
+        for (x = 0u; x < width; ++x) {
+            const int y_value = (int)y_row[x] - 16;
+            const int u_value = (int)uv_row[x & ~1u] - 128;
+            const int v_value = (int)uv_row[(x & ~1u) + 1u] - 128;
+            const int c = y_value < 0 ? 0 : y_value;
+            const int red = (298 * c + 409 * v_value + 128) >> 8;
+            const int green = (298 * c - 100 * u_value - 208 * v_value + 128) >> 8;
+            const int blue = (298 * c + 516 * u_value + 128) >> 8;
+            const size_t offset = ((size_t)y * width + x) * 4u;
+
+            stream->pixels[offset + 0u] = clamp_u8(red);
+            stream->pixels[offset + 1u] = clamp_u8(green);
+            stream->pixels[offset + 2u] = clamp_u8(blue);
+            stream->pixels[offset + 3u] = 255u;
+        }
+    }
+
+    gst_video_frame_unmap(&frame);
+    stream_surface_upload(stream);
+    stream_surface_release_sample(stream);
+    stream->gst_sample = sample;
+    stream->gst_video_info = *info;
+    stream->gst_video_info_valid = true;
+    stream->has_dmabuf_frame = false;
+    stream->has_video_frame = true;
+    stream->width = width;
+    stream->height = height;
+    return true;
+}
+
 static bool import_nv12_sample(struct renderer *renderer,
                                struct stream_surface *stream,
                                GstSample *sample)
@@ -1334,7 +1406,7 @@ static bool import_nv12_sample(struct renderer *renderer,
 
     if (!gst_video_info_from_caps(&info, caps) || GST_VIDEO_INFO_FORMAT(&info) != GST_VIDEO_FORMAT_NV12) {
         if (!stream->warned_bad_caps) {
-            fprintf(stderr, "stream pipeline must output NV12 video/x-raw(memory:DMABuf) buffers\n");
+            fprintf(stderr, "stream pipeline must output NV12 video/x-raw buffers\n");
             stream->warned_bad_caps = true;
         }
         return false;
@@ -1344,12 +1416,13 @@ static bool import_nv12_sample(struct renderer *renderer,
     mem0 = gst_buffer_peek_memory(buffer, 0u);
     mem1 = gst_buffer_n_memory(buffer) > 1u ? gst_buffer_peek_memory(buffer, 1u) : mem0;
 
-    if (!mem0 || !mem1 || !gst_is_dmabuf_memory(mem0) || !gst_is_dmabuf_memory(mem1)) {
+    if (!renderer->dmabuf_import_supported ||
+        !mem0 || !mem1 || !gst_is_dmabuf_memory(mem0) || !gst_is_dmabuf_memory(mem1)) {
         if (!stream->warned_bad_memory) {
-            fprintf(stderr, "stream pipeline did not produce DMABuf-backed NV12 planes\n");
+            fprintf(stderr, "stream pipeline did not produce DMABuf-backed NV12 planes; falling back to CPU upload\n");
             stream->warned_bad_memory = true;
         }
-        return false;
+        return upload_nv12_sample_cpu(stream, sample, &info);
     }
 
     fd0 = dup(gst_dmabuf_memory_get_fd(mem0));
@@ -1421,6 +1494,7 @@ static bool import_nv12_sample(struct renderer *renderer,
     stream->gst_video_info = info;
     stream->gst_video_info_valid = true;
     stream->has_dmabuf_frame = true;
+    stream->has_video_frame = true;
     stream->width = GST_VIDEO_INFO_WIDTH(&info);
     stream->height = GST_VIDEO_INFO_HEIGHT(&info);
     return true;
@@ -1608,7 +1682,7 @@ static void stream_surface_refresh(struct renderer *renderer,
     (void)opts;
 #endif
 
-    if (!stream->has_dmabuf_frame) {
+    if (!stream->has_video_frame) {
         stream_surface_update_pixels(stream, stream_index, scene_time);
         stream_surface_upload(stream);
     }
