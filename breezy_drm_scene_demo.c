@@ -1370,6 +1370,9 @@ static bool upload_nv12_sample_cpu(struct stream_surface *stream,
         return false;
     }
 
+    stream->width = width;
+    stream->height = height;
+
     for (y = 0u; y < height; ++y) {
         const uint8_t *y_row = (const uint8_t *)GST_VIDEO_FRAME_PLANE_DATA(&frame, 0) +
                                (ptrdiff_t)y * GST_VIDEO_FRAME_PLANE_STRIDE(&frame, 0);
@@ -1401,8 +1404,6 @@ static bool upload_nv12_sample_cpu(struct stream_surface *stream,
     stream->gst_video_info_valid = true;
     stream->has_dmabuf_frame = false;
     stream->has_video_frame = true;
-    stream->width = width;
-    stream->height = height;
     return true;
 }
 
@@ -1432,6 +1433,9 @@ static bool import_rgba_sample(struct stream_surface *stream,
         return false;
     }
 
+    stream->width = width;
+    stream->height = height;
+
     for (y = 0u; y < height; ++y) {
         memcpy(stream->pixels + (size_t)y * width * 4u,
                (const uint8_t *)GST_VIDEO_FRAME_PLANE_DATA(&frame, 0) +
@@ -1447,8 +1451,6 @@ static bool import_rgba_sample(struct stream_surface *stream,
     stream->gst_video_info_valid = true;
     stream->has_dmabuf_frame = false;
     stream->has_video_frame = true;
-    stream->width = width;
-    stream->height = height;
     return true;
 }
 
