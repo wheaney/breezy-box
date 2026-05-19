@@ -32,6 +32,7 @@ DEFAULT_RTSP_PATH = "/wfd1.0/streamid=0"
 DEFAULT_RTSP_READY_TIMEOUT_SEC = 30.0
 DEFAULT_RTSP_CONNECT_TIMEOUT_SEC = 0.75
 DEFAULT_RTSP_SOCKET_TIMEOUT_SEC = 5.0
+DEFAULT_RTSP_POST_PLAY_DRAIN_SEC = 2.0
 DEFAULT_RTSP_KEEPALIVE_INTERVAL_SEC = 15
 DEFAULT_WFD_CLIENT_RTP_PORT = 16384
 DEFAULT_RELAY_HOST = "127.0.0.1"
@@ -776,6 +777,8 @@ class RtspRelay:
             headers={"Content-Type": "text/parameters"},
             body=build_wfd_trigger("PLAY"),
         )
+
+        self._drain_server_requests(DEFAULT_RTSP_POST_PLAY_DRAIN_SEC)
         self.keepalive_source_id = GLib.timeout_add_seconds(
             self.args.rtsp_keepalive_interval_sec,
             self._keepalive,
@@ -1064,6 +1067,36 @@ class RtspRelay:
             raise RtspSessionError("RTSP control socket is not connected")
         self.control_socket.sendall(payload)
 
+    def _drain_server_requests(self, wait_timeout_sec):
+        if self.control_socket is None or self.control_reader is None or wait_timeout_sec <= 0:
+            return
+
+        deadline = time.monotonic() + wait_timeout_sec
+        original_timeout = self.control_socket.gettimeout()
+
+        try:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+
+                self.control_socket.settimeout(remaining)
+                try:
+                    first_line, headers, body = self._read_message()
+                except socket.timeout:
+                    break
+
+                if first_line.startswith("RTSP/"):
+                    if self.args.verbose:
+                        print(f"RTSP unsolicited status line: {first_line}", flush=True)
+                    continue
+
+                self._handle_server_request(first_line, headers, body)
+        finally:
+            self.control_socket.settimeout(
+                DEFAULT_RTSP_SOCKET_TIMEOUT_SEC if original_timeout is None else original_timeout
+            )
+
     def _request_expect_ok(self, method, uri, headers=None, body=b""):
         response = self._send_request(method, uri, headers=headers, body=body)
         if self.args.verbose:
@@ -1116,7 +1149,7 @@ class RtspRelay:
                                     headers=headers,
                                     body=body)
 
-            self._handle_server_request(first_line, headers)
+            self._handle_server_request(first_line, headers, body)
 
     def _read_message(self):
         if self.control_reader is None:
@@ -1145,7 +1178,7 @@ class RtspRelay:
 
         return first_line, headers, body
 
-    def _handle_server_request(self, first_line, headers):
+    def _handle_server_request(self, first_line, headers, body):
         parts = first_line.split(" ", 2)
         if len(parts) < 3:
             raise RtspSessionError(f"malformed RTSP request line: {first_line!r}")
@@ -1153,12 +1186,22 @@ class RtspRelay:
         method = parts[0]
         if self.args.verbose:
             print(f"RTSP server request: {first_line}", flush=True)
+            if headers:
+                print(f"RTSP server request headers: {headers}", flush=True)
+            if body:
+                print(
+                    "RTSP server request body: "
+                    f"{body.decode('utf-8', errors='replace').rstrip()}",
+                    flush=True,
+                )
 
         response_headers = {}
         if method == "OPTIONS":
             response_headers["Public"] = "OPTIONS, DESCRIBE, SETUP, PLAY, PAUSE, TEARDOWN, GET_PARAMETER, SET_PARAMETER"
         elif method == "GET_PARAMETER":
             response_headers["Content-Type"] = "text/parameters"
+        elif method == "SET_PARAMETER":
+            response_headers["Content-Type"] = rtsp_header_value(headers, "content-type", "text/parameters")
 
         self._send_server_response(headers, 200, "OK", response_headers)
 
