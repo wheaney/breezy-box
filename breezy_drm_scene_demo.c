@@ -190,7 +190,8 @@ static void usage(const char *argv0)
             "  --stream-width <pixels>  Width of each demo texture (default: %u)\n"
             "  --stream-height <pixels> Height of each demo texture (default: %u)\n"
             "  --stream-pipeline <gst>  Repeated GStreamer pipeline fragments that\n"
-            "                           decode to video/x-raw(memory:DMABuf),format=NV12\n"
+            "                           decode to raw video; the renderer converts the\n"
+            "                           final sink input to RGBA before upload\n"
             "  --frames <count>         Exit after rendering N frames (default: run until SIGINT)\n"
             "  --verbose                Print selected mode and renderer info\n"
             "  -h, --help               Show this help text\n",
@@ -1278,7 +1279,8 @@ static int stream_surface_init_gst_pipeline(struct stream_surface *stream,
 {
     static const char *pipeline_suffix =
         " ! queue max-size-buffers=2 leaky=downstream"
-        " ! video/x-raw,format=(string){ NV12, RGBA }"
+        " ! videoconvert"
+        " ! video/x-raw,format=(string)RGBA"
         " ! appsink name=sink max-buffers=1 drop=true sync=false"
         " enable-last-sample=false wait-on-eos=false";
     char *pipeline_description = NULL;
