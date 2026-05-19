@@ -1278,7 +1278,7 @@ static int stream_surface_init_gst_pipeline(struct stream_surface *stream,
 {
     static const char *pipeline_suffix =
         " ! queue max-size-buffers=2 leaky=downstream"
-        " ! video/x-raw,format=NV12"
+        " ! video/x-raw,format=(string){ NV12, RGBA }"
         " ! appsink name=sink max-buffers=1 drop=true sync=false"
         " enable-last-sample=false wait-on-eos=false";
     char *pipeline_description = NULL;
@@ -1406,6 +1406,52 @@ static bool upload_nv12_sample_cpu(struct stream_surface *stream,
     return true;
 }
 
+static bool import_rgba_sample(struct stream_surface *stream,
+                               GstSample *sample,
+                               const GstVideoInfo *info)
+{
+    GstBuffer *buffer = gst_sample_get_buffer(sample);
+    GstVideoFrame frame;
+    uint32_t width;
+    uint32_t height;
+    uint32_t y;
+
+    if (!buffer) {
+        return false;
+    }
+
+    if (!gst_video_frame_map(&frame, info, buffer, GST_MAP_READ)) {
+        fprintf(stderr, "failed to map RGBA sample for CPU upload\n");
+        return false;
+    }
+
+    width = GST_VIDEO_INFO_WIDTH(info);
+    height = GST_VIDEO_INFO_HEIGHT(info);
+    if (!stream_surface_ensure_rgba_storage(stream, width, height)) {
+        gst_video_frame_unmap(&frame);
+        return false;
+    }
+
+    for (y = 0u; y < height; ++y) {
+        memcpy(stream->pixels + (size_t)y * width * 4u,
+               (const uint8_t *)GST_VIDEO_FRAME_PLANE_DATA(&frame, 0) +
+               (ptrdiff_t)y * GST_VIDEO_FRAME_PLANE_STRIDE(&frame, 0),
+               (size_t)width * 4u);
+    }
+
+    gst_video_frame_unmap(&frame);
+    stream_surface_upload(stream);
+    stream_surface_release_sample(stream);
+    stream->gst_sample = sample;
+    stream->gst_video_info = *info;
+    stream->gst_video_info_valid = true;
+    stream->has_dmabuf_frame = false;
+    stream->has_video_frame = true;
+    stream->width = width;
+    stream->height = height;
+    return true;
+}
+
 static bool import_nv12_sample(struct renderer *renderer,
                                struct stream_surface *stream,
                                GstSample *sample)
@@ -1443,9 +1489,21 @@ static bool import_nv12_sample(struct renderer *renderer,
         return false;
     }
 
-    if (!gst_video_info_from_caps(&info, caps) || GST_VIDEO_INFO_FORMAT(&info) != GST_VIDEO_FORMAT_NV12) {
+    if (!gst_video_info_from_caps(&info, caps)) {
         if (!stream->warned_bad_caps) {
-            fprintf(stderr, "stream pipeline must output NV12 video/x-raw buffers\n");
+            fprintf(stderr, "stream pipeline must output supported video/x-raw buffers\n");
+            stream->warned_bad_caps = true;
+        }
+        return false;
+    }
+
+    if (GST_VIDEO_INFO_FORMAT(&info) == GST_VIDEO_FORMAT_RGBA) {
+        return import_rgba_sample(stream, sample, &info);
+    }
+
+    if (GST_VIDEO_INFO_FORMAT(&info) != GST_VIDEO_FORMAT_NV12) {
+        if (!stream->warned_bad_caps) {
+            fprintf(stderr, "stream pipeline must output NV12 or RGBA video/x-raw buffers\n");
             stream->warned_bad_caps = true;
         }
         return false;

@@ -214,7 +214,7 @@ Host firewall note:
 * GNOME Network Displays' upstream firewalld integration explicitly expects the source-side RTSP server to be reachable on TCP port `7236`.
 * If the host has UFW, firewalld, or another inbound firewall policy enabled, allow TCP `7236` from the SBC to the host or the WFD bridge will fail before the RTSP session starts.
 
-The relay bridge converts the WFD RTSP session into a local H.264 RTP stream for the renderer. The default renderer fragment for this path is `decodebin`, which gives the board a compatibility-first H.264 decode path while still allowing you to override it with a specific hardware decoder if you know the target image supports one.
+The relay bridge converts the WFD RTSP session into a local H.264 RTP stream for the renderer. The default renderer fragment for this path is `decodebin ! videoconvert`, which gives the board a compatibility-first H.264 decode path and a CPU-converted raw fallback while still allowing you to override it with a specific hardware decoder if you know the target image supports one.
 
 If you want to force a specific decoder, typical H.264 candidates on Rockchip are `mppvideodec` or a stateless V4L2 decoder such as `v4l2slh264dec`.
 
