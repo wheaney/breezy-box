@@ -333,6 +333,18 @@ def resolve_rtsp_control_url(base_url, response_headers, sdp_text):
     return resolve_rtsp_url(content_base, "streamid=0")
 
 
+def build_wfd_parameters(presentation_url, client_rtp_port):
+    lines = [
+        "wfd_video_formats: 30 00 02 02 00017380 00000000 00000000 00 0000 0000 00 none none",
+        "wfd_audio_codecs: AAC 00000001 00",
+        "wfd_3d_video_formats: none",
+        "wfd_content_protection: none",
+        f"wfd_client_rtp_ports: RTP/AVP/UDP;unicast {client_rtp_port} 0 mode=play",
+        f"wfd_presentation_URL: {presentation_url} none",
+    ]
+    return ("\r\n".join(lines) + "\r\n").encode("utf-8")
+
+
 def wait_for_tcp_endpoint(host, port, ready_timeout_sec, connect_timeout_sec):
     deadline = time.monotonic() + ready_timeout_sec
     last_error = None
@@ -735,6 +747,13 @@ class RtspRelay:
         self.session_id = session_header.split(";", 1)[0].strip()
 
         self._request_expect_ok(
+            "SET_PARAMETER",
+            self.aggregate_url,
+            headers={"Content-Type": "text/parameters"},
+            body=build_wfd_parameters(control_url, self.args.wfd_client_rtp_port),
+        )
+
+        self._request_expect_ok(
             "PLAY",
             self.aggregate_url,
             headers={"Range": "npt=0.000-"},
@@ -887,32 +906,29 @@ class RtspRelay:
         if sample is None:
             return Gst.FlowReturn.ERROR
 
-        try:
-            summary = summarize_rgba_buffer(sample.get_buffer(), sample.get_caps())
-            if summary is None:
-                print("Relay probe frame summary: unavailable", flush=True)
-            elif "error" in summary:
-                print(
-                    "Relay probe frame summary: "
-                    f"{summary.get('width', 0)}x{summary.get('height', 0)} "
-                    f"format={summary.get('format')} error={summary['error']}",
-                    flush=True,
-                )
-            else:
-                p0, p1, p2 = summary["points"]
-                avg_r, avg_g, avg_b = summary["avg_rgb"]
-                print(
-                    "Relay probe frame summary: "
-                    f"{summary['width']}x{summary['height']} "
-                    f"stride={summary['stride']} "
-                    f"avg_rgb=({avg_r},{avg_g},{avg_b}) "
-                    f"p0={p0} p1={p1} p2={p2}",
-                    flush=True,
-                )
-            self.probe_logged = True
-            return Gst.FlowReturn.OK
-        finally:
-            sample.unref()
+        summary = summarize_rgba_buffer(sample.get_buffer(), sample.get_caps())
+        if summary is None:
+            print("Relay probe frame summary: unavailable", flush=True)
+        elif "error" in summary:
+            print(
+                "Relay probe frame summary: "
+                f"{summary.get('width', 0)}x{summary.get('height', 0)} "
+                f"format={summary.get('format')} error={summary['error']}",
+                flush=True,
+            )
+        else:
+            p0, p1, p2 = summary["points"]
+            avg_r, avg_g, avg_b = summary["avg_rgb"]
+            print(
+                "Relay probe frame summary: "
+                f"{summary['width']}x{summary['height']} "
+                f"stride={summary['stride']} "
+                f"avg_rgb=({avg_r},{avg_g},{avg_b}) "
+                f"p0={p0} p1={p1} p2={p2}",
+                flush=True,
+            )
+        self.probe_logged = True
+        return Gst.FlowReturn.OK
 
     def _on_demux_pad_added(self, demux, pad, video_queue):
         pipeline = demux.get_parent()
