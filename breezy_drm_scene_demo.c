@@ -1247,6 +1247,67 @@ static bool stream_surface_ensure_rgba_storage(struct stream_surface *stream,
     return true;
 }
 
+static void log_rgba_frame_summary(const struct stream_surface *stream,
+                                   const GstVideoFrame *frame,
+                                   uint32_t width,
+                                   uint32_t height)
+{
+    const uint8_t *plane;
+    const uint32_t sample_points[][2] = {
+        {0u, 0u},
+        {width / 2u, height / 2u},
+        {width > 0u ? width - 1u : 0u, height > 0u ? height - 1u : 0u},
+    };
+    unsigned int index;
+    uint64_t total_red = 0u;
+    uint64_t total_green = 0u;
+    uint64_t total_blue = 0u;
+    uint32_t sampled_pixels = 0u;
+
+    if (!stream->verbose || width == 0u || height == 0u) {
+        return;
+    }
+
+    plane = (const uint8_t *)GST_VIDEO_FRAME_PLANE_DATA(frame, 0);
+    for (uint32_t y = 0u; y < height; y += height >= 8u ? height / 8u : 1u) {
+        const uint8_t *row = plane + (ptrdiff_t)y * GST_VIDEO_FRAME_PLANE_STRIDE(frame, 0);
+
+        for (uint32_t x = 0u; x < width; x += width >= 8u ? width / 8u : 1u) {
+            const uint8_t *pixel = row + (size_t)x * 4u;
+
+            total_red += pixel[0];
+            total_green += pixel[1];
+            total_blue += pixel[2];
+            sampled_pixels += 1u;
+        }
+    }
+
+    printf("RGBA frame summary: %ux%u stride=%d avg_rgb=(%u,%u,%u)",
+           width,
+           height,
+           GST_VIDEO_FRAME_PLANE_STRIDE(frame, 0),
+           sampled_pixels ? (unsigned int)(total_red / sampled_pixels) : 0u,
+           sampled_pixels ? (unsigned int)(total_green / sampled_pixels) : 0u,
+           sampled_pixels ? (unsigned int)(total_blue / sampled_pixels) : 0u);
+
+    for (index = 0u; index < ARRAY_SIZE(sample_points); ++index) {
+        const uint32_t x = sample_points[index][0];
+        const uint32_t y = sample_points[index][1];
+        const uint8_t *pixel = plane +
+                               (ptrdiff_t)y * GST_VIDEO_FRAME_PLANE_STRIDE(frame, 0) +
+                               (size_t)x * 4u;
+
+        printf(" p%u=(%u,%u,%u,%u)",
+               index,
+               pixel[0],
+               pixel[1],
+               pixel[2],
+               pixel[3]);
+    }
+
+    printf("\n");
+}
+
 static void stream_surface_release_sample(struct stream_surface *stream)
 {
     if (stream->gst_sample) {
@@ -1443,6 +1504,10 @@ static bool import_rgba_sample(struct stream_surface *stream,
                (const uint8_t *)GST_VIDEO_FRAME_PLANE_DATA(&frame, 0) +
                (ptrdiff_t)y * GST_VIDEO_FRAME_PLANE_STRIDE(&frame, 0),
                (size_t)width * 4u);
+    }
+
+    if (!stream->has_video_frame) {
+        log_rgba_frame_summary(stream, &frame, width, height);
     }
 
     gst_video_frame_unmap(&frame);
