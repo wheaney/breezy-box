@@ -148,10 +148,11 @@ def derive_local_admin_mac(seed_text):
     return ":".join(f"{value:02X}" for value in octets)
 
 
-def build_service_host_name(service_name, bind_host=None):
+def build_service_host_name(service_name, bind_host=None, p2p_mac=None):
     label = re.sub(r"[^a-z0-9-]+", "-", service_name.lower()).strip("-")
     if not label:
         label = "breezy-box"
+    label = label[:20].rstrip("-") or "breezy-box"
     if bind_host:
         try:
             ip_obj = ipaddress.ip_address(bind_host)
@@ -161,6 +162,10 @@ def build_service_host_name(service_name, bind_host=None):
                 label = f"{label}-{str(ip_obj).replace(':', '-')[:24].strip('-')}"
         except ValueError:
             pass
+    if p2p_mac:
+        mac_suffix = p2p_mac.replace(":", "").lower()[-6:]
+        label = f"{label}-{mac_suffix}"
+    label = f"{label}-{os.getpid()}"
     return f"{label}.local"
 
 
@@ -1131,7 +1136,11 @@ def parse_args(argv):
         args.p2p_mac_resolved = choose_p2p_mac(args)
         args.bind_host = resolve_bind_host(args)
         if not args.service_host_name:
-            args.service_host_name = build_service_host_name(args.service_name, args.bind_host)
+            args.service_host_name = build_service_host_name(
+                args.service_name,
+                args.bind_host,
+                args.p2p_mac_resolved,
+            )
     except Exception as exc:
         parser.error(str(exc))
 
