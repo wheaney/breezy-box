@@ -1378,13 +1378,12 @@ static bool upload_nv12_sample_cpu(struct stream_surface *stream,
         uint32_t x;
 
         for (x = 0u; x < width; ++x) {
-            const int y_value = (int)y_row[x] - 16;
+            const int y_value = (int)y_row[x];
             const int u_value = (int)uv_row[x & ~1u] - 128;
             const int v_value = (int)uv_row[(x & ~1u) + 1u] - 128;
-            const int c = y_value < 0 ? 0 : y_value;
-            const int red = (298 * c + 409 * v_value + 128) >> 8;
-            const int green = (298 * c - 100 * u_value - 208 * v_value + 128) >> 8;
-            const int blue = (298 * c + 516 * u_value + 128) >> 8;
+            const int red = y_value + ((359 * v_value) >> 8);
+            const int green = y_value - ((88 * u_value + 183 * v_value) >> 8);
+            const int blue = y_value + ((454 * u_value) >> 8);
             const size_t offset = ((size_t)y * width + x) * 4u;
 
             stream->pixels[offset + 0u] = clamp_u8(red);
