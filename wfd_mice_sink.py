@@ -382,15 +382,13 @@ def wait_for_tcp_endpoint(host, port, ready_timeout_sec, connect_timeout_sec):
 def build_renderer_pipeline(args):
     return (
         'udpsrc address={relay_host} port={relay_port} '
-        'caps="application/x-rtp,media=video,encoding-name=H264,payload={payload_type},clock-rate=90000" '
-        '! rtph264depay '
+        'caps="video/x-h264,stream-format=byte-stream,alignment=au" '
         '! h264parse disable-passthrough=true '
         '! video/x-h264,stream-format=byte-stream,alignment=au '
         '! {decoder_fragment}'
     ).format(
         relay_host=args.relay_host,
         relay_port=args.relay_port,
-        payload_type=args.payload_type,
         decoder_fragment=args.renderer_decoder_fragment,
     )
 
@@ -426,12 +424,11 @@ def build_relay_pipeline_description(args):
         'application/x-rtp,media=video,encoding-name=MP2T,payload=33,clock-rate=90000 ! '
         'rtpmp2tdepay ! tsdemux name=demux '
         '[dynamic video/x-h264 pad] ! queue max-size-buffers=8 leaky=downstream ! '
-        'h264parse config-interval=-1 ! '
-        'rtph264pay pt={payload_type} config-interval=1 ! '
+        'h264parse config-interval=-1 disable-passthrough=true ! '
+        'video/x-h264,stream-format=byte-stream,alignment=au ! '
         'udpsink host={relay_host} port={relay_port} sync=false async=false'
     ).format(
         wfd_client_rtp_port=args.wfd_client_rtp_port,
-        payload_type=args.payload_type,
         relay_host=args.relay_host,
         relay_port=args.relay_port,
     )
@@ -658,10 +655,10 @@ class RtspRelay:
         demux = Gst.ElementFactory.make("tsdemux", "wfd_tsdemux")
         video_queue = Gst.ElementFactory.make("queue", "wfd_video_queue")
         parser = Gst.ElementFactory.make("h264parse", "wfd_h264parse")
-        pay = Gst.ElementFactory.make("rtph264pay", "wfd_rtph264pay")
+        capsfilter = Gst.ElementFactory.make("capsfilter", "wfd_h264_caps")
         sink = Gst.ElementFactory.make("udpsink", "wfd_udpsink")
 
-        elements = [udpsrc, source_queue, depay, demux, video_queue, parser, pay, sink]
+        elements = [udpsrc, source_queue, depay, demux, video_queue, parser, capsfilter, sink]
         if any(element is None for element in elements):
             raise RuntimeError("failed to create one or more WFD relay GStreamer elements")
 
@@ -676,8 +673,11 @@ class RtspRelay:
         video_queue.set_property("max-size-buffers", 8)
         video_queue.set_property("leaky", 2)
         parser.set_property("config-interval", -1)
-        pay.set_property("pt", self.args.payload_type)
-        pay.set_property("config-interval", 1)
+        parser.set_property("disable-passthrough", True)
+        capsfilter.set_property(
+            "caps",
+            Gst.Caps.from_string("video/x-h264,stream-format=byte-stream,alignment=au"),
+        )
         sink.set_property("host", self.args.relay_host)
         sink.set_property("port", self.args.relay_port)
         sink.set_property("sync", False)
@@ -689,15 +689,15 @@ class RtspRelay:
         pipeline.add(demux)
         pipeline.add(video_queue)
         pipeline.add(parser)
-        pipeline.add(pay)
+        pipeline.add(capsfilter)
         pipeline.add(sink)
 
         for upstream, downstream in ((udpsrc, source_queue),
                                      (source_queue, depay),
                                      (depay, demux),
                                      (video_queue, parser),
-                                     (parser, pay),
-                                     (pay, sink)):
+                                     (parser, capsfilter),
+                                     (capsfilter, sink)):
             if not upstream.link(downstream):
                 raise RuntimeError(
                     f"failed to link WFD relay element {upstream.get_name()} -> {downstream.get_name()}"
@@ -1148,8 +1148,8 @@ def run_self_test(args):
         raise AssertionError(f"unexpected source id {parsed.source_id!r}")
 
     renderer_pipeline = build_renderer_pipeline(args)
-    if "rtph264depay" not in renderer_pipeline:
-        raise AssertionError("renderer pipeline did not include rtph264depay")
+    if "video/x-h264,stream-format=byte-stream,alignment=au" not in renderer_pipeline:
+        raise AssertionError("renderer pipeline did not force byte-stream H.264 for the local relay")
 
     relay_pipeline = build_relay_pipeline_description(args)
     if "udpsrc" not in relay_pipeline or "rtpmp2tdepay" not in relay_pipeline:

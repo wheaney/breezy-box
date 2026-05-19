@@ -196,13 +196,13 @@ That command does three things:
 
 * publishes a discoverable `_display._tcp` sink with `p2pMAC=<usb0-mac>`,
 * listens for MICE `SOURCE_READY` on TCP `7250`,
-* auto-launches `breezy_drm_scene_demo` with a static local relay pipeline on `127.0.0.1:5600`.
+* auto-launches `breezy_drm_scene_demo` with a static local H.264 relay pipeline on `127.0.0.1:5600`.
 
 If you prefer to launch the renderer yourself, omit `--launch-renderer`. The helper prints the exact renderer command it expects.
 
 The discoverable network-display endpoint is `wfd_mice_sink.py` itself. Running `breezy_drm_scene_demo` directly does not advertise `_display._tcp`, does not listen for MICE `SOURCE_READY`, and will never show up in GNOME Network Displays or Windows by itself.
 
-For the WFD-MICE path, do not substitute the manual H.265 examples from the next section. The bridge relays WFD into a local H.264 RTP stream for the renderer, so if you launch the renderer yourself, use the exact command printed by `wfd_mice_sink.py`.
+For the WFD-MICE path, do not substitute the manual H.265 examples from the next section. The bridge relays WFD into a local H.264 byte-stream over UDP for the renderer, so if you launch the renderer yourself, use the exact command printed by `wfd_mice_sink.py`.
 
 Once that helper is running:
 
@@ -214,7 +214,7 @@ Host firewall note:
 * GNOME Network Displays' upstream firewalld integration explicitly expects the source-side RTSP server to be reachable on TCP port `7236`.
 * If the host has UFW, firewalld, or another inbound firewall policy enabled, allow TCP `7236` from the SBC to the host or the WFD bridge will fail before the RTSP session starts.
 
-The relay bridge converts the WFD RTSP session into local H.264 RTP for the renderer. Because of that, the decoder fragment for the standards-based path should be an H.264 decoder such as `mppvideodec` or a stateless V4L2 H.264 decoder.
+The relay bridge converts the WFD RTSP session into a local H.264 byte-stream over UDP for the renderer. Because of that, the decoder fragment for the standards-based path should be an H.264 decoder such as `mppvideodec` or a stateless V4L2 H.264 decoder.
 
 Internally, the helper now drives the source with a minimal RTSP `OPTIONS` / `DESCRIBE` / `SETUP` / `PLAY` exchange and receives the WFD media on fixed local RTP/RTCP ports (default `16384/16385`) before repayloading the H.264 elementary stream to the renderer's local relay port.
 
