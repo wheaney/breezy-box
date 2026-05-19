@@ -501,23 +501,7 @@ class RtspRelay:
         self.current_source_ready = source_ready
         self.path_candidates = build_rtsp_path_candidates(self.args.rtsp_path)
 
-        for index, rtsp_path in enumerate(self.path_candidates):
-            self.path_index = index
-            try:
-                self._start_current_candidate(rtsp_path)
-                return
-            except RtspStatusError as exc:
-                failed_url = self.current_url
-                self.stop()
-                if exc.status_code == 404 and index + 1 < len(self.path_candidates):
-                    next_url = build_rtsp_url(self.current_source_host,
-                                              self.current_source_ready.rtsp_port,
-                                              self.path_candidates[index + 1])
-                    LOGGER.warning("RTSP path %s returned 404; retrying with %s", failed_url, next_url)
-                    continue
-                raise
-
-        raise RtspSessionError("exhausted RTSP path candidates without establishing a session")
+        self._start_current_candidate(self.path_candidates[0])
 
     def _start_current_candidate(self, rtsp_path):
         description = build_relay_pipeline_description(self.args)
@@ -555,12 +539,7 @@ class RtspRelay:
         self.current_url = next_url
 
         self._request_expect_ok("OPTIONS", next_url)
-
-        describe_response = self._request_expect_ok(
-            "DESCRIBE",
-            next_url,
-            headers={"Accept": "application/sdp"},
-        )
+        describe_response = self._describe_with_fallback()
         sdp_text = describe_response.body.decode("utf-8", errors="replace")
         self.aggregate_url = rtsp_header_value(describe_response.headers, "content-base", next_url)
         control_url = resolve_rtsp_control_url(self.aggregate_url, describe_response.headers, sdp_text)
@@ -589,6 +568,39 @@ class RtspRelay:
             self.args.rtsp_keepalive_interval_sec,
             self._keepalive,
         )
+
+    def _describe_with_fallback(self):
+        last_error = None
+        for index, rtsp_path in enumerate(self.path_candidates[self.path_index:], start=self.path_index):
+            describe_url = build_rtsp_url(
+                self.current_source_host,
+                self.current_source_ready.rtsp_port,
+                rtsp_path,
+            )
+            self.path_index = index
+            self.current_url = describe_url
+            self.aggregate_url = describe_url
+            try:
+                return self._request_expect_ok(
+                    "DESCRIBE",
+                    describe_url,
+                    headers={"Accept": "application/sdp"},
+                )
+            except RtspStatusError as exc:
+                last_error = exc
+                if exc.status_code == 404 and index + 1 < len(self.path_candidates):
+                    next_url = build_rtsp_url(
+                        self.current_source_host,
+                        self.current_source_ready.rtsp_port,
+                        self.path_candidates[index + 1],
+                    )
+                    LOGGER.warning("RTSP path %s returned 404; retrying with %s", describe_url, next_url)
+                    continue
+                raise
+
+        if last_error is not None:
+            raise last_error
+        raise RtspSessionError("no RTSP path candidates available for DESCRIBE")
 
     def _bind_rtcp_socket(self):
         self.rtcp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
