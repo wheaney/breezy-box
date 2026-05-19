@@ -162,6 +162,14 @@ sudo ip link set usb0 up
 sudo ip addr add 192.168.2.2/24 dev usb0
 ```
 
+If you just want the current recommended SBC-side reboot recovery path in one command, use:
+
+```sh
+sudo ./start_wfd_usb_sink.sh --verbose
+```
+
+That helper runs the gadget setup, brings `usb0` up, assigns `192.168.2.2/24`, and launches `wfd_mice_sink.py` with the current recommended defaults.
+
 On the host, assign the other side of the point-to-point link:
 
 ```sh
@@ -190,6 +198,12 @@ python3 ./wfd_mice_sink.py \
 	--launch-renderer \
 	--renderer-device /dev/dri/card0 \
 	--renderer-decoder-fragment decodebin
+```
+
+Equivalent one-shot helper on the SBC:
+
+```sh
+sudo ./start_wfd_usb_sink.sh --verbose
 ```
 
 That command does three things:
