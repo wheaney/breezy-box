@@ -345,6 +345,10 @@ def build_wfd_parameters(presentation_url, client_rtp_port):
     return ("\r\n".join(lines) + "\r\n").encode("utf-8")
 
 
+def build_wfd_trigger(trigger_method):
+    return f"wfd_trigger_method: {trigger_method}\r\n".encode("utf-8")
+
+
 def wait_for_tcp_endpoint(host, port, ready_timeout_sec, connect_timeout_sec):
     deadline = time.monotonic() + ready_timeout_sec
     last_error = None
@@ -754,9 +758,23 @@ class RtspRelay:
         )
 
         self._request_expect_ok(
+            "SET_PARAMETER",
+            self.aggregate_url,
+            headers={"Content-Type": "text/parameters"},
+            body=build_wfd_trigger("SETUP"),
+        )
+
+        self._request_expect_ok(
             "PLAY",
             self.aggregate_url,
             headers={"Range": "npt=0.000-"},
+        )
+
+        self._request_expect_ok(
+            "SET_PARAMETER",
+            self.aggregate_url,
+            headers={"Content-Type": "text/parameters"},
+            body=build_wfd_trigger("PLAY"),
         )
         self.keepalive_source_id = GLib.timeout_add_seconds(
             self.args.rtsp_keepalive_interval_sec,
