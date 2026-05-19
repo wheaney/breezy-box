@@ -383,7 +383,10 @@ def build_renderer_pipeline(args):
     return (
         'udpsrc address={relay_host} port={relay_port} '
         'caps="application/x-rtp,media=video,encoding-name=H264,payload={payload_type},clock-rate=90000" '
-        '! rtph264depay ! h264parse ! {decoder_fragment}'
+        '! rtph264depay '
+        '! h264parse disable-passthrough=true '
+        '! video/x-h264,stream-format=byte-stream,alignment=au '
+        '! {decoder_fragment}'
     ).format(
         relay_host=args.relay_host,
         relay_port=args.relay_port,
