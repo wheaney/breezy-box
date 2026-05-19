@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 
 import argparse
+import fcntl
 import hashlib
 import importlib
+import ipaddress
 import logging
 import os
 import re
@@ -15,6 +17,7 @@ import subprocess
 import sys
 import threading
 import time
+import struct
 from dataclasses import dataclass
 from typing import Dict, Optional
 
@@ -124,6 +127,21 @@ def read_interface_mac(interface_name):
         return normalize_mac(file_obj.read().strip())
 
 
+def read_interface_ipv4(interface_name):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        request = struct.pack("256s", interface_name[:15].encode("utf-8"))
+        response = fcntl.ioctl(sock.fileno(), 0x8915, request)
+    except OSError as exc:
+        raise RuntimeError(
+            f"failed to read IPv4 address for interface '{interface_name}'; bring the interface up and assign an address first"
+        ) from exc
+    finally:
+        sock.close()
+
+    return socket.inet_ntoa(response[20:24])
+
+
 def derive_local_admin_mac(seed_text):
     digest = hashlib.sha256(seed_text.encode("utf-8")).digest()
     octets = [0x02, digest[0], digest[1], digest[2], digest[3], digest[4]]
@@ -139,6 +157,14 @@ def choose_p2p_mac(args):
         except OSError as exc:
             raise RuntimeError(f"failed to read MAC address for interface '{args.interface}': {exc}") from exc
     return derive_local_admin_mac(args.service_name or socket.gethostname())
+
+
+def resolve_bind_host(args):
+    if args.bind_host != "0.0.0.0":
+        return args.bind_host
+    if not args.interface:
+        return args.bind_host
+    return read_interface_ipv4(args.interface)
 
 
 def decode_utf16_text(raw_bytes):
@@ -587,6 +613,12 @@ class RtspRelay:
 
     def _request_expect_ok(self, method, uri, headers=None, body=b""):
         response = self._send_request(method, uri, headers=headers, body=body)
+        if self.args.verbose:
+            print(
+                f"RTSP response: {response.status_code} {response.reason} "
+                f"for {method} {uri}",
+                flush=True,
+            )
         if response.status_code != 200:
             raise RtspStatusError(response.status_code, response.reason)
         return response
@@ -624,6 +656,8 @@ class RtspRelay:
                 parts = first_line.split(" ", 2)
                 if len(parts) < 3:
                     raise RtspSessionError(f"malformed RTSP status line: {first_line!r}")
+                if self.args.verbose:
+                    print(f"RTSP status line: {first_line}", flush=True)
                 return RtspResponse(status_code=int(parts[1]),
                                     reason=parts[2],
                                     headers=headers,
@@ -797,6 +831,7 @@ class Application:
             end="",
         )
         print(f"with p2pMAC={self.args.p2p_mac_resolved}.", flush=True)
+        print(f"Listening for MICE signalling on {self.args.bind_host}:{self.args.signalling_port}.", flush=True)
 
         if not self.args.launch_renderer:
             print("Suggested renderer command:", flush=True)
@@ -954,8 +989,15 @@ def parse_args(argv):
     args = parser.parse_args(argv)
     try:
         args.p2p_mac_resolved = choose_p2p_mac(args)
+        args.bind_host = resolve_bind_host(args)
     except Exception as exc:
         parser.error(str(exc))
+
+    try:
+        ipaddress.ip_address(args.bind_host)
+    except ValueError:
+        if args.bind_host != "0.0.0.0":
+            parser.error("--bind-host must be 0.0.0.0 or a valid IPv4/IPv6 address")
 
     if args.signalling_port < 1 or args.signalling_port > 65535:
         parser.error("--signalling-port must be between 1 and 65535")
