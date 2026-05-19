@@ -148,6 +148,13 @@ def derive_local_admin_mac(seed_text):
     return ":".join(f"{value:02X}" for value in octets)
 
 
+def build_service_host_name(service_name):
+    label = re.sub(r"[^a-z0-9-]+", "-", service_name.lower()).strip("-")
+    if not label:
+        label = "breezy-box"
+    return f"{label}.local"
+
+
 def choose_p2p_mac(args):
     if args.p2p_mac:
         return normalize_mac(args.p2p_mac)
@@ -417,12 +424,15 @@ def format_command(argv):
 
 
 class ServicePublisher:
-    def __init__(self, service_name, signalling_port, txt_records, disabled):
+    def __init__(self, service_name, signalling_port, txt_records, disabled, host_name=None, host_address=None):
         self.service_name = service_name
         self.signalling_port = signalling_port
         self.txt_records = txt_records
         self.disabled = disabled
-        self.process = None
+        self.host_name = host_name
+        self.host_address = host_address
+        self.service_process = None
+        self.address_process = None
 
     def start(self):
         if self.disabled:
@@ -430,23 +440,40 @@ class ServicePublisher:
             return
 
         publisher = shutil.which("avahi-publish-service")
-        if not publisher:
-            raise RuntimeError("avahi-publish-service is required for WFD-MICE discovery")
+        address_publisher = shutil.which("avahi-publish-address")
+        if not publisher or not address_publisher:
+            raise RuntimeError("avahi-publish-service and avahi-publish-address are required for WFD-MICE discovery")
 
-        argv = [publisher, self.service_name, SERVICE_TYPE, str(self.signalling_port)]
+        argv = [publisher]
+        if self.host_name:
+            argv.extend(["-H", self.host_name])
+        argv.extend([self.service_name, SERVICE_TYPE, str(self.signalling_port)])
         argv.extend(self.txt_records)
-        LOGGER.info("publishing %s on %s via Avahi", self.service_name, SERVICE_TYPE)
-        self.process = subprocess.Popen(argv)
+        if self.host_name and self.host_address:
+            LOGGER.info(
+                "publishing %s on %s via Avahi as %s -> %s",
+                self.service_name,
+                SERVICE_TYPE,
+                self.host_name,
+                self.host_address,
+            )
+            self.address_process = subprocess.Popen([address_publisher, self.host_name, self.host_address])
+        else:
+            LOGGER.info("publishing %s on %s via Avahi", self.service_name, SERVICE_TYPE)
+        self.service_process = subprocess.Popen(argv)
 
     def stop(self):
-        if self.process is None or self.process.poll() is not None:
-            return
-        self.process.terminate()
-        try:
-            self.process.wait(timeout=5.0)
-        except subprocess.TimeoutExpired:
-            self.process.kill()
-            self.process.wait()
+        for process in (self.service_process, self.address_process):
+            if process is None or process.poll() is not None:
+                continue
+            process.terminate()
+            try:
+                process.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        self.service_process = None
+        self.address_process = None
 
 
 class RendererProcess:
@@ -915,6 +942,8 @@ class Application:
             signalling_port=args.signalling_port,
             txt_records=[f"p2pMAC={args.p2p_mac_resolved}"],
             disabled=args.disable_discovery,
+            host_name=args.service_host_name,
+            host_address=args.bind_host,
         )
         self.renderer = RendererProcess(args)
         self.relay = RtspRelay(args)
@@ -1065,6 +1094,7 @@ def parse_args(argv):
         description="Advertise a WFD-MICE sink for GNOME and Windows, then relay the source RTSP session into breezy_drm_scene_demo."
     )
     parser.add_argument("--service-name", default=DEFAULT_SERVICE_NAME, help=f"mDNS service name to advertise (default: {DEFAULT_SERVICE_NAME!r})")
+    parser.add_argument("--service-host-name", help="mDNS host name to publish for the sink address (default: derived from --service-name)")
     parser.add_argument("--interface", help="network interface whose MAC address should be used for the p2pMAC TXT record")
     parser.add_argument("--p2p-mac", help="override the p2pMAC TXT record value")
     parser.add_argument("--bind-host", default="0.0.0.0", help="TCP address to bind the MICE signalling listener to (default: 0.0.0.0)")
@@ -1091,6 +1121,8 @@ def parse_args(argv):
     try:
         args.p2p_mac_resolved = choose_p2p_mac(args)
         args.bind_host = resolve_bind_host(args)
+        if not args.service_host_name:
+            args.service_host_name = build_service_host_name(args.service_name)
     except Exception as exc:
         parser.error(str(exc))
 
