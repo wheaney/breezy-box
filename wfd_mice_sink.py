@@ -35,6 +35,8 @@ DEFAULT_RTSP_SOCKET_TIMEOUT_SEC = 5.0
 DEFAULT_RTSP_POST_PLAY_DRAIN_SEC = 2.0
 DEFAULT_RTSP_KEEPALIVE_INTERVAL_SEC = 15
 DEFAULT_WFD_CLIENT_RTP_PORT = 16384
+DEFAULT_WFD_VIDEO_FORMATS = "00 00 03 10 0001ffff 1fffffff 00001fff 00 0000 0000 10 none none"
+DEFAULT_WFD_AUDIO_CODECS = "AAC 00000007 00"
 DEFAULT_RELAY_HOST = "127.0.0.1"
 DEFAULT_RELAY_PORT = 5600
 DEFAULT_PAYLOAD_TYPE = 96
@@ -306,6 +308,30 @@ def parse_rtsp_headers(lines):
     return headers
 
 
+def parse_wfd_parameters(body):
+    parameters = {}
+    if not body:
+        return parameters
+
+    body_text = body.decode("utf-8", errors="replace")
+    for raw_line in body_text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if ":" in line:
+            name, value = line.split(":", 1)
+            parameters[name.strip().lower()] = value.strip()
+        else:
+            parameters[line.strip().lower()] = None
+    return parameters
+
+
+def first_parameter_token(value):
+    if not value:
+        return None
+    return value.split(None, 1)[0]
+
+
 def resolve_rtsp_url(base_url, control_value):
     if not control_value or control_value == "*":
         return base_url
@@ -334,15 +360,24 @@ def resolve_rtsp_control_url(base_url, response_headers, sdp_text):
     return resolve_rtsp_url(content_base, "streamid=0")
 
 
-def build_wfd_parameters(presentation_url, client_rtp_port):
-    lines = [
-        "wfd_video_formats: 30 00 02 02 00017380 00000000 00000000 00 0000 0000 00 none none",
-        "wfd_audio_codecs: AAC 00000001 00",
-        "wfd_3d_video_formats: none",
-        "wfd_content_protection: none",
-        f"wfd_client_rtp_ports: RTP/AVP/UDP;unicast {client_rtp_port} 0 mode=play",
-        f"wfd_presentation_URL: {presentation_url} none",
-    ]
+def build_wfd_parameter_response(requested_parameters, client_rtp_port):
+    lines = []
+
+    if "wfd_content_protection" in requested_parameters:
+        lines.append("wfd_content_protection: none")
+    if "wfd_video_formats" in requested_parameters:
+        lines.append(f"wfd_video_formats: {DEFAULT_WFD_VIDEO_FORMATS}")
+    if "wfd_audio_codecs" in requested_parameters:
+        lines.append(f"wfd_audio_codecs: {DEFAULT_WFD_AUDIO_CODECS}")
+    if "wfd_3d_video_formats" in requested_parameters:
+        lines.append("wfd_3d_video_formats: none")
+    if "wfd_client_rtp_ports" in requested_parameters:
+        lines.append(
+            f"wfd_client_rtp_ports: RTP/AVP/UDP;unicast {client_rtp_port} {client_rtp_port + 1} mode=play"
+        )
+
+    if not lines:
+        return b""
     return ("\r\n".join(lines) + "\r\n").encode("utf-8")
 
 
@@ -677,10 +712,15 @@ class RtspRelay:
         self.path_index = 0
         self.control_socket = None
         self.control_reader = None
+        self.control_thread = None
+        self.control_thread_stop = threading.Event()
         self.rtcp_socket = None
         self.cseq = 0
         self.session_id = None
         self.aggregate_url = None
+        self.presentation_url = None
+        self.sent_sink_options = False
+        self.handshake_complete = False
         self.keepalive_source_id = 0
         self.demux = None
         self.video_queue = None
@@ -729,60 +769,8 @@ class RtspRelay:
         self._open_control_connection(connected_socket)
         self.aggregate_url = next_url
         self.current_url = next_url
-
-        self._request_expect_ok("OPTIONS", next_url)
-        describe_response = self._describe_with_fallback()
-        sdp_text = describe_response.body.decode("utf-8", errors="replace")
-        self.aggregate_url = rtsp_header_value(describe_response.headers, "content-base", next_url)
-        control_url = resolve_rtsp_control_url(self.aggregate_url, describe_response.headers, sdp_text)
-
-        setup_response = self._request_expect_ok(
-            "SETUP",
-            control_url,
-            headers={
-                "Transport": (
-                    f"RTP/AVP/UDP;unicast;client_port="
-                    f"{self.args.wfd_client_rtp_port}-{self.args.wfd_client_rtp_port + 1}"
-                )
-            },
-        )
-        session_header = rtsp_header_value(setup_response.headers, "session")
-        if not session_header:
-            raise RtspSessionError("RTSP SETUP response did not include a Session header")
-        self.session_id = session_header.split(";", 1)[0].strip()
-
-        self._request_expect_ok(
-            "SET_PARAMETER",
-            self.aggregate_url,
-            headers={"Content-Type": "text/parameters"},
-            body=build_wfd_parameters(control_url, self.args.wfd_client_rtp_port),
-        )
-
-        self._request_expect_ok(
-            "SET_PARAMETER",
-            self.aggregate_url,
-            headers={"Content-Type": "text/parameters"},
-            body=build_wfd_trigger("SETUP"),
-        )
-
-        self._request_expect_ok(
-            "PLAY",
-            self.aggregate_url,
-            headers={"Range": "npt=0.000-"},
-        )
-
-        self._request_expect_ok(
-            "SET_PARAMETER",
-            self.aggregate_url,
-            headers={"Content-Type": "text/parameters"},
-            body=build_wfd_trigger("PLAY"),
-        )
-
-        self._drain_server_requests(DEFAULT_RTSP_POST_PLAY_DRAIN_SEC)
-        self.keepalive_source_id = GLib.timeout_add_seconds(
-            self.args.rtsp_keepalive_interval_sec,
-            self._keepalive,
-        )
+        self._run_source_driven_handshake()
+        self._start_control_thread()
 
     def _build_relay_pipeline(self):
         pipeline = Gst.Pipeline.new("wfd-relay")
@@ -1062,6 +1050,59 @@ class RtspRelay:
         self.control_reader = self.control_socket.makefile("rb")
         self.cseq = 0
 
+    def _run_source_driven_handshake(self):
+        while not self.handshake_complete:
+            try:
+                first_line, headers, body = self._read_message()
+            except socket.timeout as exc:
+                raise RtspSessionError(
+                    "timed out waiting for the source-driven WFD handshake; "
+                    "the source never sent the expected OPTIONS/GET_PARAMETER/SET_PARAMETER sequence"
+                ) from exc
+
+            if first_line.startswith("RTSP/"):
+                if self.args.verbose:
+                    print(f"RTSP unsolicited status line: {first_line}", flush=True)
+                continue
+
+            self._handle_server_request(first_line, headers, body)
+
+    def _start_control_thread(self):
+        if self.control_thread is not None and self.control_thread.is_alive():
+            return
+        self.control_thread_stop.clear()
+        self.control_thread = threading.Thread(
+            target=self._control_loop,
+            name="wfd-rtsp-control",
+            daemon=True,
+        )
+        self.control_thread.start()
+
+    def _control_loop(self):
+        while not self.control_thread_stop.is_set():
+            try:
+                first_line, headers, body = self._read_message()
+            except socket.timeout:
+                continue
+            except Exception as exc:
+                if self.control_thread_stop.is_set():
+                    break
+                LOGGER.error("RTSP control loop failed: %s", exc)
+                GLib.idle_add(self.stop)
+                break
+
+            if first_line.startswith("RTSP/"):
+                if self.args.verbose:
+                    print(f"RTSP unsolicited status line: {first_line}", flush=True)
+                continue
+
+            try:
+                self._handle_server_request(first_line, headers, body)
+            except Exception as exc:
+                LOGGER.error("failed to handle RTSP server request: %s", exc)
+                GLib.idle_add(self.stop)
+                break
+
     def _send_bytes(self, payload):
         if self.control_socket is None:
             raise RtspSessionError("RTSP control socket is not connected")
@@ -1195,15 +1236,95 @@ class RtspRelay:
                     flush=True,
                 )
 
-        response_headers = {}
         if method == "OPTIONS":
-            response_headers["Public"] = "OPTIONS, DESCRIBE, SETUP, PLAY, PAUSE, TEARDOWN, GET_PARAMETER, SET_PARAMETER"
-        elif method == "GET_PARAMETER":
-            response_headers["Content-Type"] = "text/parameters"
-        elif method == "SET_PARAMETER":
-            response_headers["Content-Type"] = rtsp_header_value(headers, "content-type", "text/parameters")
+            self._handle_source_options(headers)
+            return
+        if method == "GET_PARAMETER":
+            self._handle_source_get_parameter(headers, body)
+            return
+        if method == "SET_PARAMETER":
+            self._handle_source_set_parameter(headers, body)
+            return
 
-        self._send_server_response(headers, 200, "OK", response_headers)
+        self._send_server_response(headers, 200, "OK")
+
+    def _handle_source_options(self, request_headers):
+        self._send_server_response(
+            request_headers,
+            200,
+            "OK",
+            {"Public": "org.wfa.wfd1.0, GET_PARAMETER, SET_PARAMETER"},
+        )
+
+        if self.sent_sink_options:
+            return
+
+        self.sent_sink_options = True
+        self._request_expect_ok("OPTIONS", "*", headers={"Require": "org.wfa.wfd1.0"})
+
+    def _handle_source_get_parameter(self, request_headers, body):
+        requested_parameters = parse_wfd_parameters(body)
+        response_body = build_wfd_parameter_response(
+            requested_parameters.keys(),
+            self.args.wfd_client_rtp_port,
+        )
+        response_headers = {}
+        if response_body:
+            response_headers["Content-Type"] = "text/parameters"
+        self._send_server_response(request_headers, 200, "OK", response_headers, response_body)
+
+    def _handle_source_set_parameter(self, request_headers, body):
+        response_headers = {}
+        content_type = rtsp_header_value(request_headers, "content-type")
+        if content_type:
+            response_headers["Content-Type"] = content_type
+        self._send_server_response(request_headers, 200, "OK", response_headers)
+
+        parameters = parse_wfd_parameters(body)
+        presentation_url = first_parameter_token(parameters.get("wfd_presentation_url"))
+        if presentation_url:
+            if presentation_url != self.presentation_url:
+                LOGGER.info("source presentation URL: %s", presentation_url)
+            self.presentation_url = presentation_url
+            self.aggregate_url = presentation_url
+            self.current_url = presentation_url
+
+        trigger_method = parameters.get("wfd_trigger_method")
+        if not trigger_method:
+            return
+
+        trigger_method = trigger_method.upper()
+        LOGGER.info("source requested WFD trigger: %s", trigger_method)
+        if trigger_method == "SETUP":
+            self._setup_and_play()
+
+    def _setup_and_play(self):
+        if self.handshake_complete:
+            return
+        if not self.presentation_url:
+            raise RtspSessionError("source requested SETUP before providing wfd_presentation_URL")
+
+        setup_response = self._request_expect_ok(
+            "SETUP",
+            self.presentation_url,
+            headers={
+                "Transport": (
+                    f"RTP/AVP/UDP;unicast;client_port="
+                    f"{self.args.wfd_client_rtp_port}-{self.args.wfd_client_rtp_port + 1}"
+                )
+            },
+        )
+        session_header = rtsp_header_value(setup_response.headers, "session")
+        if not session_header:
+            raise RtspSessionError("RTSP SETUP response did not include a Session header")
+        self.session_id = session_header.split(";", 1)[0].strip()
+
+        self._request_expect_ok(
+            "PLAY",
+            self.presentation_url,
+            headers={"Range": "npt=0.000-"},
+        )
+        self.handshake_complete = True
 
     def _send_server_response(self, request_headers, status_code, reason, extra_headers=None, body=b""):
         if extra_headers is None:
@@ -1241,12 +1362,21 @@ class RtspRelay:
         if self.keepalive_source_id:
             GLib.source_remove(self.keepalive_source_id)
             self.keepalive_source_id = 0
+        self.control_thread_stop.set()
         if self.control_reader is not None:
             self.control_reader.close()
             self.control_reader = None
         if self.control_socket is not None:
             self.control_socket.close()
             self.control_socket = None
+        if (
+            self.control_thread is not None
+            and self.control_thread.is_alive()
+            and threading.current_thread() is not self.control_thread
+        ):
+            self.control_thread.join(timeout=1.0)
+        self.control_thread = None
+        self.control_thread_stop.clear()
         if self.rtcp_socket is not None:
             self.rtcp_socket.close()
             self.rtcp_socket = None
@@ -1263,6 +1393,9 @@ class RtspRelay:
         self.video_queue = None
         self.auxiliary_elements = []
         self.probe_logged = False
+        self.presentation_url = None
+        self.sent_sink_options = False
+        self.handshake_complete = False
 
     def _on_message(self, bus, message):
         del bus
