@@ -189,7 +189,7 @@ python3 ./wfd_mice_sink.py \
 	--interface usb0 \
 	--launch-renderer \
 	--renderer-device /dev/dri/card0 \
-	--renderer-decoder-fragment mppvideodec
+	--renderer-decoder-fragment decodebin
 ```
 
 That command does three things:
@@ -214,7 +214,9 @@ Host firewall note:
 * GNOME Network Displays' upstream firewalld integration explicitly expects the source-side RTSP server to be reachable on TCP port `7236`.
 * If the host has UFW, firewalld, or another inbound firewall policy enabled, allow TCP `7236` from the SBC to the host or the WFD bridge will fail before the RTSP session starts.
 
-The relay bridge converts the WFD RTSP session into a local H.264 RTP stream for the renderer. Because of that, the decoder fragment for the standards-based path should be an H.264 decoder such as `mppvideodec` or a stateless V4L2 H.264 decoder.
+The relay bridge converts the WFD RTSP session into a local H.264 RTP stream for the renderer. The default renderer fragment for this path is `decodebin`, which gives the board a compatibility-first H.264 decode path while still allowing you to override it with a specific hardware decoder if you know the target image supports one.
+
+If you want to force a specific decoder, typical H.264 candidates on Rockchip are `mppvideodec` or a stateless V4L2 decoder such as `v4l2slh264dec`.
 
 Internally, the helper now drives the source with a minimal RTSP `OPTIONS` / `DESCRIBE` / `SETUP` / `PLAY` exchange and receives the WFD media on fixed local RTP/RTCP ports (default `16384/16385`) before repayloading the H.264 elementary stream to the renderer's local relay port.
 
