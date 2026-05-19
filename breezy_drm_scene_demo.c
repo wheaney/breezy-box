@@ -124,6 +124,8 @@ struct stream_surface {
     uint8_t *pixels;
     uint32_t width;
     uint32_t height;
+    uint32_t rgba_storage_width;
+    uint32_t rgba_storage_height;
     float phase_offset;
     enum stream_input_kind input_kind;
     const char *input_value;
@@ -1211,6 +1213,39 @@ static void pump_gst_bus(struct stream_surface *stream, bool verbose)
 
 static void stream_surface_upload(const struct stream_surface *stream);
 
+static bool stream_surface_ensure_rgba_storage(struct stream_surface *stream,
+                                               uint32_t width,
+                                               uint32_t height)
+{
+    uint8_t *pixels;
+
+    if (stream->rgba_storage_width == width && stream->rgba_storage_height == height) {
+        return true;
+    }
+
+    pixels = realloc(stream->pixels, (size_t)width * (size_t)height * 4u);
+    if (!pixels) {
+        fprintf(stderr, "unable to resize stream pixels to %ux%u\n", width, height);
+        return false;
+    }
+
+    stream->pixels = pixels;
+    stream->rgba_storage_width = width;
+    stream->rgba_storage_height = height;
+
+    glBindTexture(GL_TEXTURE_2D, stream->texture_id);
+    glTexImage2D(GL_TEXTURE_2D,
+                 0,
+                 GL_RGBA,
+                 (GLsizei)width,
+                 (GLsizei)height,
+                 0,
+                 GL_RGBA,
+                 GL_UNSIGNED_BYTE,
+                 stream->pixels);
+    return true;
+}
+
 static void stream_surface_release_sample(struct stream_surface *stream)
 {
     if (stream->gst_sample) {
@@ -1330,6 +1365,11 @@ static bool upload_nv12_sample_cpu(struct stream_surface *stream,
 
     width = GST_VIDEO_INFO_WIDTH(info);
     height = GST_VIDEO_INFO_HEIGHT(info);
+    if (!stream_surface_ensure_rgba_storage(stream, width, height)) {
+        gst_video_frame_unmap(&frame);
+        return false;
+    }
+
     for (y = 0u; y < height; ++y) {
         const uint8_t *y_row = (const uint8_t *)GST_VIDEO_FRAME_PLANE_DATA(&frame, 0) +
                                (ptrdiff_t)y * GST_VIDEO_FRAME_PLANE_STRIDE(&frame, 0);
@@ -1560,6 +1600,8 @@ static int stream_surfaces_init(struct stream_surface *streams,
     for (index = 0u; index < stream_count; ++index) {
         streams[index].width = width;
         streams[index].height = height;
+        streams[index].rgba_storage_width = width;
+        streams[index].rgba_storage_height = height;
         streams[index].phase_offset = (float)index * 1.7f;
         if (index < opts->stream_input_count) {
             streams[index].input_kind = opts->stream_inputs[index].kind;
