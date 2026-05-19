@@ -300,14 +300,14 @@ def wait_for_tcp_endpoint(host, port, ready_timeout_sec, connect_timeout_sec):
 
     while True:
         try:
-            with socket.create_connection((host, port), timeout=connect_timeout_sec):
-                LOGGER.info(
-                    "source RTSP server at %s:%u became reachable after %.2fs",
-                    host,
-                    port,
-                    time.monotonic() - start_time,
-                )
-                return
+            connected_socket = socket.create_connection((host, port), timeout=connect_timeout_sec)
+            LOGGER.info(
+                "source RTSP server at %s:%u became reachable after %.2fs",
+                host,
+                port,
+                time.monotonic() - start_time,
+            )
+            return connected_socket
         except OSError as exc:
             last_error = exc
             now = time.monotonic()
@@ -508,10 +508,10 @@ class RtspRelay:
         if self.args.verbose:
             print(f"GStreamer relay pipeline: {description}", flush=True)
 
-        wait_for_tcp_endpoint(self.current_source_host,
-                              self.current_source_ready.rtsp_port,
-                              self.args.rtsp_ready_timeout_sec,
-                              self.args.rtsp_connect_timeout_sec)
+        connected_socket = wait_for_tcp_endpoint(self.current_source_host,
+                             self.current_source_ready.rtsp_port,
+                             self.args.rtsp_ready_timeout_sec,
+                             self.args.rtsp_connect_timeout_sec)
 
         self._bind_rtcp_socket()
         self.pipeline = Gst.parse_launch(description)
@@ -520,10 +520,11 @@ class RtspRelay:
         self.bus.connect("message", self._on_message)
         state_result = self.pipeline.set_state(Gst.State.PLAYING)
         if state_result == Gst.StateChangeReturn.FAILURE:
+            connected_socket.close()
             self.stop()
             raise RuntimeError(f"failed to start relay pipeline for {next_url}")
 
-        self._open_control_connection()
+        self._open_control_connection(connected_socket)
         self.aggregate_url = next_url
         self.current_url = next_url
 
@@ -568,11 +569,13 @@ class RtspRelay:
         self.rtcp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.rtcp_socket.bind(("", self.args.wfd_client_rtp_port + 1))
 
-    def _open_control_connection(self):
-        self.control_socket = socket.create_connection(
-            (self.current_source_host, self.current_source_ready.rtsp_port),
-            timeout=self.args.rtsp_connect_timeout_sec,
-        )
+    def _open_control_connection(self, connected_socket=None):
+        self.control_socket = connected_socket
+        if self.control_socket is None:
+            self.control_socket = socket.create_connection(
+                (self.current_source_host, self.current_source_ready.rtsp_port),
+                timeout=self.args.rtsp_connect_timeout_sec,
+            )
         self.control_socket.settimeout(DEFAULT_RTSP_SOCKET_TIMEOUT_SEC)
         self.control_reader = self.control_socket.makefile("rb")
         self.cseq = 0

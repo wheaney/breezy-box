@@ -169,6 +169,8 @@ sudo ip link set <host-usb-iface> up
 sudo ip addr add 192.168.2.1/24 dev <host-usb-iface>
 ```
 
+After either side reboots or the USB gadget resets, make sure you re-run the host-side link and address setup too. GNOME Network Displays discovery depends on both ends of the USB Ethernet link being back up on the same subnet.
+
 If you want separate per-stream bind addresses on the SBC, add aliases such as:
 
 ```sh
@@ -197,6 +199,10 @@ That command does three things:
 * auto-launches `breezy_drm_scene_demo` with a static local relay pipeline on `127.0.0.1:5600`.
 
 If you prefer to launch the renderer yourself, omit `--launch-renderer`. The helper prints the exact renderer command it expects.
+
+The discoverable network-display endpoint is `wfd_mice_sink.py` itself. Running `breezy_drm_scene_demo` directly does not advertise `_display._tcp`, does not listen for MICE `SOURCE_READY`, and will never show up in GNOME Network Displays or Windows by itself.
+
+For the WFD-MICE path, do not substitute the manual H.265 examples from the next section. The bridge relays WFD into a local H.264 RTP stream for the renderer, so if you launch the renderer yourself, use the exact command printed by `wfd_mice_sink.py`.
 
 Once that helper is running:
 
@@ -233,6 +239,8 @@ gst-inspect-1.0 | grep -E 'mpp|v4l2.*(264|265|vp9)|h264dec|h265dec|vp9dec'
 Typical candidates are `mppvideodec`, `v4l2slh264dec`, `v4l2slh265dec`, or `v4l2slvp9dec`.
 
 ### 4. Start The Receiver Renderer
+
+This section is for manual/custom RTP senders. It is not the entrypoint for GNOME Network Displays or Windows discovery.
 
 Example H.265 RTP receiver on the SBC:
 
