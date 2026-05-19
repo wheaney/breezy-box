@@ -1146,6 +1146,8 @@ static void log_gst_message(struct stream_surface *stream, GstMessage *message, 
     case GST_MESSAGE_WARNING: {
         GError *error = NULL;
         gchar *debug_info = NULL;
+        const char *source_name = GST_MESSAGE_SRC(message) ? GST_OBJECT_NAME(GST_MESSAGE_SRC(message)) : "unknown-src";
+        const char *source_type = GST_MESSAGE_SRC(message) ? G_OBJECT_TYPE_NAME(GST_MESSAGE_SRC(message)) : "unknown-type";
         const char *prefix = GST_MESSAGE_TYPE(message) == GST_MESSAGE_ERROR ? "ERROR" : "WARNING";
 
         if (GST_MESSAGE_TYPE(message) == GST_MESSAGE_ERROR) {
@@ -1155,8 +1157,10 @@ static void log_gst_message(struct stream_surface *stream, GstMessage *message, 
         }
 
         fprintf(stderr,
-                "stream pipeline %s: %s (%s)\n",
+            "stream pipeline %s from %s (%s): %s (%s)\n",
                 prefix,
+            source_name,
+            source_type,
                 error ? error->message : "unknown error",
                 debug_info ? debug_info : "no debug info");
         if (error) {
