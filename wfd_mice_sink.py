@@ -37,6 +37,7 @@ DEFAULT_RTSP_KEEPALIVE_INTERVAL_SEC = 15
 DEFAULT_WFD_CLIENT_RTP_PORT = 16384
 DEFAULT_WFD_VIDEO_FORMATS = "00 00 03 10 0001ffff 1fffffff 00001fff 00 0000 0000 10 none none"
 DEFAULT_WFD_AUDIO_CODECS = "AAC 00000007 00"
+DEFAULT_PROBE_BLACK_LOG_BUDGET = 20
 DEFAULT_RELAY_HOST = "127.0.0.1"
 DEFAULT_RELAY_PORT = 5600
 DEFAULT_PAYLOAD_TYPE = 96
@@ -332,6 +333,20 @@ def first_parameter_token(value):
     return value.split(None, 1)[0]
 
 
+def summary_is_black(summary):
+    if summary is None or "error" in summary:
+        return False
+
+    if summary.get("avg_rgb") != (0, 0, 0):
+        return False
+
+    for point in summary.get("points", []):
+        if point[:3] != (0, 0, 0):
+            return False
+
+    return True
+
+
 def resolve_rtsp_url(base_url, control_value):
     if not control_value or control_value == "*":
         return base_url
@@ -371,6 +386,12 @@ def build_wfd_parameter_response(requested_parameters, client_rtp_port):
         lines.append(f"wfd_audio_codecs: {DEFAULT_WFD_AUDIO_CODECS}")
     if "wfd_3d_video_formats" in requested_parameters:
         lines.append("wfd_3d_video_formats: none")
+    if "wfd_display_edid" in requested_parameters:
+        lines.append("wfd_display_edid: none")
+    if "wfd_idr_request_capability" in requested_parameters:
+        lines.append("wfd_idr_request_capability: 1")
+    if "microsoft_cursor" in requested_parameters:
+        lines.append("microsoft_cursor: none")
     if "wfd_client_rtp_ports" in requested_parameters:
         lines.append(
             f"wfd_client_rtp_ports: RTP/AVP/UDP;unicast {client_rtp_port} {client_rtp_port + 1} mode=play"
@@ -379,6 +400,10 @@ def build_wfd_parameter_response(requested_parameters, client_rtp_port):
     if not lines:
         return b""
     return ("\r\n".join(lines) + "\r\n").encode("utf-8")
+
+
+def build_wfd_idr_request():
+    return b"wfd_idr_request\r\n"
 
 
 def build_wfd_trigger(trigger_method):
@@ -725,7 +750,8 @@ class RtspRelay:
         self.demux = None
         self.video_queue = None
         self.auxiliary_elements = []
-        self.probe_logged = False
+        self.probe_black_log_budget = DEFAULT_PROBE_BLACK_LOG_BUDGET
+        self.probe_non_black_logged = False
 
     def start(self, source_host, source_ready):
         self.stop()
@@ -908,35 +934,43 @@ class RtspRelay:
             raise RuntimeError(f"failed to link probe decodebin pad: {link_result.value_nick}")
 
     def _on_probe_sample(self, sink):
-        if self.probe_logged:
-            return Gst.FlowReturn.OK
-
         sample = sink.emit("pull-sample")
         if sample is None:
             return Gst.FlowReturn.ERROR
 
         summary = summarize_rgba_buffer(sample.get_buffer(), sample.get_caps())
-        if summary is None:
-            print("Relay probe frame summary: unavailable", flush=True)
-        elif "error" in summary:
-            print(
-                "Relay probe frame summary: "
-                f"{summary.get('width', 0)}x{summary.get('height', 0)} "
-                f"format={summary.get('format')} error={summary['error']}",
-                flush=True,
-            )
-        else:
-            p0, p1, p2 = summary["points"]
-            avg_r, avg_g, avg_b = summary["avg_rgb"]
-            print(
-                "Relay probe frame summary: "
-                f"{summary['width']}x{summary['height']} "
-                f"stride={summary['stride']} "
-                f"avg_rgb=({avg_r},{avg_g},{avg_b}) "
-                f"p0={p0} p1={p1} p2={p2}",
-                flush=True,
-            )
-        self.probe_logged = True
+        should_log = False
+        if summary is None or "error" in (summary or {}):
+            should_log = True
+        elif summary_is_black(summary):
+            if self.probe_black_log_budget > 0:
+                should_log = True
+                self.probe_black_log_budget -= 1
+        elif not self.probe_non_black_logged:
+            should_log = True
+            self.probe_non_black_logged = True
+
+        if should_log:
+            if summary is None:
+                print("Relay probe frame summary: unavailable", flush=True)
+            elif "error" in summary:
+                print(
+                    "Relay probe frame summary: "
+                    f"{summary.get('width', 0)}x{summary.get('height', 0)} "
+                    f"format={summary.get('format')} error={summary['error']}",
+                    flush=True,
+                )
+            else:
+                p0, p1, p2 = summary["points"]
+                avg_r, avg_g, avg_b = summary["avg_rgb"]
+                print(
+                    "Relay probe frame summary: "
+                    f"{summary['width']}x{summary['height']} "
+                    f"stride={summary['stride']} "
+                    f"avg_rgb=({avg_r},{avg_g},{avg_b}) "
+                    f"p0={p0} p1={p1} p2={p2}",
+                    flush=True,
+                )
         return Gst.FlowReturn.OK
 
     def _on_demux_pad_added(self, demux, pad, video_queue):
@@ -1324,6 +1358,18 @@ class RtspRelay:
             self.presentation_url,
             headers={"Range": "npt=0.000-"},
         )
+
+        try:
+            LOGGER.info("requesting initial IDR frame from source")
+            self._request_expect_ok(
+                "SET_PARAMETER",
+                self.presentation_url,
+                headers={"Content-Type": "text/parameters"},
+                body=build_wfd_idr_request(),
+            )
+        except Exception as exc:
+            LOGGER.warning("failed to request initial IDR frame: %s", exc)
+
         self.handshake_complete = True
 
     def _send_server_response(self, request_headers, status_code, reason, extra_headers=None, body=b""):
@@ -1392,7 +1438,8 @@ class RtspRelay:
         self.demux = None
         self.video_queue = None
         self.auxiliary_elements = []
-        self.probe_logged = False
+        self.probe_black_log_budget = DEFAULT_PROBE_BLACK_LOG_BUDGET
+        self.probe_non_black_logged = False
         self.presentation_url = None
         self.sent_sink_options = False
         self.handshake_complete = False
