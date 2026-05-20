@@ -816,6 +816,8 @@ class RtspRelay:
         pay = Gst.ElementFactory.make("rtph264pay", "wfd_rtph264pay")
         sink = Gst.ElementFactory.make("udpsink", "wfd_udpsink")
         probe_queue = Gst.ElementFactory.make("queue", "wfd_probe_queue")
+        probe_parser = Gst.ElementFactory.make("h264parse", "wfd_probe_h264parse")
+        probe_h264_caps = Gst.ElementFactory.make("capsfilter", "wfd_probe_h264_caps")
         probe_decodebin = Gst.ElementFactory.make("decodebin", "wfd_probe_decodebin")
         probe_convert = Gst.ElementFactory.make("videoconvert", "wfd_probe_videoconvert")
         probe_caps = Gst.ElementFactory.make("capsfilter", "wfd_probe_caps")
@@ -834,6 +836,8 @@ class RtspRelay:
             pay,
             sink,
             probe_queue,
+            probe_parser,
+            probe_h264_caps,
             probe_decodebin,
             probe_convert,
             probe_caps,
@@ -868,6 +872,12 @@ class RtspRelay:
         sink.set_property("async", False)
         probe_queue.set_property("max-size-buffers", 1)
         probe_queue.set_property("leaky", 2)
+        probe_parser.set_property("config-interval", -1)
+        probe_parser.set_property("disable-passthrough", True)
+        probe_h264_caps.set_property(
+            "caps",
+            Gst.Caps.from_string("video/x-h264,stream-format=byte-stream,alignment=au"),
+        )
         probe_caps.set_property("caps", Gst.Caps.from_string("video/x-raw,format=RGBA"))
         probe_sink.set_property("emit-signals", True)
         probe_sink.set_property("max-buffers", 1)
@@ -886,6 +896,8 @@ class RtspRelay:
         pipeline.add(pay)
         pipeline.add(sink)
         pipeline.add(probe_queue)
+        pipeline.add(probe_parser)
+        pipeline.add(probe_h264_caps)
         pipeline.add(probe_decodebin)
         pipeline.add(probe_convert)
         pipeline.add(probe_caps)
@@ -899,7 +911,9 @@ class RtspRelay:
                                      (parser, capsfilter),
                                      (capsfilter, pay),
                                      (pay, sink),
-                                     (probe_queue, probe_decodebin),
+                                     (probe_queue, probe_parser),
+                                     (probe_parser, probe_h264_caps),
+                                     (probe_h264_caps, probe_decodebin),
                                      (probe_convert, probe_caps),
                                      (probe_caps, probe_sink)):
             if not upstream.link(downstream):
