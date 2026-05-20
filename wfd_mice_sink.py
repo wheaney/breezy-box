@@ -736,7 +736,7 @@ class RtspRelay:
         self.path_candidates = []
         self.path_index = 0
         self.control_socket = None
-        self.control_reader = None
+        self.control_buffer = bytearray()
         self.control_thread = None
         self.control_thread_stop = threading.Event()
         self.rtcp_socket = None
@@ -752,6 +752,7 @@ class RtspRelay:
         self.auxiliary_elements = []
         self.probe_black_log_budget = DEFAULT_PROBE_BLACK_LOG_BUDGET
         self.probe_non_black_logged = False
+        self.probe_frame_count = 0
 
     def start(self, source_host, source_ready):
         self.stop()
@@ -938,7 +939,12 @@ class RtspRelay:
         if sample is None:
             return Gst.FlowReturn.ERROR
 
+        self.probe_frame_count += 1
         summary = summarize_rgba_buffer(sample.get_buffer(), sample.get_caps())
+        buffer = sample.get_buffer()
+        pts_ms = None
+        if buffer is not None and buffer.pts != Gst.CLOCK_TIME_NONE:
+            pts_ms = buffer.pts / Gst.MSECOND
         should_log = False
         if summary is None or "error" in (summary or {}):
             should_log = True
@@ -952,11 +958,16 @@ class RtspRelay:
 
         if should_log:
             if summary is None:
-                print("Relay probe frame summary: unavailable", flush=True)
+                print(
+                    f"Relay probe frame summary: frame={self.probe_frame_count} unavailable",
+                    flush=True,
+                )
             elif "error" in summary:
                 print(
                     "Relay probe frame summary: "
+                    f"frame={self.probe_frame_count} "
                     f"{summary.get('width', 0)}x{summary.get('height', 0)} "
+                    f"pts_ms={pts_ms if pts_ms is not None else 'none'} "
                     f"format={summary.get('format')} error={summary['error']}",
                     flush=True,
                 )
@@ -965,7 +976,9 @@ class RtspRelay:
                 avg_r, avg_g, avg_b = summary["avg_rgb"]
                 print(
                     "Relay probe frame summary: "
+                    f"frame={self.probe_frame_count} "
                     f"{summary['width']}x{summary['height']} "
+                    f"pts_ms={pts_ms if pts_ms is not None else 'none'} "
                     f"stride={summary['stride']} "
                     f"avg_rgb=({avg_r},{avg_g},{avg_b}) "
                     f"p0={p0} p1={p1} p2={p2}",
@@ -1081,7 +1094,7 @@ class RtspRelay:
                 timeout=self.args.rtsp_connect_timeout_sec,
             )
         self.control_socket.settimeout(DEFAULT_RTSP_SOCKET_TIMEOUT_SEC)
-        self.control_reader = self.control_socket.makefile("rb")
+        self.control_buffer.clear()
         self.cseq = 0
 
     def _run_source_driven_handshake(self):
@@ -1143,7 +1156,7 @@ class RtspRelay:
         self.control_socket.sendall(payload)
 
     def _drain_server_requests(self, wait_timeout_sec):
-        if self.control_socket is None or self.control_reader is None or wait_timeout_sec <= 0:
+        if self.control_socket is None or wait_timeout_sec <= 0:
             return
 
         deadline = time.monotonic() + wait_timeout_sec
@@ -1227,31 +1240,52 @@ class RtspRelay:
             self._handle_server_request(first_line, headers, body)
 
     def _read_message(self):
-        if self.control_reader is None:
-            raise RtspSessionError("RTSP control reader is unavailable")
+        if self.control_socket is None:
+            raise RtspSessionError("RTSP control socket is unavailable")
 
-        first_line = self.control_reader.readline()
-        if not first_line:
-            raise RtspSessionError("RTSP control connection closed unexpectedly")
-        first_line = first_line.decode("utf-8", errors="replace").rstrip("\r\n")
+        first_line = self._read_line_from_socket()
 
         header_lines = []
         while True:
-            line = self.control_reader.readline()
-            if not line:
-                raise RtspSessionError("RTSP control connection closed while reading headers")
-            line = line.decode("utf-8", errors="replace").rstrip("\r\n")
+            line = self._read_line_from_socket()
             if not line:
                 break
             header_lines.append(line)
 
         headers = parse_rtsp_headers(header_lines)
         content_length = int(rtsp_header_value(headers, "content-length", "0") or "0")
-        body = self.control_reader.read(content_length) if content_length > 0 else b""
+        body = self._read_exact_from_socket(content_length) if content_length > 0 else b""
         if content_length > 0 and len(body) != content_length:
             raise RtspSessionError("RTSP control connection closed while reading body")
 
         return first_line, headers, body
+
+    def _read_line_from_socket(self):
+        while True:
+            newline_index = self.control_buffer.find(b"\n")
+            if newline_index >= 0:
+                line = bytes(self.control_buffer[: newline_index + 1])
+                del self.control_buffer[: newline_index + 1]
+                return line.decode("utf-8", errors="replace").rstrip("\r\n")
+
+            self._recv_into_control_buffer()
+
+    def _read_exact_from_socket(self, count):
+        while len(self.control_buffer) < count:
+            self._recv_into_control_buffer()
+
+        payload = bytes(self.control_buffer[:count])
+        del self.control_buffer[:count]
+        return payload
+
+    def _recv_into_control_buffer(self):
+        if self.control_socket is None:
+            raise RtspSessionError("RTSP control socket is unavailable")
+
+        chunk = self.control_socket.recv(4096)
+        if not chunk:
+            raise RtspSessionError("RTSP control connection closed unexpectedly")
+        self.control_buffer.extend(chunk)
 
     def _handle_server_request(self, first_line, headers, body):
         parts = first_line.split(" ", 2)
@@ -1409,12 +1443,10 @@ class RtspRelay:
             GLib.source_remove(self.keepalive_source_id)
             self.keepalive_source_id = 0
         self.control_thread_stop.set()
-        if self.control_reader is not None:
-            self.control_reader.close()
-            self.control_reader = None
         if self.control_socket is not None:
             self.control_socket.close()
             self.control_socket = None
+        self.control_buffer.clear()
         if (
             self.control_thread is not None
             and self.control_thread.is_alive()
@@ -1440,6 +1472,7 @@ class RtspRelay:
         self.auxiliary_elements = []
         self.probe_black_log_budget = DEFAULT_PROBE_BLACK_LOG_BUDGET
         self.probe_non_black_logged = False
+        self.probe_frame_count = 0
         self.presentation_url = None
         self.sent_sink_options = False
         self.handshake_complete = False
