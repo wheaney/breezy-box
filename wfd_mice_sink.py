@@ -852,6 +852,8 @@ class RtspRelay:
         self.depay_mpegts_buffer_count = 0
         self.tsparse_mpegts_log_budget = DEFAULT_MPEGTS_BUFFER_LOG_BUDGET
         self.tsparse_mpegts_buffer_count = 0
+        self.demux_video_pad_log_budget = DEFAULT_ENCODED_VIDEO_LOG_BUDGET
+        self.demux_video_pad_buffer_count = 0
         self.encoded_video_sink_log_budget = DEFAULT_ENCODED_VIDEO_LOG_BUDGET
         self.encoded_video_sink_buffer_count = 0
         self.encoded_video_log_budget = DEFAULT_ENCODED_VIDEO_LOG_BUDGET
@@ -1177,6 +1179,17 @@ class RtspRelay:
             info,
         )
 
+    def _on_demux_video_pad_buffer(self, pad, info):
+        del pad
+        return self._log_encoded_video_buffer(
+            "Relay demux pad buffer",
+            "demux_video_pad_buffer_count",
+            "demux_video_pad_log_budget",
+            None,
+            None,
+            info,
+        )
+
     def _on_mpegts_buffer(self, label, count_attr, log_budget_attr, info):
         buffer = info.get_buffer()
         if buffer is None:
@@ -1392,6 +1405,8 @@ class RtspRelay:
                 print(f"Ignoring demux pad with caps: {caps.to_string() if caps is not None else 'unknown'}", flush=True)
             self._attach_auxiliary_pad_branch(pipeline, pad, caps)
             return
+
+        pad.add_probe(Gst.PadProbeType.BUFFER, self._on_demux_video_pad_buffer)
 
         sink_pad = video_queue.get_static_pad("sink")
         if sink_pad is None:
@@ -1886,6 +1901,8 @@ class RtspRelay:
         self.depay_mpegts_buffer_count = 0
         self.tsparse_mpegts_log_budget = DEFAULT_MPEGTS_BUFFER_LOG_BUDGET
         self.tsparse_mpegts_buffer_count = 0
+        self.demux_video_pad_log_budget = DEFAULT_ENCODED_VIDEO_LOG_BUDGET
+        self.demux_video_pad_buffer_count = 0
         self.encoded_video_sink_log_budget = DEFAULT_ENCODED_VIDEO_LOG_BUDGET
         self.encoded_video_sink_buffer_count = 0
         self.encoded_video_log_budget = DEFAULT_ENCODED_VIDEO_LOG_BUDGET
