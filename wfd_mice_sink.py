@@ -856,6 +856,10 @@ class RtspRelay:
         self.tsparse_mpegts_buffer_count = 0
         self.demux_video_pad_log_budget = DEFAULT_ENCODED_VIDEO_LOG_BUDGET
         self.demux_video_pad_buffer_count = 0
+        self.demux_video_parser_sink_log_budget = DEFAULT_ENCODED_VIDEO_LOG_BUDGET
+        self.demux_video_parser_sink_buffer_count = 0
+        self.demux_video_parser_log_budget = DEFAULT_ENCODED_VIDEO_LOG_BUDGET
+        self.demux_video_parser_buffer_count = 0
         self.encoded_video_sink_log_budget = DEFAULT_ENCODED_VIDEO_LOG_BUDGET
         self.encoded_video_sink_buffer_count = 0
         self.encoded_video_log_budget = DEFAULT_ENCODED_VIDEO_LOG_BUDGET
@@ -1084,6 +1088,16 @@ class RtspRelay:
             raise RuntimeError("failed to look up WFD relay tsparse source pad")
         tsparse_src_pad.add_probe(Gst.PadProbeType.BUFFER, self._on_tsparse_mpegts_buffer)
 
+        video_parser_sink_pad = video_parser.get_static_pad("sink")
+        if video_parser_sink_pad is None:
+            raise RuntimeError("failed to look up WFD relay video parser sink pad")
+        video_parser_sink_pad.add_probe(Gst.PadProbeType.BUFFER, self._on_demux_video_parser_sink_buffer)
+
+        video_parser_src_pad = video_parser.get_static_pad("src")
+        if video_parser_src_pad is None:
+            raise RuntimeError("failed to look up WFD relay video parser source pad")
+        video_parser_src_pad.add_probe(Gst.PadProbeType.BUFFER, self._on_demux_video_parser_buffer)
+
         video_sink_pad = video_queue.get_static_pad("sink")
         if video_sink_pad is None:
             raise RuntimeError("failed to look up WFD relay video queue sink pad")
@@ -1200,6 +1214,28 @@ class RtspRelay:
             "Relay demux pad buffer",
             "demux_video_pad_buffer_count",
             "demux_video_pad_log_budget",
+            None,
+            None,
+            info,
+        )
+
+    def _on_demux_video_parser_sink_buffer(self, pad, info):
+        del pad
+        return self._log_encoded_video_buffer(
+            "Relay demux parser sink buffer",
+            "demux_video_parser_sink_buffer_count",
+            "demux_video_parser_sink_log_budget",
+            None,
+            None,
+            info,
+        )
+
+    def _on_demux_video_parser_buffer(self, pad, info):
+        del pad
+        return self._log_encoded_video_buffer(
+            "Relay demux parser src buffer",
+            "demux_video_parser_buffer_count",
+            "demux_video_parser_log_budget",
             None,
             None,
             info,
@@ -1918,6 +1954,10 @@ class RtspRelay:
         self.tsparse_mpegts_buffer_count = 0
         self.demux_video_pad_log_budget = DEFAULT_ENCODED_VIDEO_LOG_BUDGET
         self.demux_video_pad_buffer_count = 0
+        self.demux_video_parser_sink_log_budget = DEFAULT_ENCODED_VIDEO_LOG_BUDGET
+        self.demux_video_parser_sink_buffer_count = 0
+        self.demux_video_parser_log_budget = DEFAULT_ENCODED_VIDEO_LOG_BUDGET
+        self.demux_video_parser_buffer_count = 0
         self.encoded_video_sink_log_budget = DEFAULT_ENCODED_VIDEO_LOG_BUDGET
         self.encoded_video_sink_buffer_count = 0
         self.encoded_video_log_budget = DEFAULT_ENCODED_VIDEO_LOG_BUDGET
