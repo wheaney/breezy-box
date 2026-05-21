@@ -1,0 +1,135 @@
+INFO: starting renderer: ./breezy_drm_scene_demo --device /dev/dri/card0 --verbose --stream-pipeline 'udpsrc address=127.0.0.1 port=5600 caps="application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000" ! rtph264depay ! h264parse disable-passthrough=true ! video/x-h264,stream-format=byte-stream,alignment=au ! decodebin ! videoconvert'
+INFO: publishing Breezy Box on _display._tcp via Avahi as breezy-box-192-168-2-2-000002-2630.local -> 192.168.2.2
+Advertising WFD-MICE sink 'Breezy Box' on _display._tcp port 7250 with p2pMAC=02:00:00:00:00:02.
+Listening for MICE signalling on 192.168.2.2:7250.
+Waiting for Windows or GNOME Network Displays to connect, then relaying RTSP to 127.0.0.1:5600.
+Established under name 'Breezy Box'
+INFO: received SOURCE_READY from 192.168.2.1 (friendly='cachyos-x8664', rtsp-port=7236, source-id='GnomeMICEDisplay')
+DRM mode: 2560x1440@60 connector=54 crtc=39
+GL vendor: Mesa
+GL renderer: Mali-T860 (Panfrost)
+DMABUF import: available
+stream pipeline: udpsrc address=127.0.0.1 port=5600 caps="application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000" ! rtph264depay ! h264parse disable-passthrough=true ! video/x-h264,stream-format=byte-stream,alignment=au ! decodebin ! videoconvert
+INFO: starting renderer: ./breezy_drm_scene_demo --device /dev/dri/card0 --verbose --stream-pipeline 'udpsrc address=127.0.0.1 port=5600 caps="application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000" ! rtph264depay ! h264parse disable-passthrough=true ! video/x-h264,stream-format=byte-stream,alignment=au ! decodebin ! videoconvert'
+INFO: starting WFD relay from rtsp://192.168.2.1:7236/wfd1.0/streamid=0 (source='cachyos-x8664', source-id='GnomeMICEDisplay')
+GStreamer relay pipeline: udpsrc port=16384 caps="application/x-rtp,media=video,encoding-name=MP2T,payload=33,clock-rate=90000" ! queue max-size-buffers=8 ! application/x-rtp,media=video,encoding-name=MP2T,payload=33,clock-rate=90000 ! rtpmp2tdepay ! tsparse set-timestamps=true ! tsdemux emit-stats=true latency=0 name=demux [dynamic video/x-h264 pad] ! h264parse disable-passthrough=true ! video/x-h264,stream-format=byte-stream,alignment=au ! queue max-size-buffers=8 leaky=downstream ! tee name=video_tee video_tee. ! queue max-size-buffers=8 leaky=downstream ! h264parse config-interval=-1 disable-passthrough=true ! video/x-h264,stream-format=byte-stream,alignment=au ! rtph264pay pt=96 config-interval=1 ! udpsink host=127.0.0.1 port=5600 sync=false async=false video_tee. ! queue max-size-buffers=1 leaky=downstream ! decodebin ! videoconvert ! video/x-raw,format=RGBA ! appsink name=probe_sink max-buffers=1 drop=true sync=false emit-signals=true
+INFO: waiting up to 30.0s for source RTSP server at 192.168.2.1:7236
+INFO: source RTSP server at 192.168.2.1:7236 became reachable after 0.01s
+RTSP server request: OPTIONS * RTSP/1.0
+RTSP server request headers: {'cseq': ['1'], 'require': ['org.wfa.wfd1.0'], 'server': ['GStreamer RTSP server'], 'date': ['Thu, 21 May 2026 20:46:32 GMT']}
+RTSP request: OPTIONS *
+RTSP status line: RTSP/1.0 200 OK
+RTSP response: 200 OK for OPTIONS *
+RTSP server request: GET_PARAMETER rtsp://localhost/wfd1.0 RTSP/1.0
+RTSP server request headers: {'cseq': ['2'], 'content-type': ['text/parameters'], 'server': ['GStreamer RTSP server'], 'date': ['Thu, 21 May 2026 20:46:32 GMT'], 'content-length': ['123']}
+RTSP server request body: wfd_client_rtp_ports
+wfd_audio_codecs
+wfd_video_formats
+wfd_display_edid
+wfd_idr_request_capability
+microsoft_cursor
+RTSP server request: SET_PARAMETER rtsp://localhost/wfd1.0 RTSP/1.0
+RTSP server request headers: {'cseq': ['3'], 'content-type': ['text/parameters'], 'server': ['GStreamer RTSP server'], 'date': ['Thu, 21 May 2026 20:46:32 GMT'], 'content-length': ['255']}
+RTSP server request body: wfd_video_formats: 00 00 03 10 00000080 00000000 00000000 00 0000 0000 00 none none
+wfd_audio_codecs: AAC 00000001 00
+wfd_presentation_URL: rtsp://192.168.2.1:7236/wfd1.0/streamid=0 none
+wfd_client_rtp_ports: RTP/AVP/UDP;unicast 16384 16385 mode=play
+INFO: source presentation URL: rtsp://192.168.2.1:7236/wfd1.0/streamid=0
+RTSP server request: SET_PARAMETER rtsp://localhost/wfd1.0 RTSP/1.0
+RTSP server request headers: {'cseq': ['4'], 'content-type': ['text/parameters'], 'server': ['GStreamer RTSP server'], 'date': ['Thu, 21 May 2026 20:46:32 GMT'], 'content-length': ['27']}
+RTSP server request body: wfd_trigger_method: SETUP
+INFO: source requested WFD trigger: SETUP
+RTSP request: SETUP rtsp://192.168.2.1:7236/wfd1.0/streamid=0
+RTSP status line: RTSP/1.0 200 OK
+RTSP response: 200 OK for SETUP rtsp://192.168.2.1:7236/wfd1.0/streamid=0
+RTSP request: PLAY rtsp://192.168.2.1:7236/wfd1.0/streamid=0
+RTSP status line: RTSP/1.0 200 OK
+RTSP response: 200 OK for PLAY rtsp://192.168.2.1:7236/wfd1.0/streamid=0
+INFO: requesting initial IDR frame from source
+RTSP request: SET_PARAMETER rtsp://192.168.2.1:7236/wfd1.0/streamid=0
+RTSP status line: RTSP/1.0 200 OK
+RTSP response: 200 OK for SET_PARAMETER rtsp://192.168.2.1:7236/wfd1.0/streamid=0
+Relay input RTP packet: packet=1 size=1328 pt=33 seq=1 timestamp=0 marker=0
+Relay depay MPEG-TS buffer: buffer=1 size=1316 packets=7 remainder=0 sync=1 null_packets=0 pids=0x0000,0x0020,0x1011 pts_ms=1096.873714 dts_ms=1096.873714 flags=key,discont headers=pid=0x0000/pusi=1/afc=3/cc=1 pid=0x0020/pusi=1/afc=3/cc=1 pid=0x1011/pusi=1/afc=3/cc=1 pid=0x1011/pusi=0/afc=1/cc=2
+Relay tsparse MPEG-TS buffer: buffer=1 size=376 packets=2 remainder=0 sync=1 null_packets=0 pids=0x0000,0x0020 pts_ms=1096.873714 dts_ms=1096.873714 flags=key headers=pid=0x0000/pusi=1/afc=3/cc=1 pid=0x0020/pusi=1/afc=3/cc=1
+Relay input RTP packet: packet=2 size=1328 pt=33 seq=2 timestamp=0 marker=0
+Relay depay MPEG-TS buffer: buffer=2 size=1316 packets=7 remainder=0 sync=1 null_packets=0 pids=0x1011 pts_ms=1097.072631 dts_ms=1097.072631 flags=key headers=pid=0x1011/pusi=0/afc=1/cc=6 pid=0x1011/pusi=0/afc=1/cc=7 pid=0x1011/pusi=0/afc=1/cc=8 pid=0x1011/pusi=0/afc=1/cc=9
+Relay input RTP packet: packet=3 size=1328 pt=33 seq=3 timestamp=0 marker=0
+Relay depay MPEG-TS buffer: buffer=3 size=1316 packets=7 remainder=0 sync=1 null_packets=0 pids=0x1011 pts_ms=1097.105881 dts_ms=1097.105881 flags=key headers=pid=0x1011/pusi=0/afc=1/cc=13 pid=0x1011/pusi=0/afc=1/cc=14 pid=0x1011/pusi=0/afc=1/cc=15 pid=0x1011/pusi=0/afc=1/cc=0
+Relay input RTP packet: packet=4 size=1328 pt=33 seq=4 timestamp=0 marker=0
+Relay depay MPEG-TS buffer: buffer=4 size=1316 packets=7 remainder=0 sync=1 null_packets=0 pids=0x1011 pts_ms=1097.153422 dts_ms=1097.153422 flags=key headers=pid=0x1011/pusi=0/afc=1/cc=4 pid=0x1011/pusi=0/afc=1/cc=5 pid=0x1011/pusi=0/afc=1/cc=6 pid=0x1011/pusi=0/afc=1/cc=7
+Relay input RTP packet: packet=5 size=1328 pt=33 seq=5 timestamp=0 marker=0
+Relay depay MPEG-TS buffer: buffer=5 size=1316 packets=7 remainder=0 sync=1 null_packets=0 pids=0x1011 pts_ms=1097.184339 dts_ms=1097.184339 flags=key headers=pid=0x1011/pusi=0/afc=1/cc=11 pid=0x1011/pusi=0/afc=1/cc=12 pid=0x1011/pusi=0/afc=1/cc=13 pid=0x1011/pusi=0/afc=1/cc=14
+Relay input RTP packet: packet=6 size=1328 pt=33 seq=6 timestamp=0 marker=0
+Relay depay MPEG-TS buffer: buffer=6 size=1316 packets=7 remainder=0 sync=1 null_packets=0 pids=0x1011,0x1100,0x0000 pts_ms=1097.291672 dts_ms=1097.291672 flags=key headers=pid=0x1011/pusi=0/afc=3/cc=2 pid=0x1100/pusi=1/afc=1/cc=1 pid=0x1100/pusi=0/afc=1/cc=2 pid=0x1100/pusi=0/afc=1/cc=3
+Relay input RTP packet: packet=7 size=1328 pt=33 seq=7 timestamp=2999 marker=0
+Relay depay MPEG-TS buffer: buffer=7 size=1316 packets=7 remainder=0 sync=1 null_packets=0 pids=0x0020,0x1011 pts_ms=1130.524752 dts_ms=1130.524752 flags=key headers=pid=0x0020/pusi=1/afc=3/cc=2 pid=0x1011/pusi=1/afc=3/cc=3 pid=0x1011/pusi=0/afc=1/cc=4 pid=0x1011/pusi=0/afc=1/cc=5
+Relay input RTP packet: packet=8 size=1328 pt=33 seq=8 timestamp=2999 marker=0
+Relay depay MPEG-TS buffer: buffer=8 size=1316 packets=7 remainder=0 sync=1 null_packets=0 pids=0x1011 pts_ms=1130.619252 dts_ms=1130.619252 flags=key headers=pid=0x1011/pusi=0/afc=1/cc=9 pid=0x1011/pusi=0/afc=1/cc=10 pid=0x1011/pusi=0/afc=1/cc=11 pid=0x1011/pusi=0/afc=1/cc=12
+Relay input RTP packet: packet=9 size=1328 pt=33 seq=9 timestamp=2999 marker=0
+Relay depay MPEG-TS buffer: buffer=9 size=1316 packets=7 remainder=0 sync=1 null_packets=0 pids=0x1011 pts_ms=1130.649876 dts_ms=1130.649876 flags=key headers=pid=0x1011/pusi=0/afc=1/cc=0 pid=0x1011/pusi=0/afc=1/cc=1 pid=0x1011/pusi=0/afc=1/cc=2 pid=0x1011/pusi=0/afc=1/cc=3
+Relay input RTP packet: packet=10 size=1328 pt=33 seq=10 timestamp=2999 marker=0
+Relay depay MPEG-TS buffer: buffer=10 size=1316 packets=7 remainder=0 sync=1 null_packets=0 pids=0x1011 pts_ms=1130.677876 dts_ms=1130.677876 flags=key headers=pid=0x1011/pusi=0/afc=1/cc=7 pid=0x1011/pusi=0/afc=1/cc=8 pid=0x1011/pusi=0/afc=1/cc=9 pid=0x1011/pusi=0/afc=1/cc=10
+Relay input RTP packet: packet=11 size=1328 pt=33 seq=11 timestamp=2999 marker=0
+Relay depay MPEG-TS buffer: buffer=11 size=1316 packets=7 remainder=0 sync=1 null_packets=0 pids=0x1011 pts_ms=1130.70471 dts_ms=1130.70471 flags=key headers=pid=0x1011/pusi=0/afc=1/cc=14 pid=0x1011/pusi=0/afc=1/cc=15 pid=0x1011/pusi=0/afc=1/cc=0 pid=0x1011/pusi=0/afc=1/cc=1
+Relay input RTP packet: packet=12 size=1328 pt=33 seq=12 timestamp=2999 marker=0
+Relay depay MPEG-TS buffer: buffer=12 size=1316 packets=7 remainder=0 sync=1 null_packets=0 pids=0x1100 pts_ms=1130.73096 dts_ms=1130.73096 flags=key headers=pid=0x1100/pusi=1/afc=1/cc=6 pid=0x1100/pusi=0/afc=1/cc=7 pid=0x1100/pusi=0/afc=1/cc=8 pid=0x1100/pusi=0/afc=1/cc=9
+Relay tsparse MPEG-TS buffer: buffer=2 size=15980 packets=85 remainder=0 sync=1 null_packets=0 pids=0x1011 pts_ms=65.853198 dts_ms=65.853198 flags=key headers=pid=0x1011/pusi=1/afc=3/cc=1 pid=0x1011/pusi=0/afc=1/cc=2 pid=0x1011/pusi=0/afc=1/cc=3 pid=0x1011/pusi=0/afc=1/cc=4
+Relay tsdemux message: message=1 structure=pat, section=(GstMpegtsSection)NULL;
+Linked demux video pad with caps: video/x-h264, stream-format=(string)byte-stream
+Relay demux pad buffer: buffer=1 size=6189 pts_ms=190.853198 dts_ms=190.853198 flags=key,discont
+Relay demux parser sink buffer: buffer=1 size=6189 pts_ms=190.853198 dts_ms=190.853198 flags=key,discont
+Relay tsdemux message: message=2 structure=pmt, section=(GstMpegtsSection)NULL;
+Relay tsdemux message: message=3 structure=tsdemux, pid=(uint)4113, offset=(guint64)375, pts=(guint64)324000416;
+Ignoring demux pad with caps: audio/mpeg, mpegversion=(int)4, stream-format=(string)adts
+Draining auxiliary demux pad with caps: audio/mpeg, mpegversion=(int)4, stream-format=(string)adts
+Relay demux parser src buffer: buffer=1 size=6189 pts_ms=190.853198 dts_ms=190.853198 flags=key,discont
+Relay demux video buffer: buffer=1 size=6189 pts_ms=190.853198 dts_ms=190.853198 flags=key,discont
+Relay encoded video buffer: buffer=1 size=6189 pts_ms=190.853198 dts_ms=190.853198 flags=key,discont
+Relay demux pad buffer: buffer=2 size=6189 pts_ms=224.186531 dts_ms=224.186531 flags=key,discont
+Relay tsdemux message: message=4 structure=pmt, section=(GstMpegtsSection)NULL;
+Relay tsdemux message: message=5 structure=tsdemux, pid=(uint)4113, offset=(guint64)8083, pts=(guint64)324003416;
+Relay tsdemux message: message=6 structure=tsdemux, pid=(uint)4352, offset=(guint64)14475, pts=(guint64)324002819;
+Relay tsdemux message: message=7 structure=tsdemux, pid=(uint)4352, offset=(guint64)15415, pts=(guint64)324004739;
+Relay tsparse MPEG-TS buffer: buffer=3 size=24816 packets=132 remainder=0 sync=1 null_packets=0 pids=0x1011 pts_ms=132.679518 dts_ms=132.679518 flags=key headers=pid=0x1011/pusi=1/afc=3/cc=5 pid=0x1011/pusi=0/afc=1/cc=6 pid=0x1011/pusi=0/afc=1/cc=7 pid=0x1011/pusi=0/afc=1/cc=8
+Relay demux pad buffer: buffer=3 size=21178 pts_ms=257.519864 dts_ms=257.519864 flags=key
+Relay tsdemux message: message=8 structure=tsdemux, pid=(uint)4113, offset=(guint64)16355, pts=(guint64)324006416;
+Relay demux pad buffer: buffer=4 size=49 pts_ms=290.853198 dts_ms=290.853198 flags=key
+Relay tsdemux message: message=9 structure=tsdemux, pid=(uint)4352, offset=(guint64)38163, pts=(guint64)324006660;
+Relay tsdemux message: message=10 structure=tsdemux, pid=(uint)4352, offset=(guint64)39103, pts=(guint64)324008579;
+Relay tsdemux message: message=11 structure=tsdemux, pid=(uint)4113, offset=(guint64)40043, pts=(guint64)324009416;
+Relay tsdemux message: message=12 structure=tsdemux, pid=(uint)4352, offset=(guint64)40231, pts=(guint64)324010499;
+Relay tsparse MPEG-TS buffer: buffer=4 size=4512 packets=24 remainder=0 sync=1 null_packets=0 pids=0x1011,0x1100,0x0000,0x0020 pts_ms=196.753794 dts_ms=196.753794 flags=key headers=pid=0x1011/pusi=1/afc=3/cc=10 pid=0x1100/pusi=1/afc=1/cc=15 pid=0x1100/pusi=0/afc=1/cc=0 pid=0x1100/pusi=0/afc=1/cc=1
+Relay demux pad buffer: buffer=5 size=35 pts_ms=324.177774 dts_ms=324.177774 flags=key
+Relay tsdemux message: message=13 structure=tsdemux, pid=(uint)4113, offset=(guint64)41171, pts=(guint64)324012416;
+Relay demux pad buffer: buffer=6 size=40 pts_ms=357.511107 dts_ms=357.511107 flags=key
+Relay tsdemux message: message=14 structure=tsdemux, pid=(uint)4352, offset=(guint64)41359, pts=(guint64)324012420;
+Relay tsdemux message: message=15 structure=tsdemux, pid=(uint)4352, offset=(guint64)42299, pts=(guint64)324014339;
+Relay tsdemux message: message=16 structure=tsdemux, pid=(uint)4113, offset=(guint64)43615, pts=(guint64)324015416;
+Relay tsdemux message: message=17 structure=tsdemux, pid=(uint)4352, offset=(guint64)43803, pts=(guint64)324016259;
+Relay tsdemux message: message=18 structure=tsdemux, pid=(uint)4352, offset=(guint64)44743, pts=(guint64)324018180;
+Relay tsparse MPEG-TS buffer: buffer=5 size=3572 packets=19 remainder=0 sync=1 null_packets=0 pids=0x1011,0x1100 pts_ms=262.1484 dts_ms=262.1484 flags=key headers=pid=0x1011/pusi=1/afc=3/cc=12 pid=0x1100/pusi=1/afc=1/cc=3 pid=0x1100/pusi=0/afc=1/cc=4 pid=0x1100/pusi=0/afc=1/cc=5
+Relay demux pad buffer: buffer=7 size=40 pts_ms=390.807481 dts_ms=390.807481 flags=key
+Relay tsdemux message: message=19 structure=tsdemux, pid=(uint)4113, offset=(guint64)45683, pts=(guint64)324018416;
+Relay demux pad buffer: buffer=8 size=43 pts_ms=424.140814 dts_ms=424.140814 flags=key
+Relay tsdemux message: message=20 structure=tsdemux, pid=(uint)4352, offset=(guint64)45871, pts=(guint64)324020099;
+Relay probe frame summary: frame=1 1920x1080 pts_ms=190.853198 stride=7680 avg_rgb=(0,0,0) p0=(0, 0, 0, 255) p1=(0, 0, 0, 255) p2=(0, 0, 0, 255)
+Relay tsparse MPEG-TS buffer: buffer=6 size=3196 packets=17 remainder=0 sync=1 null_packets=0 pids=0x1011,0x1100 pts_ms=327.593 dts_ms=327.593 flags=key headers=pid=0x1011/pusi=1/afc=3/cc=14 pid=0x1100/pusi=1/afc=1/cc=2 pid=0x1100/pusi=0/afc=1/cc=3 pid=0x1100/pusi=0/afc=1/cc=4
+Relay demux pad buffer: buffer=9 size=43 pts_ms=457.391656 dts_ms=457.391656 flags=key
+Relay demux pad buffer: buffer=10 size=47 pts_ms=490.72499 dts_ms=490.72499 flags=key
+Relay tsparse MPEG-TS buffer: buffer=7 size=3572 packets=19 remainder=0 sync=1 null_packets=0 pids=0x1011,0x1100,0x0000,0x0020 pts_ms=393.428381 dts_ms=393.428381 flags=key headers=pid=0x1011/pusi=1/afc=3/cc=0 pid=0x1100/pusi=1/afc=1/cc=1 pid=0x1100/pusi=0/afc=1/cc=2 pid=0x1100/pusi=0/afc=1/cc=3
+Relay tsparse MPEG-TS buffer: buffer=8 size=3572 packets=19 remainder=0 sync=1 null_packets=0 pids=0x1011,0x1100 pts_ms=458.511044 dts_ms=458.511044 flags=key headers=pid=0x1011/pusi=1/afc=3/cc=2 pid=0x1100/pusi=1/afc=1/cc=0 pid=0x1100/pusi=0/afc=1/cc=1 pid=0x1100/pusi=0/afc=1/cc=2
+Relay tsparse MPEG-TS buffer: buffer=9 size=3196 packets=17 remainder=0 sync=1 null_packets=0 pids=0x1011,0x1100 pts_ms=522.845779 dts_ms=522.845779 flags=key headers=pid=0x1011/pusi=1/afc=3/cc=4 pid=0x1100/pusi=1/afc=1/cc=15 pid=0x1100/pusi=0/afc=1/cc=0 pid=0x1100/pusi=0/afc=1/cc=1
+Relay tsparse MPEG-TS buffer: buffer=10 size=3572 packets=19 remainder=0 sync=1 null_packets=0 pids=0x1011,0x1100,0x0000,0x0020 pts_ms=587.517903 dts_ms=587.517903 flags=key headers=pid=0x1011/pusi=1/afc=3/cc=6 pid=0x1100/pusi=1/afc=1/cc=14 pid=0x1100/pusi=0/afc=1/cc=15 pid=0x1100/pusi=0/afc=1/cc=0
+Relay tsparse MPEG-TS buffer: buffer=11 size=3572 packets=19 remainder=0 sync=1 null_packets=0 pids=0x1011,0x1100 pts_ms=651.532747 dts_ms=651.532747 flags=key headers=pid=0x1011/pusi=1/afc=3/cc=8 pid=0x1100/pusi=1/afc=1/cc=13 pid=0x1100/pusi=0/afc=1/cc=14 pid=0x1100/pusi=0/afc=1/cc=15
+Relay tsparse MPEG-TS buffer: buffer=12 size=4136 packets=22 remainder=0 sync=1 null_packets=0 pids=0x1011,0x1100 pts_ms=715.840217 dts_ms=715.840217 flags=key headers=pid=0x1011/pusi=1/afc=3/cc=10 pid=0x1100/pusi=1/afc=1/cc=12 pid=0x1100/pusi=0/afc=1/cc=13 pid=0x1100/pusi=0/afc=1/cc=14
+Relay tsdemux message: message=300 structure=tsdemux, pid=(uint)4113, offset=(guint64)348363, pts=(guint64)324348416;
+ERROR: RTSP control loop failed: RTSP control connection closed unexpectedly
+Got SIGINT, quitting.
+DRM mode: 2560x1440@60 connector=54 crtc=39
+GL vendor: Mesa
+GL renderer: Mali-T860 (Panfrost)
+DMABUF import: available
+stream pipeline: udpsrc address=127.0.0.1 port=5600 caps="application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000" ! rtph264depay ! h264parse disable-passthrough=true ! video/x-h264,stream-format=byte-stream,alignment=au ! decodebin ! videoconvert
+stream received first sample: caps=video/x-raw, width=(int)1920, height=(int)1080, interlace-mode=(string)progressive, multiview-mode=(string)mono, multiview-flags=(GstVideoMultiviewFlagsSet)0:ffffffff:/right-view-first/left-flipped/left-flopped/right-flipped/right-flopped/half-aspect/mixed-mono, pixel-aspect-ratio=(fraction)1/1, framerate=(fraction)30/1, format=(string)RGBA memories=1
+RGBA frame summary: 1920x1080 stride=7680 avg_rgb=(0,0,0) p0=(0,0,0,255) p1=(0,0,0,255) p2=(0,0,0,255)

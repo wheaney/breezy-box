@@ -839,6 +839,7 @@ class RtspRelay:
         self.keepalive_source_id = 0
         self.demux = None
         self.video_queue = None
+        self.auxiliary_queue = None
         self.auxiliary_elements = []
         self.probe_black_log_budget = DEFAULT_PROBE_BLACK_LOG_BUDGET
         self.probe_non_black_logged = False
@@ -934,6 +935,8 @@ class RtspRelay:
         video_capsfilter = Gst.ElementFactory.make("capsfilter", "wfd_video_h264_caps")
         video_queue = Gst.ElementFactory.make("queue", "wfd_video_queue")
         video_tee = Gst.ElementFactory.make("tee", "wfd_video_tee")
+        auxiliary_queue = Gst.ElementFactory.make("queue", "wfd_aux_queue")
+        auxiliary_sink = Gst.ElementFactory.make("fakesink", "wfd_aux_sink")
         relay_queue = Gst.ElementFactory.make("queue", "wfd_relay_queue")
         parser = Gst.ElementFactory.make("h264parse", "wfd_h264parse")
         capsfilter = Gst.ElementFactory.make("capsfilter", "wfd_h264_caps")
@@ -957,6 +960,8 @@ class RtspRelay:
             video_capsfilter,
             video_queue,
             video_tee,
+            auxiliary_queue,
+            auxiliary_sink,
             relay_queue,
             parser,
             capsfilter,
@@ -991,6 +996,10 @@ class RtspRelay:
         )
         video_queue.set_property("max-size-buffers", 8)
         video_queue.set_property("leaky", 2)
+        auxiliary_queue.set_property("max-size-buffers", 8)
+        auxiliary_queue.set_property("leaky", 2)
+        auxiliary_sink.set_property("sync", False)
+        auxiliary_sink.set_property("async", False)
         relay_queue.set_property("max-size-buffers", 8)
         relay_queue.set_property("leaky", 2)
         parser.set_property("config-interval", -1)
@@ -1028,6 +1037,8 @@ class RtspRelay:
         pipeline.add(video_capsfilter)
         pipeline.add(video_queue)
         pipeline.add(video_tee)
+        pipeline.add(auxiliary_queue)
+        pipeline.add(auxiliary_sink)
         pipeline.add(relay_queue)
         pipeline.add(parser)
         pipeline.add(capsfilter)
@@ -1048,6 +1059,7 @@ class RtspRelay:
                                      (video_parser, video_capsfilter),
                                      (video_capsfilter, video_queue),
                                      (video_queue, video_tee),
+                                     (auxiliary_queue, auxiliary_sink),
                                      (relay_queue, parser),
                                      (parser, capsfilter),
                                      (capsfilter, pay),
@@ -1113,6 +1125,7 @@ class RtspRelay:
         probe_sink.connect("new-sample", self._on_probe_sample)
         self.demux = demux
         self.video_queue = video_queue
+        self.auxiliary_queue = auxiliary_queue
         return pipeline
 
     def _on_probe_decodebin_pad_added(self, decodebin, pad, probe_convert):
@@ -1474,6 +1487,18 @@ class RtspRelay:
     def _attach_auxiliary_pad_branch(self, pipeline, pad, caps):
         if pad.is_linked():
             return
+
+        if self.auxiliary_queue is not None:
+            sink_pad = self.auxiliary_queue.get_static_pad("sink")
+            if sink_pad is None:
+                raise RuntimeError("failed to look up primary auxiliary relay queue sink pad")
+            if not sink_pad.is_linked():
+                link_result = pad.link(sink_pad)
+                if link_result != Gst.PadLinkReturn.OK:
+                    raise RuntimeError(f"failed to link primary auxiliary demux pad: {link_result.value_nick}")
+                if self.args.verbose:
+                    print(f"Draining auxiliary demux pad with caps: {caps.to_string() if caps is not None else 'unknown'}", flush=True)
+                return
 
         queue_name = f"wfd_aux_queue_{len(self.auxiliary_elements)}"
         sink_name = f"wfd_aux_sink_{len(self.auxiliary_elements)}"
@@ -1937,6 +1962,7 @@ class RtspRelay:
         self.current_url = None
         self.demux = None
         self.video_queue = None
+        self.auxiliary_queue = None
         self.auxiliary_elements = []
         self.probe_black_log_budget = DEFAULT_PROBE_BLACK_LOG_BUDGET
         self.probe_non_black_logged = False
