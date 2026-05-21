@@ -44,6 +44,8 @@ DEFAULT_ENCODED_VIDEO_LOG_BUDGET = 10
 DEFAULT_ENCODED_VIDEO_IDLE_LOG_BUDGET = 6
 DEFAULT_MPEGTS_BUFFER_LOG_BUDGET = 12
 DEFAULT_TSDEMUX_MESSAGE_LOG_BUDGET = 20
+DEFAULT_PAD_EVENT_LOG_BUDGET = 20
+DEFAULT_DEMUX_STALL_SNAPSHOT_BUDGET = 2
 DEFAULT_RELAY_HOST = "127.0.0.1"
 DEFAULT_RELAY_PORT = 5600
 DEFAULT_PAYLOAD_TYPE = 96
@@ -838,6 +840,8 @@ class RtspRelay:
         self.handshake_complete = False
         self.keepalive_source_id = 0
         self.demux = None
+        self.demux_video_pad = None
+        self.demux_video_queue = None
         self.video_queue = None
         self.auxiliary_queue = None
         self.auxiliary_elements = []
@@ -857,12 +861,17 @@ class RtspRelay:
         self.tsparse_mpegts_buffer_count = 0
         self.demux_video_pad_log_budget = DEFAULT_ENCODED_VIDEO_LOG_BUDGET
         self.demux_video_pad_buffer_count = 0
+        self.demux_video_pad_event_log_budget = DEFAULT_PAD_EVENT_LOG_BUDGET
+        self.demux_video_pad_event_count = 0
         self.demux_video_queue_sink_log_budget = DEFAULT_ENCODED_VIDEO_LOG_BUDGET
         self.demux_video_queue_sink_buffer_count = 0
+        self.demux_video_queue_sink_event_log_budget = DEFAULT_PAD_EVENT_LOG_BUDGET
+        self.demux_video_queue_sink_event_count = 0
         self.demux_video_parser_sink_log_budget = DEFAULT_ENCODED_VIDEO_LOG_BUDGET
         self.demux_video_parser_sink_buffer_count = 0
         self.demux_video_parser_log_budget = DEFAULT_ENCODED_VIDEO_LOG_BUDGET
         self.demux_video_parser_buffer_count = 0
+        self.demux_video_stall_snapshot_budget = DEFAULT_DEMUX_STALL_SNAPSHOT_BUDGET
         self.encoded_video_sink_log_budget = DEFAULT_ENCODED_VIDEO_LOG_BUDGET
         self.encoded_video_sink_buffer_count = 0
         self.encoded_video_log_budget = DEFAULT_ENCODED_VIDEO_LOG_BUDGET
@@ -1111,6 +1120,10 @@ class RtspRelay:
         if demux_video_queue_sink_pad is None:
             raise RuntimeError("failed to look up WFD relay demux video queue sink pad")
         demux_video_queue_sink_pad.add_probe(Gst.PadProbeType.BUFFER, self._on_demux_video_queue_sink_buffer)
+        demux_video_queue_sink_pad.add_probe(
+            Gst.PadProbeType.EVENT_DOWNSTREAM | Gst.PadProbeType.EVENT_FLUSH,
+            self._on_demux_video_queue_sink_event,
+        )
 
         video_parser_sink_pad = video_parser.get_static_pad("sink")
         if video_parser_sink_pad is None:
@@ -1136,6 +1149,7 @@ class RtspRelay:
         probe_decodebin.connect("pad-added", self._on_probe_decodebin_pad_added, probe_convert)
         probe_sink.connect("new-sample", self._on_probe_sample)
         self.demux = demux
+        self.demux_video_queue = demux_video_queue
         self.video_queue = video_queue
         self.auxiliary_queue = auxiliary_queue
         return pipeline
@@ -1234,13 +1248,23 @@ class RtspRelay:
         )
 
     def _on_demux_video_pad_buffer(self, pad, info):
-        del pad
-        return self._log_encoded_video_buffer(
+        result = self._log_encoded_video_buffer(
             "Relay demux pad buffer",
             "demux_video_pad_buffer_count",
             "demux_video_pad_log_budget",
             None,
             None,
+            info,
+        )
+        self._maybe_log_demux_video_stall_snapshot(pad)
+        return result
+
+    def _on_demux_video_pad_event(self, pad, info):
+        return self._log_pad_event(
+            "Relay demux pad event",
+            "demux_video_pad_event_count",
+            "demux_video_pad_event_log_budget",
+            pad,
             info,
         )
 
@@ -1252,6 +1276,15 @@ class RtspRelay:
             "demux_video_queue_sink_log_budget",
             None,
             None,
+            info,
+        )
+
+    def _on_demux_video_queue_sink_event(self, pad, info):
+        return self._log_pad_event(
+            "Relay demux queue sink event",
+            "demux_video_queue_sink_event_count",
+            "demux_video_queue_sink_event_log_budget",
+            pad,
             info,
         )
 
@@ -1320,6 +1353,93 @@ class RtspRelay:
                 )
 
         return Gst.PadProbeReturn.OK
+
+    def _log_pad_event(self, label, count_attr, log_budget_attr, pad, info):
+        event = info.get_event()
+        if event is None:
+            return Gst.PadProbeReturn.OK
+
+        count = getattr(self, count_attr) + 1
+        setattr(self, count_attr, count)
+
+        event_type = event.type
+        should_log = event_type in {
+            Gst.EventType.STREAM_START,
+            Gst.EventType.CAPS,
+            Gst.EventType.SEGMENT,
+            Gst.EventType.FLUSH_START,
+            Gst.EventType.FLUSH_STOP,
+            Gst.EventType.EOS,
+        }
+        log_budget = getattr(self, log_budget_attr)
+        if log_budget > 0:
+            should_log = True
+            setattr(self, log_budget_attr, log_budget - 1)
+
+        if not should_log:
+            return Gst.PadProbeReturn.OK
+
+        detail = ""
+        try:
+            if event_type == Gst.EventType.STREAM_START:
+                detail = f" stream_id={event.parse_stream_start()}"
+            elif event_type == Gst.EventType.CAPS:
+                caps = event.parse_caps()
+                detail = f" caps={caps.to_string() if caps is not None else 'unknown'}"
+            elif event_type == Gst.EventType.SEGMENT:
+                segment = event.parse_segment()
+                detail = (
+                    f" format={segment.format.value_nick}"
+                    f" start={segment.start}"
+                    f" stop={segment.stop}"
+                    f" time={segment.time}"
+                    f" base={segment.base}"
+                    f" rate={segment.rate}"
+                )
+        except Exception as exc:
+            detail = f" detail_error={exc}"
+
+        parent = pad.get_parent_element()
+        pad_name = f"{parent.get_name() if parent is not None else 'unknown'}:{pad.get_name()}"
+        print(
+            f"{label}: count={count} pad={pad_name} event={event_type.value_nick}{detail}",
+            flush=True,
+        )
+        return Gst.PadProbeReturn.OK
+
+    def _maybe_log_demux_video_stall_snapshot(self, pad):
+        if self.demux_video_stall_snapshot_budget <= 0:
+            return
+        if self.demux_video_pad_buffer_count < 2:
+            return
+        if self.demux_video_queue_sink_buffer_count >= self.demux_video_pad_buffer_count:
+            return
+
+        peer = pad.get_peer()
+        peer_parent = peer.get_parent_element() if peer is not None else None
+        queue_level_buffers = None
+        queue_level_bytes = None
+        queue_level_time = None
+        if self.demux_video_queue is not None:
+            queue_level_buffers = self.demux_video_queue.get_property("current-level-buffers")
+            queue_level_bytes = self.demux_video_queue.get_property("current-level-bytes")
+            queue_level_time = self.demux_video_queue.get_property("current-level-time")
+
+        print(
+            "Relay demux stall snapshot: "
+            f"pad_buffers={self.demux_video_pad_buffer_count} "
+            f"queue_sink_buffers={self.demux_video_queue_sink_buffer_count} "
+            f"parser_sink_buffers={self.demux_video_parser_sink_buffer_count} "
+            f"parser_src_buffers={self.demux_video_parser_buffer_count} "
+            f"encoded_buffers={self.encoded_video_buffer_count} "
+            f"pad_linked={int(pad.is_linked())} "
+            f"peer={peer_parent.get_name() + ':' + peer.get_name() if peer_parent is not None and peer is not None else 'none'} "
+            f"queue_level_buffers={queue_level_buffers if queue_level_buffers is not None else 'unknown'} "
+            f"queue_level_bytes={queue_level_bytes if queue_level_bytes is not None else 'unknown'} "
+            f"queue_level_time={queue_level_time if queue_level_time is not None else 'unknown'}",
+            flush=True,
+        )
+        self.demux_video_stall_snapshot_budget -= 1
 
     def _on_encoded_video_buffer(self, pad, info):
         del pad
@@ -1494,6 +1614,11 @@ class RtspRelay:
             return
 
         pad.add_probe(Gst.PadProbeType.BUFFER, self._on_demux_video_pad_buffer)
+        pad.add_probe(
+            Gst.PadProbeType.EVENT_DOWNSTREAM | Gst.PadProbeType.EVENT_FLUSH,
+            self._on_demux_video_pad_event,
+        )
+        self.demux_video_pad = pad
 
         sink_pad = demux_video_queue.get_static_pad("sink")
         if sink_pad is None:
@@ -1984,6 +2109,8 @@ class RtspRelay:
         self.aggregate_url = None
         self.current_url = None
         self.demux = None
+        self.demux_video_pad = None
+        self.demux_video_queue = None
         self.video_queue = None
         self.auxiliary_queue = None
         self.auxiliary_elements = []
@@ -2003,12 +2130,17 @@ class RtspRelay:
         self.tsparse_mpegts_buffer_count = 0
         self.demux_video_pad_log_budget = DEFAULT_ENCODED_VIDEO_LOG_BUDGET
         self.demux_video_pad_buffer_count = 0
+        self.demux_video_pad_event_log_budget = DEFAULT_PAD_EVENT_LOG_BUDGET
+        self.demux_video_pad_event_count = 0
         self.demux_video_queue_sink_log_budget = DEFAULT_ENCODED_VIDEO_LOG_BUDGET
         self.demux_video_queue_sink_buffer_count = 0
+        self.demux_video_queue_sink_event_log_budget = DEFAULT_PAD_EVENT_LOG_BUDGET
+        self.demux_video_queue_sink_event_count = 0
         self.demux_video_parser_sink_log_budget = DEFAULT_ENCODED_VIDEO_LOG_BUDGET
         self.demux_video_parser_sink_buffer_count = 0
         self.demux_video_parser_log_budget = DEFAULT_ENCODED_VIDEO_LOG_BUDGET
         self.demux_video_parser_buffer_count = 0
+        self.demux_video_stall_snapshot_budget = DEFAULT_DEMUX_STALL_SNAPSHOT_BUDGET
         self.encoded_video_sink_log_budget = DEFAULT_ENCODED_VIDEO_LOG_BUDGET
         self.encoded_video_sink_buffer_count = 0
         self.encoded_video_log_budget = DEFAULT_ENCODED_VIDEO_LOG_BUDGET
