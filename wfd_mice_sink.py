@@ -505,7 +505,7 @@ def build_relay_pipeline_description(args):
         'caps="application/x-rtp,media=video,encoding-name=MP2T,payload=33,clock-rate=90000" ! '
         'queue max-size-buffers=8 ! '
         'application/x-rtp,media=video,encoding-name=MP2T,payload=33,clock-rate=90000 ! '
-        'rtpmp2tdepay ! tsdemux name=demux '
+        'rtpmp2tdepay ! tsparse set-timestamps=true ! tsdemux name=demux '
         '[dynamic video/x-h264 pad] ! queue max-size-buffers=8 leaky=downstream ! tee name=video_tee '
         'video_tee. ! queue max-size-buffers=8 leaky=downstream ! '
         'h264parse config-interval=-1 disable-passthrough=true ! '
@@ -828,6 +828,7 @@ class RtspRelay:
         udpsrc = Gst.ElementFactory.make("udpsrc", "wfd_udpsrc")
         source_queue = Gst.ElementFactory.make("queue", "wfd_source_queue")
         depay = Gst.ElementFactory.make("rtpmp2tdepay", "wfd_rtpmp2tdepay")
+        tsparse = Gst.ElementFactory.make("tsparse", "wfd_tsparse")
         demux = Gst.ElementFactory.make("tsdemux", "wfd_tsdemux")
         video_queue = Gst.ElementFactory.make("queue", "wfd_video_queue")
         video_tee = Gst.ElementFactory.make("tee", "wfd_video_tee")
@@ -848,6 +849,7 @@ class RtspRelay:
             udpsrc,
             source_queue,
             depay,
+            tsparse,
             demux,
             video_queue,
             video_tee,
@@ -875,6 +877,7 @@ class RtspRelay:
         )
         udpsrc.set_property("port", self.args.wfd_client_rtp_port)
         source_queue.set_property("max-size-buffers", 8)
+        tsparse.set_property("set-timestamps", True)
         video_queue.set_property("max-size-buffers", 8)
         video_queue.set_property("leaky", 2)
         relay_queue.set_property("max-size-buffers", 8)
@@ -908,6 +911,7 @@ class RtspRelay:
         pipeline.add(udpsrc)
         pipeline.add(source_queue)
         pipeline.add(depay)
+        pipeline.add(tsparse)
         pipeline.add(demux)
         pipeline.add(video_queue)
         pipeline.add(video_tee)
@@ -926,7 +930,8 @@ class RtspRelay:
 
         for upstream, downstream in ((udpsrc, source_queue),
                                      (source_queue, depay),
-                                     (depay, demux),
+                                     (depay, tsparse),
+                                     (tsparse, demux),
                                      (video_queue, video_tee),
                                      (relay_queue, parser),
                                      (parser, capsfilter),
@@ -1809,6 +1814,7 @@ def validate_environment(args):
     for element_name in (
         "udpsrc",
         "rtpmp2tdepay",
+        "tsparse",
         "tsdemux",
         "fakesink",
         "h264parse",
