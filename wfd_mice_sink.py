@@ -852,6 +852,8 @@ class RtspRelay:
         self.depay_mpegts_buffer_count = 0
         self.tsparse_mpegts_log_budget = DEFAULT_MPEGTS_BUFFER_LOG_BUDGET
         self.tsparse_mpegts_buffer_count = 0
+        self.encoded_video_sink_log_budget = DEFAULT_ENCODED_VIDEO_LOG_BUDGET
+        self.encoded_video_sink_buffer_count = 0
         self.encoded_video_log_budget = DEFAULT_ENCODED_VIDEO_LOG_BUDGET
         self.encoded_video_idle_log_budget = DEFAULT_ENCODED_VIDEO_IDLE_LOG_BUDGET
         self.encoded_video_buffer_count = 0
@@ -1065,6 +1067,11 @@ class RtspRelay:
             raise RuntimeError("failed to look up WFD relay tsparse source pad")
         tsparse_src_pad.add_probe(Gst.PadProbeType.BUFFER, self._on_tsparse_mpegts_buffer)
 
+        video_sink_pad = video_queue.get_static_pad("sink")
+        if video_sink_pad is None:
+            raise RuntimeError("failed to look up WFD relay video queue sink pad")
+        video_sink_pad.add_probe(Gst.PadProbeType.BUFFER, self._on_encoded_video_queue_sink_buffer)
+
         video_src_pad = video_queue.get_static_pad("src")
         if video_src_pad is None:
             raise RuntimeError("failed to look up WFD relay video queue source pad")
@@ -1159,6 +1166,17 @@ class RtspRelay:
             info,
         )
 
+    def _on_encoded_video_queue_sink_buffer(self, pad, info):
+        del pad
+        return self._log_encoded_video_buffer(
+            "Relay demux video buffer",
+            "encoded_video_sink_buffer_count",
+            "encoded_video_sink_log_budget",
+            None,
+            None,
+            info,
+        )
+
     def _on_mpegts_buffer(self, label, count_attr, log_budget_attr, info):
         buffer = info.get_buffer()
         if buffer is None:
@@ -1205,18 +1223,32 @@ class RtspRelay:
 
     def _on_encoded_video_buffer(self, pad, info):
         del pad
+        return self._log_encoded_video_buffer(
+            "Relay encoded video buffer",
+            "encoded_video_buffer_count",
+            "encoded_video_log_budget",
+            "encoded_video_last_pts_ms",
+            "encoded_video_last_buffer_monotonic",
+            info,
+        )
+
+    def _log_encoded_video_buffer(self, label, count_attr, log_budget_attr, last_pts_attr, last_buffer_monotonic_attr, info):
         buffer = info.get_buffer()
         if buffer is None:
             return Gst.PadProbeReturn.OK
 
-        self.encoded_video_buffer_count += 1
-        self.encoded_video_idle_log_budget = DEFAULT_ENCODED_VIDEO_IDLE_LOG_BUDGET
-        self.encoded_video_last_buffer_monotonic = time.monotonic()
+        count = getattr(self, count_attr) + 1
+        setattr(self, count_attr, count)
+
+        if last_buffer_monotonic_attr is not None:
+            self.encoded_video_idle_log_budget = DEFAULT_ENCODED_VIDEO_IDLE_LOG_BUDGET
+            setattr(self, last_buffer_monotonic_attr, time.monotonic())
 
         pts_ms = None
         if buffer.pts != Gst.CLOCK_TIME_NONE:
             pts_ms = buffer.pts / Gst.MSECOND
-        self.encoded_video_last_pts_ms = pts_ms
+        if last_pts_attr is not None:
+            setattr(self, last_pts_attr, pts_ms)
 
         dts_ms = None
         if buffer.dts != Gst.CLOCK_TIME_NONE:
@@ -1230,16 +1262,17 @@ class RtspRelay:
             flag_names.append("corrupted")
 
         should_log = False
-        if self.encoded_video_log_budget > 0:
+        log_budget = getattr(self, log_budget_attr)
+        if log_budget > 0:
             should_log = True
-            self.encoded_video_log_budget -= 1
-        elif self.encoded_video_buffer_count % 120 == 0:
+            setattr(self, log_budget_attr, log_budget - 1)
+        elif count % 120 == 0:
             should_log = True
 
         if should_log:
             print(
-                "Relay encoded video buffer: "
-                f"buffer={self.encoded_video_buffer_count} "
+                f"{label}: "
+                f"buffer={count} "
                 f"size={buffer.get_size()} "
                 f"pts_ms={pts_ms if pts_ms is not None else 'none'} "
                 f"dts_ms={dts_ms if dts_ms is not None else 'none'} "
@@ -1853,6 +1886,8 @@ class RtspRelay:
         self.depay_mpegts_buffer_count = 0
         self.tsparse_mpegts_log_budget = DEFAULT_MPEGTS_BUFFER_LOG_BUDGET
         self.tsparse_mpegts_buffer_count = 0
+        self.encoded_video_sink_log_budget = DEFAULT_ENCODED_VIDEO_LOG_BUDGET
+        self.encoded_video_sink_buffer_count = 0
         self.encoded_video_log_budget = DEFAULT_ENCODED_VIDEO_LOG_BUDGET
         self.encoded_video_idle_log_budget = DEFAULT_ENCODED_VIDEO_IDLE_LOG_BUDGET
         self.encoded_video_buffer_count = 0
