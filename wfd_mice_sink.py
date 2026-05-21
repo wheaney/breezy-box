@@ -589,7 +589,7 @@ def build_relay_pipeline_description(args):
         'caps="application/x-rtp,media=video,encoding-name=MP2T,payload=33,clock-rate=90000" ! '
         'queue max-size-buffers=8 ! '
         'application/x-rtp,media=video,encoding-name=MP2T,payload=33,clock-rate=90000 ! '
-        'rtpmp2tdepay ! tsparse set-timestamps=true ! tsdemux emit-stats=true name=demux '
+        'rtpmp2tdepay ! tsparse set-timestamps=true ! tsdemux emit-stats=true latency=0 name=demux '
         '[dynamic video/x-h264 pad] ! queue max-size-buffers=8 leaky=downstream ! tee name=video_tee '
         'video_tee. ! queue max-size-buffers=8 leaky=downstream ! '
         'h264parse config-interval=-1 disable-passthrough=true ! '
@@ -969,6 +969,7 @@ class RtspRelay:
         source_queue.set_property("max-size-buffers", 8)
         tsparse.set_property("set-timestamps", True)
         demux.set_property("emit-stats", True)
+        demux.set_property("latency", 0)
         video_queue.set_property("max-size-buffers", 8)
         video_queue.set_property("leaky", 2)
         relay_queue.set_property("max-size-buffers", 8)
