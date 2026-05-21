@@ -590,7 +590,7 @@ def build_relay_pipeline_description(args):
         'queue max-size-buffers=8 ! '
         'application/x-rtp,media=video,encoding-name=MP2T,payload=33,clock-rate=90000 ! '
         'rtpmp2tdepay ! tsparse set-timestamps=true ! tsdemux emit-stats=true latency=0 name=demux '
-        '[dynamic video/x-h264 pad] ! h264parse disable-passthrough=true ! '
+        '[dynamic video/x-h264 pad] ! queue max-size-buffers=8 ! h264parse disable-passthrough=true ! '
         'video/x-h264,stream-format=byte-stream,alignment=au ! '
         'queue max-size-buffers=8 leaky=downstream ! tee name=video_tee '
         'video_tee. ! queue max-size-buffers=8 leaky=downstream ! '
@@ -857,6 +857,8 @@ class RtspRelay:
         self.tsparse_mpegts_buffer_count = 0
         self.demux_video_pad_log_budget = DEFAULT_ENCODED_VIDEO_LOG_BUDGET
         self.demux_video_pad_buffer_count = 0
+        self.demux_video_queue_sink_log_budget = DEFAULT_ENCODED_VIDEO_LOG_BUDGET
+        self.demux_video_queue_sink_buffer_count = 0
         self.demux_video_parser_sink_log_budget = DEFAULT_ENCODED_VIDEO_LOG_BUDGET
         self.demux_video_parser_sink_buffer_count = 0
         self.demux_video_parser_log_budget = DEFAULT_ENCODED_VIDEO_LOG_BUDGET
@@ -931,6 +933,7 @@ class RtspRelay:
         depay = Gst.ElementFactory.make("rtpmp2tdepay", "wfd_rtpmp2tdepay")
         tsparse = Gst.ElementFactory.make("tsparse", "wfd_tsparse")
         demux = Gst.ElementFactory.make("tsdemux", "wfd_tsdemux")
+        demux_video_queue = Gst.ElementFactory.make("queue", "wfd_demux_video_queue")
         video_parser = Gst.ElementFactory.make("h264parse", "wfd_video_h264parse")
         video_capsfilter = Gst.ElementFactory.make("capsfilter", "wfd_video_h264_caps")
         video_queue = Gst.ElementFactory.make("queue", "wfd_video_queue")
@@ -956,6 +959,7 @@ class RtspRelay:
             depay,
             tsparse,
             demux,
+            demux_video_queue,
             video_parser,
             video_capsfilter,
             video_queue,
@@ -989,6 +993,7 @@ class RtspRelay:
         tsparse.set_property("set-timestamps", True)
         demux.set_property("emit-stats", True)
         demux.set_property("latency", 0)
+        demux_video_queue.set_property("max-size-buffers", 8)
         video_parser.set_property("disable-passthrough", True)
         video_capsfilter.set_property(
             "caps",
@@ -1033,6 +1038,7 @@ class RtspRelay:
         pipeline.add(depay)
         pipeline.add(tsparse)
         pipeline.add(demux)
+        pipeline.add(demux_video_queue)
         pipeline.add(video_parser)
         pipeline.add(video_capsfilter)
         pipeline.add(video_queue)
@@ -1056,6 +1062,7 @@ class RtspRelay:
                                      (source_queue, depay),
                                      (depay, tsparse),
                                      (tsparse, demux),
+                                     (demux_video_queue, video_parser),
                                      (video_parser, video_capsfilter),
                                      (video_capsfilter, video_queue),
                                      (video_queue, video_tee),
@@ -1100,6 +1107,11 @@ class RtspRelay:
             raise RuntimeError("failed to look up WFD relay tsparse source pad")
         tsparse_src_pad.add_probe(Gst.PadProbeType.BUFFER, self._on_tsparse_mpegts_buffer)
 
+        demux_video_queue_sink_pad = demux_video_queue.get_static_pad("sink")
+        if demux_video_queue_sink_pad is None:
+            raise RuntimeError("failed to look up WFD relay demux video queue sink pad")
+        demux_video_queue_sink_pad.add_probe(Gst.PadProbeType.BUFFER, self._on_demux_video_queue_sink_buffer)
+
         video_parser_sink_pad = video_parser.get_static_pad("sink")
         if video_parser_sink_pad is None:
             raise RuntimeError("failed to look up WFD relay video parser sink pad")
@@ -1120,7 +1132,7 @@ class RtspRelay:
             raise RuntimeError("failed to look up WFD relay video queue source pad")
         video_src_pad.add_probe(Gst.PadProbeType.BUFFER, self._on_encoded_video_buffer)
 
-        demux.connect("pad-added", self._on_demux_pad_added, video_parser)
+        demux.connect("pad-added", self._on_demux_pad_added, demux_video_queue)
         probe_decodebin.connect("pad-added", self._on_probe_decodebin_pad_added, probe_convert)
         probe_sink.connect("new-sample", self._on_probe_sample)
         self.demux = demux
@@ -1227,6 +1239,17 @@ class RtspRelay:
             "Relay demux pad buffer",
             "demux_video_pad_buffer_count",
             "demux_video_pad_log_budget",
+            None,
+            None,
+            info,
+        )
+
+    def _on_demux_video_queue_sink_buffer(self, pad, info):
+        del pad
+        return self._log_encoded_video_buffer(
+            "Relay demux queue sink buffer",
+            "demux_video_queue_sink_buffer_count",
+            "demux_video_queue_sink_log_budget",
             None,
             None,
             info,
@@ -1455,7 +1478,7 @@ class RtspRelay:
                 )
         return Gst.FlowReturn.OK
 
-    def _on_demux_pad_added(self, demux, pad, video_parser):
+    def _on_demux_pad_added(self, demux, pad, demux_video_queue):
         pipeline = demux.get_parent()
         if pipeline is None:
             raise RuntimeError("failed to look up relay pipeline for tsdemux pad handling")
@@ -1472,15 +1495,15 @@ class RtspRelay:
 
         pad.add_probe(Gst.PadProbeType.BUFFER, self._on_demux_video_pad_buffer)
 
-        sink_pad = video_parser.get_static_pad("sink")
+        sink_pad = demux_video_queue.get_static_pad("sink")
         if sink_pad is None:
-            raise RuntimeError("failed to look up WFD relay video parser sink pad")
+            raise RuntimeError("failed to look up WFD relay demux video queue sink pad")
         if sink_pad.is_linked():
             return
 
         link_result = pad.link(sink_pad)
         if link_result != Gst.PadLinkReturn.OK:
-            raise RuntimeError(f"failed to link tsdemux video pad to relay parser: {link_result.value_nick}")
+            raise RuntimeError(f"failed to link tsdemux video pad to relay video queue: {link_result.value_nick}")
         if self.args.verbose:
             print(f"Linked demux video pad with caps: {caps.to_string() if caps is not None else 'unknown'}", flush=True)
 
@@ -1980,6 +2003,8 @@ class RtspRelay:
         self.tsparse_mpegts_buffer_count = 0
         self.demux_video_pad_log_budget = DEFAULT_ENCODED_VIDEO_LOG_BUDGET
         self.demux_video_pad_buffer_count = 0
+        self.demux_video_queue_sink_log_budget = DEFAULT_ENCODED_VIDEO_LOG_BUDGET
+        self.demux_video_queue_sink_buffer_count = 0
         self.demux_video_parser_sink_log_budget = DEFAULT_ENCODED_VIDEO_LOG_BUDGET
         self.demux_video_parser_sink_buffer_count = 0
         self.demux_video_parser_log_budget = DEFAULT_ENCODED_VIDEO_LOG_BUDGET
