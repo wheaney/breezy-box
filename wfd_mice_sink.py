@@ -38,6 +38,8 @@ DEFAULT_WFD_CLIENT_RTP_PORT = 16384
 DEFAULT_WFD_VIDEO_FORMATS = "00 00 03 10 0001ffff 1fffffff 00001fff 00 0000 0000 10 none none"
 DEFAULT_WFD_AUDIO_CODECS = "AAC 00000007 00"
 DEFAULT_PROBE_BLACK_LOG_BUDGET = 20
+DEFAULT_ENCODED_VIDEO_LOG_BUDGET = 10
+DEFAULT_ENCODED_VIDEO_IDLE_LOG_BUDGET = 6
 DEFAULT_RELAY_HOST = "127.0.0.1"
 DEFAULT_RELAY_PORT = 5600
 DEFAULT_PAYLOAD_TYPE = 96
@@ -753,6 +755,12 @@ class RtspRelay:
         self.probe_black_log_budget = DEFAULT_PROBE_BLACK_LOG_BUDGET
         self.probe_non_black_logged = False
         self.probe_frame_count = 0
+        self.encoded_video_log_budget = DEFAULT_ENCODED_VIDEO_LOG_BUDGET
+        self.encoded_video_idle_log_budget = DEFAULT_ENCODED_VIDEO_IDLE_LOG_BUDGET
+        self.encoded_video_buffer_count = 0
+        self.encoded_video_last_pts_ms = None
+        self.encoded_video_last_buffer_monotonic = None
+        self.encoded_video_watchdog_source_id = 0
 
     def start(self, source_host, source_ready):
         self.stop()
@@ -792,6 +800,10 @@ class RtspRelay:
             connected_socket.close()
             self.stop()
             raise RuntimeError(f"failed to start relay pipeline for {next_url}")
+        self.encoded_video_watchdog_source_id = GLib.timeout_add_seconds(
+            5,
+            self._on_encoded_video_watchdog,
+        )
 
         self._open_control_connection(connected_socket)
         self.aggregate_url = next_url
@@ -932,6 +944,11 @@ class RtspRelay:
         if probe_pad.link(probe_sink_pad) != Gst.PadLinkReturn.OK:
             raise RuntimeError("failed to link probe tee branch")
 
+        video_src_pad = video_queue.get_static_pad("src")
+        if video_src_pad is None:
+            raise RuntimeError("failed to look up WFD relay video queue source pad")
+        video_src_pad.add_probe(Gst.PadProbeType.BUFFER, self._on_encoded_video_buffer)
+
         demux.connect("pad-added", self._on_demux_pad_added, video_queue)
         probe_decodebin.connect("pad-added", self._on_probe_decodebin_pad_added, probe_convert)
         probe_sink.connect("new-sample", self._on_probe_sample)
@@ -947,6 +964,78 @@ class RtspRelay:
         link_result = pad.link(sink_pad)
         if link_result != Gst.PadLinkReturn.OK:
             raise RuntimeError(f"failed to link probe decodebin pad: {link_result.value_nick}")
+
+    def _on_encoded_video_buffer(self, pad, info):
+        del pad
+        buffer = info.get_buffer()
+        if buffer is None:
+            return Gst.PadProbeReturn.OK
+
+        self.encoded_video_buffer_count += 1
+        self.encoded_video_idle_log_budget = DEFAULT_ENCODED_VIDEO_IDLE_LOG_BUDGET
+        self.encoded_video_last_buffer_monotonic = time.monotonic()
+
+        pts_ms = None
+        if buffer.pts != Gst.CLOCK_TIME_NONE:
+            pts_ms = buffer.pts / Gst.MSECOND
+        self.encoded_video_last_pts_ms = pts_ms
+
+        dts_ms = None
+        if buffer.dts != Gst.CLOCK_TIME_NONE:
+            dts_ms = buffer.dts / Gst.MSECOND
+
+        buffer_flags = buffer.get_flags()
+        flag_names = ["delta" if buffer_flags & Gst.BufferFlags.DELTA_UNIT else "key"]
+        if buffer_flags & Gst.BufferFlags.DISCONT:
+            flag_names.append("discont")
+        if buffer_flags & Gst.BufferFlags.CORRUPTED:
+            flag_names.append("corrupted")
+
+        should_log = False
+        if self.encoded_video_log_budget > 0:
+            should_log = True
+            self.encoded_video_log_budget -= 1
+        elif self.encoded_video_buffer_count % 120 == 0:
+            should_log = True
+
+        if should_log:
+            print(
+                "Relay encoded video buffer: "
+                f"buffer={self.encoded_video_buffer_count} "
+                f"size={buffer.get_size()} "
+                f"pts_ms={pts_ms if pts_ms is not None else 'none'} "
+                f"dts_ms={dts_ms if dts_ms is not None else 'none'} "
+                f"flags={','.join(flag_names)}",
+                flush=True,
+            )
+
+        return Gst.PadProbeReturn.OK
+
+    def _on_encoded_video_watchdog(self):
+        if self.pipeline is None:
+            self.encoded_video_watchdog_source_id = 0
+            return GLib.SOURCE_REMOVE
+
+        if (
+            self.encoded_video_buffer_count == 0
+            or self.encoded_video_last_buffer_monotonic is None
+            or self.encoded_video_idle_log_budget <= 0
+        ):
+            return GLib.SOURCE_CONTINUE
+
+        idle_ms = (time.monotonic() - self.encoded_video_last_buffer_monotonic) * 1000.0
+        if idle_ms < 5000.0:
+            return GLib.SOURCE_CONTINUE
+
+        print(
+            "Relay encoded video idle: "
+            f"buffers={self.encoded_video_buffer_count} "
+            f"last_pts_ms={self.encoded_video_last_pts_ms if self.encoded_video_last_pts_ms is not None else 'none'} "
+            f"idle_ms={idle_ms:.0f}",
+            flush=True,
+        )
+        self.encoded_video_idle_log_budget -= 1
+        return GLib.SOURCE_CONTINUE
 
     def _on_probe_sample(self, sink):
         sample = sink.emit("pull-sample")
@@ -1456,6 +1545,9 @@ class RtspRelay:
         if self.keepalive_source_id:
             GLib.source_remove(self.keepalive_source_id)
             self.keepalive_source_id = 0
+        if self.encoded_video_watchdog_source_id:
+            GLib.source_remove(self.encoded_video_watchdog_source_id)
+            self.encoded_video_watchdog_source_id = 0
         self.control_thread_stop.set()
         if self.control_socket is not None:
             self.control_socket.close()
@@ -1487,6 +1579,11 @@ class RtspRelay:
         self.probe_black_log_budget = DEFAULT_PROBE_BLACK_LOG_BUDGET
         self.probe_non_black_logged = False
         self.probe_frame_count = 0
+        self.encoded_video_log_budget = DEFAULT_ENCODED_VIDEO_LOG_BUDGET
+        self.encoded_video_idle_log_budget = DEFAULT_ENCODED_VIDEO_IDLE_LOG_BUDGET
+        self.encoded_video_buffer_count = 0
+        self.encoded_video_last_pts_ms = None
+        self.encoded_video_last_buffer_monotonic = None
         self.presentation_url = None
         self.sent_sink_options = False
         self.handshake_complete = False
