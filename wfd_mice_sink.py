@@ -590,7 +590,9 @@ def build_relay_pipeline_description(args):
         'queue max-size-buffers=8 ! '
         'application/x-rtp,media=video,encoding-name=MP2T,payload=33,clock-rate=90000 ! '
         'rtpmp2tdepay ! tsparse set-timestamps=true ! tsdemux emit-stats=true latency=0 name=demux '
-        '[dynamic video/x-h264 pad] ! queue max-size-buffers=8 leaky=downstream ! tee name=video_tee '
+        '[dynamic video/x-h264 pad] ! h264parse disable-passthrough=true ! '
+        'video/x-h264,stream-format=byte-stream,alignment=au ! '
+        'queue max-size-buffers=8 leaky=downstream ! tee name=video_tee '
         'video_tee. ! queue max-size-buffers=8 leaky=downstream ! '
         'h264parse config-interval=-1 disable-passthrough=true ! '
         'video/x-h264,stream-format=byte-stream,alignment=au ! '
@@ -924,6 +926,8 @@ class RtspRelay:
         depay = Gst.ElementFactory.make("rtpmp2tdepay", "wfd_rtpmp2tdepay")
         tsparse = Gst.ElementFactory.make("tsparse", "wfd_tsparse")
         demux = Gst.ElementFactory.make("tsdemux", "wfd_tsdemux")
+        video_parser = Gst.ElementFactory.make("h264parse", "wfd_video_h264parse")
+        video_capsfilter = Gst.ElementFactory.make("capsfilter", "wfd_video_h264_caps")
         video_queue = Gst.ElementFactory.make("queue", "wfd_video_queue")
         video_tee = Gst.ElementFactory.make("tee", "wfd_video_tee")
         relay_queue = Gst.ElementFactory.make("queue", "wfd_relay_queue")
@@ -945,6 +949,8 @@ class RtspRelay:
             depay,
             tsparse,
             demux,
+            video_parser,
+            video_capsfilter,
             video_queue,
             video_tee,
             relay_queue,
@@ -974,6 +980,11 @@ class RtspRelay:
         tsparse.set_property("set-timestamps", True)
         demux.set_property("emit-stats", True)
         demux.set_property("latency", 0)
+        video_parser.set_property("disable-passthrough", True)
+        video_capsfilter.set_property(
+            "caps",
+            Gst.Caps.from_string("video/x-h264,stream-format=byte-stream,alignment=au"),
+        )
         video_queue.set_property("max-size-buffers", 8)
         video_queue.set_property("leaky", 2)
         relay_queue.set_property("max-size-buffers", 8)
@@ -1009,6 +1020,8 @@ class RtspRelay:
         pipeline.add(depay)
         pipeline.add(tsparse)
         pipeline.add(demux)
+        pipeline.add(video_parser)
+        pipeline.add(video_capsfilter)
         pipeline.add(video_queue)
         pipeline.add(video_tee)
         pipeline.add(relay_queue)
@@ -1028,6 +1041,8 @@ class RtspRelay:
                                      (source_queue, depay),
                                      (depay, tsparse),
                                      (tsparse, demux),
+                                     (video_parser, video_capsfilter),
+                                     (video_capsfilter, video_queue),
                                      (video_queue, video_tee),
                                      (relay_queue, parser),
                                      (parser, capsfilter),
@@ -1079,7 +1094,7 @@ class RtspRelay:
             raise RuntimeError("failed to look up WFD relay video queue source pad")
         video_src_pad.add_probe(Gst.PadProbeType.BUFFER, self._on_encoded_video_buffer)
 
-        demux.connect("pad-added", self._on_demux_pad_added, video_queue)
+        demux.connect("pad-added", self._on_demux_pad_added, video_parser)
         probe_decodebin.connect("pad-added", self._on_probe_decodebin_pad_added, probe_convert)
         probe_sink.connect("new-sample", self._on_probe_sample)
         self.demux = demux
@@ -1391,7 +1406,7 @@ class RtspRelay:
                 )
         return Gst.FlowReturn.OK
 
-    def _on_demux_pad_added(self, demux, pad, video_queue):
+    def _on_demux_pad_added(self, demux, pad, video_parser):
         pipeline = demux.get_parent()
         if pipeline is None:
             raise RuntimeError("failed to look up relay pipeline for tsdemux pad handling")
@@ -1408,15 +1423,15 @@ class RtspRelay:
 
         pad.add_probe(Gst.PadProbeType.BUFFER, self._on_demux_video_pad_buffer)
 
-        sink_pad = video_queue.get_static_pad("sink")
+        sink_pad = video_parser.get_static_pad("sink")
         if sink_pad is None:
-            raise RuntimeError("failed to look up WFD relay video queue sink pad")
+            raise RuntimeError("failed to look up WFD relay video parser sink pad")
         if sink_pad.is_linked():
             return
 
         link_result = pad.link(sink_pad)
         if link_result != Gst.PadLinkReturn.OK:
-            raise RuntimeError(f"failed to link tsdemux video pad to relay queue: {link_result.value_nick}")
+            raise RuntimeError(f"failed to link tsdemux video pad to relay parser: {link_result.value_nick}")
         if self.args.verbose:
             print(f"Linked demux video pad with caps: {caps.to_string() if caps is not None else 'unknown'}", flush=True)
 
