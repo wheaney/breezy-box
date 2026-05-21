@@ -38,6 +38,8 @@ DEFAULT_WFD_CLIENT_RTP_PORT = 16384
 DEFAULT_WFD_VIDEO_FORMATS = "00 00 03 10 0001ffff 1fffffff 00001fff 00 0000 0000 10 none none"
 DEFAULT_WFD_AUDIO_CODECS = "AAC 00000007 00"
 DEFAULT_PROBE_BLACK_LOG_BUDGET = 20
+DEFAULT_PROBE_CHANGE_LOG_BUDGET = 20
+DEFAULT_PROBE_STILL_LOG_BUDGET = 6
 DEFAULT_INPUT_RTP_LOG_BUDGET = 12
 DEFAULT_INPUT_RTP_IDLE_LOG_BUDGET = 6
 DEFAULT_ENCODED_VIDEO_LOG_BUDGET = 10
@@ -344,6 +346,9 @@ def first_parameter_token(value):
 def summary_is_black(summary):
     if summary is None or "error" in summary:
         return False
+
+    if summary.get("non_black_samples") is not None:
+        return summary["non_black_samples"] == 0
 
     if summary.get("avg_rgb") != (0, 0, 0):
         return False
@@ -663,6 +668,8 @@ def summarize_rgba_buffer(buffer, caps):
         total_green = 0
         total_blue = 0
         sampled_pixels = 0
+        non_black_samples = 0
+        signature = hashlib.blake2s(digest_size=8)
         step_y = max(1, height // 8)
         step_x = max(1, width // 8)
 
@@ -670,9 +677,16 @@ def summarize_rgba_buffer(buffer, caps):
             row_offset = y * stride
             for x in range(0, width, step_x):
                 offset = row_offset + x * 4
-                total_red += data[offset + 0]
-                total_green += data[offset + 1]
-                total_blue += data[offset + 2]
+                red = data[offset + 0]
+                green = data[offset + 1]
+                blue = data[offset + 2]
+                alpha = data[offset + 3]
+                total_red += red
+                total_green += green
+                total_blue += blue
+                signature.update(bytes((red, green, blue, alpha)))
+                if red != 0 or green != 0 or blue != 0:
+                    non_black_samples += 1
                 sampled_pixels += 1
 
         points = []
@@ -690,6 +704,9 @@ def summarize_rgba_buffer(buffer, caps):
                 total_green // max(sampled_pixels, 1),
                 total_blue // max(sampled_pixels, 1),
             ),
+            "sample_count": sampled_pixels,
+            "non_black_samples": non_black_samples,
+            "sample_signature": signature.hexdigest(),
             "points": points,
         }
     finally:
@@ -846,8 +863,12 @@ class RtspRelay:
         self.auxiliary_queue = None
         self.auxiliary_elements = []
         self.probe_black_log_budget = DEFAULT_PROBE_BLACK_LOG_BUDGET
+        self.probe_change_log_budget = DEFAULT_PROBE_CHANGE_LOG_BUDGET
+        self.probe_still_log_budget = DEFAULT_PROBE_STILL_LOG_BUDGET
         self.probe_non_black_logged = False
         self.probe_frame_count = 0
+        self.probe_last_signature = None
+        self.probe_last_change_frame = 0
         self.input_rtp_log_budget = DEFAULT_INPUT_RTP_LOG_BUDGET
         self.input_rtp_idle_log_budget = DEFAULT_INPUT_RTP_IDLE_LOG_BUDGET
         self.input_rtp_packet_count = 0
@@ -1557,13 +1578,39 @@ class RtspRelay:
         pts_ms = None
         if buffer is not None and buffer.pts != Gst.CLOCK_TIME_NONE:
             pts_ms = buffer.pts / Gst.MSECOND
+        sample_signature = None
+        signature_changed = False
+        unchanged_frames = 0
+        if summary is not None and "error" not in summary:
+            sample_signature = summary.get("sample_signature")
+            if sample_signature != self.probe_last_signature:
+                signature_changed = self.probe_last_signature is not None
+                self.probe_last_signature = sample_signature
+                self.probe_last_change_frame = self.probe_frame_count
+            else:
+                unchanged_frames = self.probe_frame_count - self.probe_last_change_frame
+
         should_log = False
         if summary is None or "error" in (summary or {}):
             should_log = True
+        elif self.probe_frame_count <= 12:
+            should_log = True
+        elif signature_changed:
+            if self.probe_change_log_budget > 0:
+                should_log = True
+                self.probe_change_log_budget -= 1
+            elif self.probe_frame_count % 120 == 0:
+                should_log = True
         elif summary_is_black(summary):
             if self.probe_black_log_budget > 0:
                 should_log = True
                 self.probe_black_log_budget -= 1
+            elif unchanged_frames in (30, 120, 300):
+                should_log = True
+        elif unchanged_frames in (30, 120, 300):
+            if self.probe_still_log_budget > 0:
+                should_log = True
+                self.probe_still_log_budget -= 1
         elif not self.probe_non_black_logged:
             should_log = True
             self.probe_non_black_logged = True
@@ -1592,6 +1639,10 @@ class RtspRelay:
                     f"{summary['width']}x{summary['height']} "
                     f"pts_ms={pts_ms if pts_ms is not None else 'none'} "
                     f"stride={summary['stride']} "
+                    f"sig={summary.get('sample_signature', 'none')} "
+                    f"changed={int(signature_changed)} "
+                    f"unchanged_frames={unchanged_frames} "
+                    f"non_black_samples={summary.get('non_black_samples', 'none')}/{summary.get('sample_count', 'none')} "
                     f"avg_rgb=({avg_r},{avg_g},{avg_b}) "
                     f"p0={p0} p1={p1} p2={p2}",
                     flush=True,
@@ -2132,8 +2183,12 @@ class RtspRelay:
         self.auxiliary_queue = None
         self.auxiliary_elements = []
         self.probe_black_log_budget = DEFAULT_PROBE_BLACK_LOG_BUDGET
+        self.probe_change_log_budget = DEFAULT_PROBE_CHANGE_LOG_BUDGET
+        self.probe_still_log_budget = DEFAULT_PROBE_STILL_LOG_BUDGET
         self.probe_non_black_logged = False
         self.probe_frame_count = 0
+        self.probe_last_signature = None
+        self.probe_last_change_frame = 0
         self.input_rtp_log_budget = DEFAULT_INPUT_RTP_LOG_BUDGET
         self.input_rtp_idle_log_budget = DEFAULT_INPUT_RTP_IDLE_LOG_BUDGET
         self.input_rtp_packet_count = 0
