@@ -38,6 +38,8 @@ DEFAULT_WFD_CLIENT_RTP_PORT = 16384
 DEFAULT_WFD_VIDEO_FORMATS = "00 00 03 10 0001ffff 1fffffff 00001fff 00 0000 0000 10 none none"
 DEFAULT_WFD_AUDIO_CODECS = "AAC 00000007 00"
 DEFAULT_PROBE_BLACK_LOG_BUDGET = 20
+DEFAULT_INPUT_RTP_LOG_BUDGET = 12
+DEFAULT_INPUT_RTP_IDLE_LOG_BUDGET = 6
 DEFAULT_ENCODED_VIDEO_LOG_BUDGET = 10
 DEFAULT_ENCODED_VIDEO_IDLE_LOG_BUDGET = 6
 DEFAULT_RELAY_HOST = "127.0.0.1"
@@ -755,6 +757,13 @@ class RtspRelay:
         self.probe_black_log_budget = DEFAULT_PROBE_BLACK_LOG_BUDGET
         self.probe_non_black_logged = False
         self.probe_frame_count = 0
+        self.input_rtp_log_budget = DEFAULT_INPUT_RTP_LOG_BUDGET
+        self.input_rtp_idle_log_budget = DEFAULT_INPUT_RTP_IDLE_LOG_BUDGET
+        self.input_rtp_packet_count = 0
+        self.input_rtp_last_seq = None
+        self.input_rtp_last_timestamp = None
+        self.input_rtp_last_payload_type = None
+        self.input_rtp_last_packet_monotonic = None
         self.encoded_video_log_budget = DEFAULT_ENCODED_VIDEO_LOG_BUDGET
         self.encoded_video_idle_log_budget = DEFAULT_ENCODED_VIDEO_IDLE_LOG_BUDGET
         self.encoded_video_buffer_count = 0
@@ -944,6 +953,11 @@ class RtspRelay:
         if probe_pad.link(probe_sink_pad) != Gst.PadLinkReturn.OK:
             raise RuntimeError("failed to link probe tee branch")
 
+        source_src_pad = source_queue.get_static_pad("src")
+        if source_src_pad is None:
+            raise RuntimeError("failed to look up WFD relay source queue source pad")
+        source_src_pad.add_probe(Gst.PadProbeType.BUFFER, self._on_input_rtp_packet)
+
         video_src_pad = video_queue.get_static_pad("src")
         if video_src_pad is None:
             raise RuntimeError("failed to look up WFD relay video queue source pad")
@@ -964,6 +978,61 @@ class RtspRelay:
         link_result = pad.link(sink_pad)
         if link_result != Gst.PadLinkReturn.OK:
             raise RuntimeError(f"failed to link probe decodebin pad: {link_result.value_nick}")
+
+    def _on_input_rtp_packet(self, pad, info):
+        del pad
+        buffer = info.get_buffer()
+        if buffer is None:
+            return Gst.PadProbeReturn.OK
+
+        self.input_rtp_packet_count += 1
+        self.input_rtp_idle_log_budget = DEFAULT_INPUT_RTP_IDLE_LOG_BUDGET
+        self.input_rtp_last_packet_monotonic = time.monotonic()
+
+        packet_size = buffer.get_size()
+        payload_type = None
+        marker = False
+        sequence = None
+        timestamp = None
+
+        success, map_info = buffer.map(Gst.MapFlags.READ)
+        if success:
+            try:
+                data = map_info.data
+                if len(data) >= 12:
+                    version = data[0] >> 6
+                    if version == 2:
+                        payload_type = data[1] & 0x7F
+                        marker = bool(data[1] & 0x80)
+                        sequence = int.from_bytes(data[2:4], byteorder="big")
+                        timestamp = int.from_bytes(data[4:8], byteorder="big")
+            finally:
+                buffer.unmap(map_info)
+
+        self.input_rtp_last_payload_type = payload_type
+        self.input_rtp_last_seq = sequence
+        self.input_rtp_last_timestamp = timestamp
+
+        should_log = False
+        if self.input_rtp_log_budget > 0:
+            should_log = True
+            self.input_rtp_log_budget -= 1
+        elif self.input_rtp_packet_count % 300 == 0:
+            should_log = True
+
+        if should_log:
+            print(
+                "Relay input RTP packet: "
+                f"packet={self.input_rtp_packet_count} "
+                f"size={packet_size} "
+                f"pt={payload_type if payload_type is not None else 'unknown'} "
+                f"seq={sequence if sequence is not None else 'unknown'} "
+                f"timestamp={timestamp if timestamp is not None else 'unknown'} "
+                f"marker={int(marker)}",
+                flush=True,
+            )
+
+        return Gst.PadProbeReturn.OK
 
     def _on_encoded_video_buffer(self, pad, info):
         del pad
@@ -1015,6 +1084,24 @@ class RtspRelay:
         if self.pipeline is None:
             self.encoded_video_watchdog_source_id = 0
             return GLib.SOURCE_REMOVE
+
+        if (
+            self.input_rtp_packet_count > 0
+            and self.input_rtp_last_packet_monotonic is not None
+            and self.input_rtp_idle_log_budget > 0
+        ):
+            input_idle_ms = (time.monotonic() - self.input_rtp_last_packet_monotonic) * 1000.0
+            if input_idle_ms >= 5000.0:
+                print(
+                    "Relay input RTP idle: "
+                    f"packets={self.input_rtp_packet_count} "
+                    f"last_pt={self.input_rtp_last_payload_type if self.input_rtp_last_payload_type is not None else 'unknown'} "
+                    f"last_seq={self.input_rtp_last_seq if self.input_rtp_last_seq is not None else 'unknown'} "
+                    f"last_timestamp={self.input_rtp_last_timestamp if self.input_rtp_last_timestamp is not None else 'unknown'} "
+                    f"idle_ms={input_idle_ms:.0f}",
+                    flush=True,
+                )
+                self.input_rtp_idle_log_budget -= 1
 
         if (
             self.encoded_video_buffer_count == 0
@@ -1507,6 +1594,13 @@ class RtspRelay:
         except Exception as exc:
             LOGGER.warning("failed to request initial IDR frame: %s", exc)
 
+        if self.keepalive_source_id:
+            GLib.source_remove(self.keepalive_source_id)
+        self.keepalive_source_id = GLib.timeout_add_seconds(
+            self.args.rtsp_keepalive_interval_sec,
+            self._keepalive,
+        )
+
         self.handshake_complete = True
 
     def _send_server_response(self, request_headers, status_code, reason, extra_headers=None, body=b""):
@@ -1579,6 +1673,13 @@ class RtspRelay:
         self.probe_black_log_budget = DEFAULT_PROBE_BLACK_LOG_BUDGET
         self.probe_non_black_logged = False
         self.probe_frame_count = 0
+        self.input_rtp_log_budget = DEFAULT_INPUT_RTP_LOG_BUDGET
+        self.input_rtp_idle_log_budget = DEFAULT_INPUT_RTP_IDLE_LOG_BUDGET
+        self.input_rtp_packet_count = 0
+        self.input_rtp_last_seq = None
+        self.input_rtp_last_timestamp = None
+        self.input_rtp_last_payload_type = None
+        self.input_rtp_last_packet_monotonic = None
         self.encoded_video_log_budget = DEFAULT_ENCODED_VIDEO_LOG_BUDGET
         self.encoded_video_idle_log_budget = DEFAULT_ENCODED_VIDEO_IDLE_LOG_BUDGET
         self.encoded_video_buffer_count = 0
