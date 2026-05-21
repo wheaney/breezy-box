@@ -1624,7 +1624,24 @@ class RtspRelay:
         if sink_pad is None:
             raise RuntimeError("failed to look up WFD relay demux video queue sink pad")
         if sink_pad.is_linked():
-            return
+            peer_pad = sink_pad.get_peer()
+            if peer_pad == pad:
+                return
+            if peer_pad is None:
+                raise RuntimeError("relay video queue sink pad is linked without an upstream peer")
+            if not peer_pad.unlink(sink_pad):
+                raise RuntimeError("failed to unlink stale tsdemux video pad from relay video queue")
+            if self.args.verbose:
+                peer_parent = peer_pad.get_parent_element()
+                old_pad_name = (
+                    f"{peer_parent.get_name()}:{peer_pad.get_name()}"
+                    if peer_parent is not None
+                    else peer_pad.get_name()
+                )
+                print(
+                    f"Replacing stale demux video pad link {old_pad_name} -> {pad.get_name()}",
+                    flush=True,
+                )
 
         link_result = pad.link(sink_pad)
         if link_result != Gst.PadLinkReturn.OK:
