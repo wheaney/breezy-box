@@ -4,10 +4,12 @@
 #include <EGL/eglext.h>
 #include <GLES2/gl2.h>
 #include <GLES2/gl2ext.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <gbm.h>
 #include <getopt.h>
 #include <math.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -614,6 +616,64 @@ static struct drm_fb *drm_fb_get_from_bo(int drm_fd, struct gbm_bo *bo)
 
     gbm_bo_set_user_data(bo, fb, drm_fb_destroy_callback);
     return fb;
+}
+
+static void page_flip_handler(int fd,
+                              unsigned int frame,
+                              unsigned int sec,
+                              unsigned int usec,
+                              void *data)
+{
+    bool *completed = data;
+
+    (void)fd;
+    (void)frame;
+    (void)sec;
+    (void)usec;
+    if (completed) {
+        *completed = true;
+    }
+}
+
+static int wait_for_page_flip(struct renderer *renderer, bool *completed)
+{
+    drmEventContext event_context;
+    struct pollfd poll_fd;
+
+    memset(&event_context, 0, sizeof(event_context));
+    event_context.version = DRM_EVENT_CONTEXT_VERSION;
+    event_context.page_flip_handler = page_flip_handler;
+
+    memset(&poll_fd, 0, sizeof(poll_fd));
+    poll_fd.fd = renderer->drm_fd;
+    poll_fd.events = POLLIN;
+
+    while (!*completed) {
+        const int poll_result = poll(&poll_fd, 1, 5000);
+
+        if (poll_result < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            perror("poll");
+            return -1;
+        }
+        if (poll_result == 0) {
+            fprintf(stderr, "timed out waiting for DRM page flip\n");
+            return -1;
+        }
+        if ((poll_fd.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+            fprintf(stderr, "DRM page flip poll failed: revents=0x%x\n", poll_fd.revents);
+            return -1;
+        }
+        if ((poll_fd.revents & POLLIN) != 0 &&
+            drmHandleEvent(renderer->drm_fd, &event_context) != 0) {
+            perror("drmHandleEvent");
+            return -1;
+        }
+    }
+
+    return 0;
 }
 
 static int find_active_pipeline(int drm_fd, struct drm_pipeline *pipeline)
@@ -1925,7 +1985,6 @@ static int renderer_present(struct renderer *renderer)
 {
     struct gbm_bo *bo;
     struct drm_fb *fb;
-    uint32_t connector_id = renderer->pipeline.connector_id;
 
     if (!eglSwapBuffers(renderer->egl_display, renderer->egl_surface)) {
         fprintf(stderr, "eglSwapBuffers failed\n");
@@ -1945,22 +2004,44 @@ static int renderer_present(struct renderer *renderer)
         return -1;
     }
 
-    if (drmModeSetCrtc(renderer->drm_fd,
-                       renderer->pipeline.crtc_id,
-                       fb->fb_id,
-                       0,
-                       0,
-                       &connector_id,
-                       1,
-                       &renderer->pipeline.mode) != 0) {
-        perror("drmModeSetCrtc");
-        gbm_surface_release_buffer(renderer->gbm_surface, bo);
-        return -1;
+    if (!renderer->previous_bo) {
+        uint32_t connector_id = renderer->pipeline.connector_id;
+
+        if (drmModeSetCrtc(renderer->drm_fd,
+                           renderer->pipeline.crtc_id,
+                           fb->fb_id,
+                           0,
+                           0,
+                           &connector_id,
+                           1,
+                           &renderer->pipeline.mode) != 0) {
+            perror("drmModeSetCrtc");
+            gbm_surface_release_buffer(renderer->gbm_surface, bo);
+            return -1;
+        }
+        renderer->previous_bo = bo;
+        return 0;
     }
 
-    if (renderer->previous_bo) {
-        gbm_surface_release_buffer(renderer->gbm_surface, renderer->previous_bo);
+    {
+        bool page_flip_completed = false;
+
+        if (drmModePageFlip(renderer->drm_fd,
+                            renderer->pipeline.crtc_id,
+                            fb->fb_id,
+                            DRM_MODE_PAGE_FLIP_EVENT,
+                            &page_flip_completed) != 0) {
+            perror("drmModePageFlip");
+            gbm_surface_release_buffer(renderer->gbm_surface, bo);
+            return -1;
+        }
+        if (wait_for_page_flip(renderer, &page_flip_completed) != 0) {
+            gbm_surface_release_buffer(renderer->gbm_surface, bo);
+            return -1;
+        }
     }
+
+    gbm_surface_release_buffer(renderer->gbm_surface, renderer->previous_bo);
     renderer->previous_bo = bo;
     return 0;
 }
