@@ -42,6 +42,8 @@ DEFAULT_INPUT_RTP_LOG_BUDGET = 12
 DEFAULT_INPUT_RTP_IDLE_LOG_BUDGET = 6
 DEFAULT_ENCODED_VIDEO_LOG_BUDGET = 10
 DEFAULT_ENCODED_VIDEO_IDLE_LOG_BUDGET = 6
+DEFAULT_MPEGTS_BUFFER_LOG_BUDGET = 12
+DEFAULT_TSDEMUX_MESSAGE_LOG_BUDGET = 20
 DEFAULT_RELAY_HOST = "127.0.0.1"
 DEFAULT_RELAY_PORT = 5600
 DEFAULT_PAYLOAD_TYPE = 96
@@ -351,6 +353,88 @@ def summary_is_black(summary):
     return True
 
 
+def summarize_mpegts_buffer(buffer):
+    if buffer is None:
+        return None
+
+    pts_ms = None
+    if buffer.pts != Gst.CLOCK_TIME_NONE:
+        pts_ms = buffer.pts / Gst.MSECOND
+
+    dts_ms = None
+    if buffer.dts != Gst.CLOCK_TIME_NONE:
+        dts_ms = buffer.dts / Gst.MSECOND
+
+    buffer_flags = buffer.get_flags()
+    flag_names = ["delta" if buffer_flags & Gst.BufferFlags.DELTA_UNIT else "key"]
+    if buffer_flags & Gst.BufferFlags.DISCONT:
+        flag_names.append("discont")
+    if buffer_flags & Gst.BufferFlags.CORRUPTED:
+        flag_names.append("corrupted")
+
+    summary = {
+        "size": buffer.get_size(),
+        "pts_ms": pts_ms,
+        "dts_ms": dts_ms,
+        "flags": flag_names,
+    }
+
+    success, map_info = buffer.map(Gst.MapFlags.READ)
+    if not success:
+        summary["error"] = "map failed"
+        return summary
+
+    try:
+        data = map_info.data
+        packet_size = 188
+        packet_count = len(data) // packet_size
+        remainder = len(data) % packet_size
+        inspected_packets = min(packet_count, 16)
+        unique_pids = []
+        packet_headers = []
+        null_packet_count = 0
+        sync_ok = packet_count > 0 and remainder == 0
+
+        for packet_index in range(inspected_packets):
+            offset = packet_index * packet_size
+            packet = data[offset:offset + packet_size]
+            if len(packet) < 4:
+                sync_ok = False
+                break
+            if packet[0] != 0x47:
+                sync_ok = False
+                packet_headers.append(f"bad-sync@{packet_index}:{packet[0]:02x}")
+                continue
+
+            pid = ((packet[1] & 0x1F) << 8) | packet[2]
+            payload_unit_start = 1 if packet[1] & 0x40 else 0
+            adaptation_field_control = (packet[3] >> 4) & 0x03
+            continuity_counter = packet[3] & 0x0F
+
+            if pid == 0x1FFF:
+                null_packet_count += 1
+            if pid not in unique_pids and len(unique_pids) < 6:
+                unique_pids.append(pid)
+            if len(packet_headers) < 4:
+                packet_headers.append(
+                    f"pid=0x{pid:04x}/pusi={payload_unit_start}/afc={adaptation_field_control}/cc={continuity_counter}"
+                )
+
+        summary.update({
+            "packet_count": packet_count,
+            "inspected_packets": inspected_packets,
+            "remainder": remainder,
+            "sync_ok": sync_ok,
+            "unique_pids": unique_pids,
+            "packet_headers": packet_headers,
+            "null_packet_count": null_packet_count,
+        })
+    finally:
+        buffer.unmap(map_info)
+
+    return summary
+
+
 def resolve_rtsp_url(base_url, control_value):
     if not control_value or control_value == "*":
         return base_url
@@ -505,7 +589,7 @@ def build_relay_pipeline_description(args):
         'caps="application/x-rtp,media=video,encoding-name=MP2T,payload=33,clock-rate=90000" ! '
         'queue max-size-buffers=8 ! '
         'application/x-rtp,media=video,encoding-name=MP2T,payload=33,clock-rate=90000 ! '
-        'rtpmp2tdepay ! tsparse set-timestamps=true ! tsdemux name=demux '
+        'rtpmp2tdepay ! tsparse set-timestamps=true ! tsdemux emit-stats=true name=demux '
         '[dynamic video/x-h264 pad] ! queue max-size-buffers=8 leaky=downstream ! tee name=video_tee '
         'video_tee. ! queue max-size-buffers=8 leaky=downstream ! '
         'h264parse config-interval=-1 disable-passthrough=true ! '
@@ -764,12 +848,18 @@ class RtspRelay:
         self.input_rtp_last_timestamp = None
         self.input_rtp_last_payload_type = None
         self.input_rtp_last_packet_monotonic = None
+        self.depay_mpegts_log_budget = DEFAULT_MPEGTS_BUFFER_LOG_BUDGET
+        self.depay_mpegts_buffer_count = 0
+        self.tsparse_mpegts_log_budget = DEFAULT_MPEGTS_BUFFER_LOG_BUDGET
+        self.tsparse_mpegts_buffer_count = 0
         self.encoded_video_log_budget = DEFAULT_ENCODED_VIDEO_LOG_BUDGET
         self.encoded_video_idle_log_budget = DEFAULT_ENCODED_VIDEO_IDLE_LOG_BUDGET
         self.encoded_video_buffer_count = 0
         self.encoded_video_last_pts_ms = None
         self.encoded_video_last_buffer_monotonic = None
         self.encoded_video_watchdog_source_id = 0
+        self.tsdemux_message_log_budget = DEFAULT_TSDEMUX_MESSAGE_LOG_BUDGET
+        self.tsdemux_message_count = 0
 
     def start(self, source_host, source_ready):
         self.stop()
@@ -878,6 +968,7 @@ class RtspRelay:
         udpsrc.set_property("port", self.args.wfd_client_rtp_port)
         source_queue.set_property("max-size-buffers", 8)
         tsparse.set_property("set-timestamps", True)
+        demux.set_property("emit-stats", True)
         video_queue.set_property("max-size-buffers", 8)
         video_queue.set_property("leaky", 2)
         relay_queue.set_property("max-size-buffers", 8)
@@ -963,6 +1054,16 @@ class RtspRelay:
             raise RuntimeError("failed to look up WFD relay source queue source pad")
         source_src_pad.add_probe(Gst.PadProbeType.BUFFER, self._on_input_rtp_packet)
 
+        depay_src_pad = depay.get_static_pad("src")
+        if depay_src_pad is None:
+            raise RuntimeError("failed to look up WFD relay depay source pad")
+        depay_src_pad.add_probe(Gst.PadProbeType.BUFFER, self._on_depay_mpegts_buffer)
+
+        tsparse_src_pad = tsparse.get_static_pad("src")
+        if tsparse_src_pad is None:
+            raise RuntimeError("failed to look up WFD relay tsparse source pad")
+        tsparse_src_pad.add_probe(Gst.PadProbeType.BUFFER, self._on_tsparse_mpegts_buffer)
+
         video_src_pad = video_queue.get_static_pad("src")
         if video_src_pad is None:
             raise RuntimeError("failed to look up WFD relay video queue source pad")
@@ -1036,6 +1137,68 @@ class RtspRelay:
                 f"marker={int(marker)}",
                 flush=True,
             )
+
+        return Gst.PadProbeReturn.OK
+
+    def _on_depay_mpegts_buffer(self, pad, info):
+        del pad
+        return self._on_mpegts_buffer(
+            "Relay depay MPEG-TS buffer",
+            "depay_mpegts_buffer_count",
+            "depay_mpegts_log_budget",
+            info,
+        )
+
+    def _on_tsparse_mpegts_buffer(self, pad, info):
+        del pad
+        return self._on_mpegts_buffer(
+            "Relay tsparse MPEG-TS buffer",
+            "tsparse_mpegts_buffer_count",
+            "tsparse_mpegts_log_budget",
+            info,
+        )
+
+    def _on_mpegts_buffer(self, label, count_attr, log_budget_attr, info):
+        buffer = info.get_buffer()
+        if buffer is None:
+            return Gst.PadProbeReturn.OK
+
+        count = getattr(self, count_attr) + 1
+        setattr(self, count_attr, count)
+
+        should_log = False
+        log_budget = getattr(self, log_budget_attr)
+        if log_budget > 0:
+            should_log = True
+            setattr(self, log_budget_attr, log_budget - 1)
+        elif count % 300 == 0:
+            should_log = True
+
+        if should_log:
+            summary = summarize_mpegts_buffer(buffer)
+            if summary is None or "error" in summary:
+                print(
+                    f"{label}: buffer={count} size={buffer.get_size()} error={summary['error'] if summary else 'unavailable'}",
+                    flush=True,
+                )
+            else:
+                pid_text = ",".join(f"0x{pid:04x}" for pid in summary["unique_pids"]) or "none"
+                header_text = " ".join(summary["packet_headers"]) or "none"
+                print(
+                    f"{label}: "
+                    f"buffer={count} "
+                    f"size={summary['size']} "
+                    f"packets={summary['packet_count']} "
+                    f"remainder={summary['remainder']} "
+                    f"sync={int(summary['sync_ok'])} "
+                    f"null_packets={summary['null_packet_count']} "
+                    f"pids={pid_text} "
+                    f"pts_ms={summary['pts_ms'] if summary['pts_ms'] is not None else 'none'} "
+                    f"dts_ms={summary['dts_ms'] if summary['dts_ms'] is not None else 'none'} "
+                    f"flags={','.join(summary['flags'])} "
+                    f"headers={header_text}",
+                    flush=True,
+                )
 
         return Gst.PadProbeReturn.OK
 
@@ -1685,11 +1848,17 @@ class RtspRelay:
         self.input_rtp_last_timestamp = None
         self.input_rtp_last_payload_type = None
         self.input_rtp_last_packet_monotonic = None
+        self.depay_mpegts_log_budget = DEFAULT_MPEGTS_BUFFER_LOG_BUDGET
+        self.depay_mpegts_buffer_count = 0
+        self.tsparse_mpegts_log_budget = DEFAULT_MPEGTS_BUFFER_LOG_BUDGET
+        self.tsparse_mpegts_buffer_count = 0
         self.encoded_video_log_budget = DEFAULT_ENCODED_VIDEO_LOG_BUDGET
         self.encoded_video_idle_log_budget = DEFAULT_ENCODED_VIDEO_IDLE_LOG_BUDGET
         self.encoded_video_buffer_count = 0
         self.encoded_video_last_pts_ms = None
         self.encoded_video_last_buffer_monotonic = None
+        self.tsdemux_message_log_budget = DEFAULT_TSDEMUX_MESSAGE_LOG_BUDGET
+        self.tsdemux_message_count = 0
         self.presentation_url = None
         self.sent_sink_options = False
         self.handshake_complete = False
@@ -1702,6 +1871,31 @@ class RtspRelay:
             if debug:
                 LOGGER.error("relay pipeline debug info: %s", debug)
             self.stop()
+        elif message.type == Gst.MessageType.WARNING:
+            warn, debug = message.parse_warning()
+            source_name = message.src.get_name() if message.src is not None else "unknown"
+            LOGGER.warning("relay pipeline warning from %s: %s", source_name, warn)
+            if debug:
+                LOGGER.warning("relay pipeline warning debug info: %s", debug)
+        elif message.type == Gst.MessageType.ELEMENT:
+            structure = message.get_structure()
+            source_name = message.src.get_name() if message.src is not None else "unknown"
+            if source_name == "wfd_tsdemux" and structure is not None:
+                self.tsdemux_message_count += 1
+                should_log = False
+                if self.tsdemux_message_log_budget > 0:
+                    should_log = True
+                    self.tsdemux_message_log_budget -= 1
+                elif self.tsdemux_message_count % 300 == 0:
+                    should_log = True
+
+                if should_log:
+                    print(
+                        "Relay tsdemux message: "
+                        f"message={self.tsdemux_message_count} "
+                        f"structure={structure.to_string()}",
+                        flush=True,
+                    )
         elif message.type == Gst.MessageType.EOS:
             LOGGER.info("relay pipeline reached EOS")
             self.stop()
