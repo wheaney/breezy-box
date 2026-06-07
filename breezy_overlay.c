@@ -252,7 +252,8 @@ void breezy_overlay_set_addresses(struct breezy_overlay *ov,
 void breezy_overlay_update(struct breezy_overlay *ov,
 			    bool glasses_active,
 			    size_t imported_count,
-			    size_t device_count)
+			    size_t device_count,
+			    bool verbose)
 {
 	(void)device_count;
 
@@ -273,9 +274,10 @@ void breezy_overlay_update(struct breezy_overlay *ov,
 	 * over Wi-Fi), so skip the OTG arping probe that would otherwise block
 	 * wireless-only connections from advancing past NO_HOST. */
 	bool host_connected = (imported_count > 0u) || arping_probe(ov);
-	fprintf(stderr, "breezy_overlay: iface=%s host_ip=%s arping=%d glasses=%d imported=%zu state=%d\n",
-		ov->otg_iface, ov->host_ip, (int)host_connected,
-		(int)glasses_active, imported_count, (int)ov->state);
+	if (verbose)
+		printf("breezy_overlay: iface=%s host_ip=%s arping=%d glasses=%d imported=%zu state=%d\n",
+		       ov->otg_iface, ov->host_ip, (int)host_connected,
+		       (int)glasses_active, imported_count, (int)ov->state);
 
 	enum breezy_overlay_state next;
 	if (!glasses_active)

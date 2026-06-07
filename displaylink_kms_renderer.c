@@ -180,7 +180,8 @@ static void kms_poll_device_config(struct kms_state *kms,
 				active_slots++;
 		}
 		breezy_overlay_update(&kms->overlay, active,
-				      active_slots, server->opts.device_count);
+				      active_slots, server->opts.device_count,
+				      server->opts.verbose);
 	}
 
 	if (active == kms->device_active && kms->device_complete_dist_px != 0.0f)
@@ -608,7 +609,7 @@ static int kms_init(struct kms_state *kms, const char *drm_device,
  * ---------------------------------------------------------------- */
 
 static int kms_init_display_tex(struct kms_state *kms, size_t idx,
-                                 struct udl_runtime *udl)
+                                 struct udl_runtime *udl, bool verbose)
 {
 	struct kms_display_tex *disp = &kms->displays[idx];
 	uint32_t w = udl->width;
@@ -666,8 +667,9 @@ static int kms_init_display_tex(struct kms_state *kms, size_t idx,
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 		glBindTexture(GL_TEXTURE_2D, 0);
 
-		fprintf(stderr, "kms: display %zu DMA-buf texture %ux%u stride=%u\n",
-		        idx, w, h, disp->bo_stride);
+		if (verbose)
+			printf("kms: display %zu DMA-buf texture %ux%u stride=%u\n",
+			       idx, w, h, disp->bo_stride);
 		disp->initialized = true;
 		return 0;
 	}
@@ -683,7 +685,8 @@ fallback:
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 	glBindTexture(GL_TEXTURE_2D, 0);
 
-	fprintf(stderr, "kms: display %zu fallback GL texture %ux%u\n", idx, w, h);
+	if (verbose)
+		printf("kms: display %zu fallback GL texture %ux%u\n", idx, w, h);
 	disp->initialized = true;
 	return 0;
 }
@@ -698,7 +701,8 @@ static int kms_init_display_textures(struct kms_state *kms, struct server_runtim
 
 	for (i = 0u; i < kms->display_count && i < MAX_USBIP_DEVICES; i++) {
 		if (i < server->opts.device_count && server->devices[i].udl.enabled) {
-			if (kms_init_display_tex(kms, i, &server->devices[i].udl) != 0)
+			if (kms_init_display_tex(kms, i, &server->devices[i].udl,
+						 server->opts.verbose) != 0)
 				return -1;
 		} else {
 			kms->displays[i].initialized = true;
@@ -914,8 +918,9 @@ static void kms_render_frame(struct kms_state *kms,
 			float left_x  = kms->placements[i].cnx - w_half;
 			float right_x = kms->placements[i].cnx + w_half;
 			float quad_top = kms->placements[i].cny + h_half;
-			fprintf(stderr, "kms_overlay: slot=%zu cnx=%.0f w=%.0f left=%.0f right=%.0f\n",
-				i, kms->placements[i].cnx, w_half*2.0f, left_x, right_x);
+			if (server->opts.verbose)
+				printf("kms_overlay: slot=%zu cnx=%.0f w=%.0f left=%.0f right=%.0f\n",
+				       i, kms->placements[i].cnx, w_half*2.0f, left_x, right_x);
 			if (quad_top > top_y_px)
 				top_y_px = quad_top;
 			if (first_ext || left_x  < min_x_px) min_x_px = left_x;
@@ -941,10 +946,11 @@ static void kms_render_frame(struct kms_state *kms,
 		static size_t last_visible = SIZE_MAX;
 		static float  last_cx = 0.0f;
 		if (visible_count != last_visible || center_x_px != last_cx) {
-			fprintf(stderr, "kms_overlay: visible=%zu meshes=%d "
-				"min_x=%.0f max_x=%.0f center_x=%.0f top_y=%.0f\n",
-				visible_count, (int)kms->meshes_computed,
-				min_x_px, max_x_px, center_x_px, top_y_px);
+			if (server->opts.verbose)
+				printf("kms_overlay: visible=%zu meshes=%d "
+				       "min_x=%.0f max_x=%.0f center_x=%.0f top_y=%.0f\n",
+				       visible_count, (int)kms->meshes_computed,
+				       min_x_px, max_x_px, center_x_px, top_y_px);
 			last_visible = visible_count;
 			last_cx = center_x_px;
 		}
@@ -1007,7 +1013,8 @@ static int kms_run(struct kms_state *kms, struct server_runtime *server)
 	kms->device_size_adj_h_px     = 0.0f;
 	kms->meshes_computed          = false;
 	/* Prime the overlay texture before the first frame. */
-	breezy_overlay_update(&kms->overlay, false, 0u, server->opts.device_count);
+	breezy_overlay_update(&kms->overlay, false, 0u, server->opts.device_count,
+			      server->opts.verbose);
 	kms_update_display_textures(kms, server);
 	kms_render_frame(kms, server);
 	if (!eglSwapBuffers(kms->egl_display, kms->egl_surface)) {

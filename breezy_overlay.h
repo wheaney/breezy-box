@@ -22,7 +22,7 @@
  *   breezy_overlay_set_addresses(&ov, &link_cfg, gadget_netdev);
  *
  *   // each frame (or each poll cycle):
- *   breezy_overlay_update(&ov, glasses_active, imported_count, device_count);
+ *   breezy_overlay_update(&ov, glasses_active, imported_count, device_count, verbose);
  *
  *   // render:
  *   if (ov.tex.tex)
@@ -86,7 +86,8 @@ void breezy_overlay_set_addresses(struct breezy_overlay *ov,
 void breezy_overlay_update(struct breezy_overlay *ov,
 			    bool glasses_active,
 			    size_t imported_count,
-			    size_t device_count);
+			    size_t device_count,
+			    bool verbose);
 
 /* Release the GL texture.  Call with an active GL context. */
 void breezy_overlay_destroy(struct breezy_overlay *ov);
