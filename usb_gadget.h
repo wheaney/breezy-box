@@ -10,7 +10,7 @@
 #define USB_GADGET_STR_MAX    128
 
 /*
- * Configuration for the OTG CDC-NCM USB gadget.
+ * Configuration for the OTG RNDIS USB gadget.
  * Fill with usb_gadget_config_defaults() then override as needed.
  */
 struct usb_gadget_config {
@@ -28,13 +28,12 @@ struct usb_gadget_config {
     char manufacturer_string[USB_GADGET_STR_MAX];
     char product_string[USB_GADGET_STR_MAX];
 
-    /* CDC-NCM network function */
-    char ncm_dev_mac[USB_GADGET_MAC_MAX];   /* gadget-side MAC */
-    char ncm_host_mac[USB_GADGET_MAC_MAX];  /* host-side MAC */
-    char ncm_netdev[USB_GADGET_NETDEV_MAX]; /* kernel net interface (e.g. "usb0") */
-    char ncm_ip_cidr[USB_GADGET_IP_MAX];    /* e.g. "192.168.7.2/30" */
-    unsigned ncm_mtu;                       /* 0 = leave interface MTU at kernel default */
-    unsigned ncm_max_segment_size;          /* 0 = leave function attribute untouched */
+    /* RNDIS network function */
+    char rndis_dev_mac[USB_GADGET_MAC_MAX];   /* gadget-side MAC */
+    char rndis_host_mac[USB_GADGET_MAC_MAX];  /* host-side MAC */
+    char rndis_netdev[USB_GADGET_NETDEV_MAX]; /* kernel net interface (e.g. "usb0") */
+    char rndis_ip_cidr[USB_GADGET_IP_MAX];    /* e.g. "192.168.7.2/30" */
+    unsigned rndis_mtu;                       /* 0 = leave interface MTU at kernel default */
 };
 
 /* Runtime state owned by the caller; zero-initialise before use */
@@ -49,7 +48,7 @@ struct usb_gadget_state {
 void usb_gadget_config_defaults(struct usb_gadget_config *cfg);
 
 /*
- * Configure the CDC-NCM gadget and bring up the network interface.
+ * Configure the RNDIS gadget and bring up the network interface.
  * Requires CAP_NET_ADMIN and write access to /sys/kernel/config.
  * Returns 0 on success, -1 on error (message printed to stderr).
  * On partial failure, state is left in a condition that usb_gadget_teardown()

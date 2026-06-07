@@ -19,8 +19,6 @@
 #define CONFIGFS_ROOT  "/sys/kernel/config"
 #define GADGET_BASE    CONFIGFS_ROOT "/usb_gadget"
 #define UDC_CLASS_DIR  "/sys/class/udc"
-#define NCM_MAX_SEGMENT_SIZE_LIMIT 8000u
-#define ETHERNET_HEADER_SIZE 14u
 
 static int run_cmd(const char *const argv[]);
 
@@ -44,33 +42,6 @@ static int write_configfs(const char *path, const char *value)
     return 0;
 }
 
-static int write_configfs_optional(const char *path, const char *value)
-{
-    int fd = open(path, O_WRONLY);
-
-    if (fd < 0) {
-        if (errno == ENOENT) {
-            fprintf(stderr, "usb_gadget: optional configfs attribute unavailable: %s\n", path);
-            return 0;
-        }
-        fprintf(stderr, "usb_gadget: open(%s): %s\n", path, strerror(errno));
-        return -1;
-    }
-
-    size_t len = strlen(value);
-    ssize_t n = write(fd, value, len);
-    int err = errno;
-    close(fd);
-    if (n < 0 || (size_t)n != len) {
-        if (err == ENOENT) {
-            fprintf(stderr, "usb_gadget: optional configfs attribute vanished: %s\n", path);
-            return 0;
-        }
-        fprintf(stderr, "usb_gadget: write(%s): %s\n", path, strerror(err));
-        return -1;
-    }
-    return 1;
-}
 
 static int mkdir_ok(const char *path)
 {
@@ -141,7 +112,7 @@ static int ensure_configfs(void)
 {
     /* Best-effort module loads; these are no-ops if already loaded */
     { const char *const argv[] = {"modprobe", "libcomposite", NULL}; run_cmd(argv); }
-    { const char *const argv[] = {"modprobe", "usb_f_ncm",    NULL}; run_cmd(argv); }
+    { const char *const argv[] = {"modprobe", "usb_f_rndis",  NULL}; run_cmd(argv); }
 
     /* Mount configfs if not already present; EBUSY means already mounted */
     if (mount("none", CONFIGFS_ROOT, "configfs", 0, NULL) < 0 && errno != EBUSY) {
@@ -202,11 +173,9 @@ static void teardown_configfs(const char *root)
         }
     }
 
-    snprintf(p, sizeof(p), "%s/configs/c.1/ncm.usb0",   root); rm_link(p);
     snprintf(p, sizeof(p), "%s/configs/c.1/rndis.usb0", root); rm_link(p);
     snprintf(p, sizeof(p), "%s/os_desc/c.1",            root); rm_link(p);
 
-    snprintf(p, sizeof(p), "%s/functions/ncm.usb0", root); rm_dir(p);
     snprintf(p, sizeof(p), "%s/functions/rndis.usb0/os_desc/interface.rndis", root);
     rm_dir(p);
     snprintf(p, sizeof(p), "%s/functions/rndis.usb0", root); rm_dir(p);
@@ -226,23 +195,12 @@ void usb_gadget_config_defaults(struct usb_gadget_config *cfg)
     snprintf(cfg->gadget_name,         sizeof(cfg->gadget_name),         "breezy-composite");
     snprintf(cfg->serial_string,       sizeof(cfg->serial_string),       "BREEZY0001");
     snprintf(cfg->manufacturer_string, sizeof(cfg->manufacturer_string), "Breezy Box");
-    snprintf(cfg->product_string,      sizeof(cfg->product_string),      "Breezy Box OTG NCM");
-    snprintf(cfg->ncm_dev_mac,         sizeof(cfg->ncm_dev_mac),         "02:1a:11:00:00:01");
-    snprintf(cfg->ncm_host_mac,        sizeof(cfg->ncm_host_mac),        "02:1a:11:00:00:02");
-    snprintf(cfg->ncm_netdev,          sizeof(cfg->ncm_netdev),          "usb0");
-    snprintf(cfg->ncm_ip_cidr,         sizeof(cfg->ncm_ip_cidr),         "192.168.7.2/30");
-    /*
-     * Default to the largest NCM segment the kernel f_ncm allows (8000) and the
-     * matching IP MTU (8000 - 14 ethernet header).  A jumbo MTU collapses each
-     * large USB/IP bulk-OUT transfer into ~5x fewer TCP segments / NCM datagrams,
-     * which is the dominant per-packet cost in the single-core dwc3+u_ether+TCP
-     * receive funnel.  The host side is matched automatically via DHCP option 26
-     * (see link_services); either value can still be overridden by env.
-     */
-    cfg->ncm_max_segment_size = NCM_MAX_SEGMENT_SIZE_LIMIT;
-    cfg->ncm_mtu = NCM_MAX_SEGMENT_SIZE_LIMIT - ETHERNET_HEADER_SIZE;
-    (void)parse_unsigned_env("BREEZY_NCM_MTU", &cfg->ncm_mtu);
-    (void)parse_unsigned_env("BREEZY_NCM_MAX_SEGMENT_SIZE", &cfg->ncm_max_segment_size);
+    snprintf(cfg->product_string,        sizeof(cfg->product_string),        "Breezy Box OTG RNDIS");
+    snprintf(cfg->rndis_dev_mac,         sizeof(cfg->rndis_dev_mac),         "02:1a:11:00:00:01");
+    snprintf(cfg->rndis_host_mac,        sizeof(cfg->rndis_host_mac),        "02:1a:11:00:00:02");
+    snprintf(cfg->rndis_netdev,          sizeof(cfg->rndis_netdev),          "usb0");
+    snprintf(cfg->rndis_ip_cidr,         sizeof(cfg->rndis_ip_cidr),         "192.168.7.2/30");
+    (void)parse_unsigned_env("BREEZY_RNDIS_MTU", &cfg->rndis_mtu);
 }
 
 int usb_gadget_setup(const struct usb_gadget_config *cfg,
@@ -254,31 +212,8 @@ int usb_gadget_setup(const struct usb_gadget_config *cfg,
 
     memset(state, 0, sizeof(*state));
 
-    if (cfg->ncm_max_segment_size > NCM_MAX_SEGMENT_SIZE_LIMIT) {
-        fprintf(stderr,
-                "usb_gadget: BREEZY_NCM_MAX_SEGMENT_SIZE=%u exceeds the kernel f_ncm limit of %u bytes\n",
-                cfg->ncm_max_segment_size,
-                NCM_MAX_SEGMENT_SIZE_LIMIT);
-        return -1;
-    }
-    if (cfg->ncm_max_segment_size > 0u &&
-        cfg->ncm_mtu > (cfg->ncm_max_segment_size - ETHERNET_HEADER_SIZE)) {
-        fprintf(stderr,
-                "usb_gadget: BREEZY_NCM_MTU=%u is larger than the usable MTU for max_segment_size=%u; use at most %u\n",
-                cfg->ncm_mtu,
-                cfg->ncm_max_segment_size,
-                cfg->ncm_max_segment_size - ETHERNET_HEADER_SIZE);
-        return -1;
-    }
-
-    /*
-     * The OTG port is a plain CDC-NCM ethernet link. All displays are served
-     * to the host over USB/IP across this ethernet connection.
-     *
-     * Keep the legacy g_rndis_displaylink module in-tree for a future NCM +
-     * DisplayLink refactor, but unload it if it is currently active so the
-     * NCM configfs gadget can claim the UDC cleanly.
-     */
+    /* Unload the legacy g_rndis_displaylink module if active so the RNDIS
+     * configfs gadget can claim the UDC cleanly. */
     { const char *const a[] = {"rmmod", "g_rndis_displaylink", NULL}; (void)run_cmd(a); }
 
     if (ensure_configfs() < 0)
@@ -300,7 +235,7 @@ int usb_gadget_setup(const struct usb_gadget_config *cfg,
     /* Populate state early so partial failures leave a teardown-safe condition. */
     snprintf(state->gadget_root, sizeof(state->gadget_root), "%s", root);
     snprintf(state->udc_name,    sizeof(state->udc_name),    "%s", udc);
-    snprintf(state->netdev_name, sizeof(state->netdev_name), "%s", cfg->ncm_netdev);
+    snprintf(state->netdev_name, sizeof(state->netdev_name), "%s", cfg->rndis_netdev);
 
 #define WF(rel, val) \
     do { snprintf(p, sizeof(p), "%s/" rel, root); \
@@ -309,7 +244,11 @@ int usb_gadget_setup(const struct usb_gadget_config *cfg,
     do { snprintf(p, sizeof(p), "%s/" rel, root); \
          if (mkdir_ok(p) < 0) return -1; } while (0)
 
-    /* Use the standard IAD composite device class for the CDC-NCM function. */
+    /*
+     * RNDIS requires the Miscellaneous Device class (EF/02/01) so Windows
+     * recognises the OS descriptor and loads the inbox RNDIS driver without
+     * needing a third-party INF.
+     */
     WF("idVendor",  "0x1d6b");
     WF("idProduct", "0x0104");
     WF("bcdUSB",    "0x0200");
@@ -327,26 +266,33 @@ int usb_gadget_setup(const struct usb_gadget_config *cfg,
     /* Configuration c.1 */
     MD("configs/c.1");
     MD("configs/c.1/strings/0x409");
-    WF("configs/c.1/strings/0x409/configuration", "Breezy NCM");
+    WF("configs/c.1/strings/0x409/configuration", "Breezy RNDIS");
     WF("configs/c.1/MaxPower", "250");
 
-    /* CDC-NCM function instance */
-    MD("functions/ncm.usb0");
-    WF("functions/ncm.usb0/dev_addr",  cfg->ncm_dev_mac);
-    WF("functions/ncm.usb0/host_addr", cfg->ncm_host_mac);
-    if (cfg->ncm_max_segment_size > 0u) {
-        char max_segment_size[16];
+    /*
+     * OS descriptor: tells Windows to use the RNDIS driver automatically.
+     * The os_desc/use flag must be set before binding to the UDC.
+     */
+    WF("os_desc/use",        "1");
+    WF("os_desc/b_vendor_code", "0xcd");
 
-        snprintf(max_segment_size, sizeof(max_segment_size), "%u", cfg->ncm_max_segment_size);
-        snprintf(p, sizeof(p), "%s/functions/ncm.usb0/max_segment_size", root);
-        if (write_configfs_optional(p, max_segment_size) < 0)
-            return -1;
-    }
+    /* RNDIS function instance */
+    MD("functions/rndis.usb0");
+    WF("functions/rndis.usb0/dev_addr",  cfg->rndis_dev_mac);
+    WF("functions/rndis.usb0/host_addr", cfg->rndis_host_mac);
+    WF("functions/rndis.usb0/os_desc/interface.rndis/compatible_id",    "RNDIS");
+    WF("functions/rndis.usb0/os_desc/interface.rndis/sub_compatible_id", "5162001");
 
-    /* Wire function into config. */
-    snprintf(p, sizeof(p), "%s/functions/ncm.usb0", root);
-    snprintf(q, sizeof(q), "%s/configs/c.1/ncm.usb0", root);
+    /* Wire function into config and expose it via os_desc. */
+    snprintf(p, sizeof(p), "%s/functions/rndis.usb0", root);
+    snprintf(q, sizeof(q), "%s/configs/c.1/rndis.usb0", root);
     if (symlink(p, q) < 0) {
+        fprintf(stderr, "usb_gadget: symlink(%s): %s\n", q, strerror(errno));
+        return -1;
+    }
+    snprintf(p, sizeof(p), "%s/configs/c.1", root);
+    snprintf(q, sizeof(q), "%s/os_desc/c.1", root);
+    if (symlink(p, q) < 0 && errno != EEXIST) {
         fprintf(stderr, "usb_gadget: symlink(%s): %s\n", q, strerror(errno));
         return -1;
     }
@@ -393,38 +339,27 @@ int usb_gadget_setup(const struct usb_gadget_config *cfg,
 #undef MD
 
     /* Bring up network interface. */
-    { const char *const argv[] = {"ip", "addr", "flush", "dev", cfg->ncm_netdev, NULL};
+    { const char *const argv[] = {"ip", "addr", "flush", "dev", cfg->rndis_netdev, NULL};
       run_cmd(argv); }  /* best-effort; interface may not exist yet */
-        if (cfg->ncm_mtu > 0u) {
-                char mtu[16];
-                const char *const argv[] = {"ip", "link", "set", "dev", cfg->ncm_netdev, "mtu", mtu, NULL};
+    if (cfg->rndis_mtu > 0u) {
+        char mtu[16];
+        const char *const argv[] = {"ip", "link", "set", "dev", cfg->rndis_netdev, "mtu", mtu, NULL};
 
-                snprintf(mtu, sizeof(mtu), "%u", cfg->ncm_mtu);
-                if (run_cmd(argv) < 0)
-                        return -1;
-        }
-    { const char *const argv[] = {"ip", "link", "set", cfg->ncm_netdev, "up", NULL};
+        snprintf(mtu, sizeof(mtu), "%u", cfg->rndis_mtu);
+        if (run_cmd(argv) < 0)
+            return -1;
+    }
+    { const char *const argv[] = {"ip", "link", "set", cfg->rndis_netdev, "up", NULL};
       if (run_cmd(argv) < 0) return -1; }
-    { const char *const argv[] = {"ip", "addr", "add", cfg->ncm_ip_cidr, "dev", cfg->ncm_netdev, NULL};
+    { const char *const argv[] = {"ip", "addr", "add", cfg->rndis_ip_cidr, "dev", cfg->rndis_netdev, NULL};
       if (run_cmd(argv) < 0) return -1; }
-
-    /*
-     * Enable GRO on the gadget netdev so inbound TCP segments are coalesced
-     * before the TCP receive path inside the NET_RX softirq.  This reduces the
-     * per-segment work in the single-core receive funnel.  Best-effort: ethtool
-     * may be absent or the gadget RX may not be NAPI-backed on this kernel.
-     */
-    { const char *const argv[] = {"ethtool", "-K", cfg->ncm_netdev, "gro", "on", NULL};
-      (void)run_cmd(argv); }
 
     state->active = true;
-        printf("usb_gadget: CDC-NCM gadget on UDC %s, iface %s %s",
-                     udc, cfg->ncm_netdev, cfg->ncm_ip_cidr);
-        if (cfg->ncm_mtu > 0u)
-                printf(" mtu=%u", cfg->ncm_mtu);
-        if (cfg->ncm_max_segment_size > 0u)
-                printf(" max_segment_size=%u", cfg->ncm_max_segment_size);
-        printf("\n");
+    printf("usb_gadget: RNDIS gadget on UDC %s, iface %s %s",
+           udc, cfg->rndis_netdev, cfg->rndis_ip_cidr);
+    if (cfg->rndis_mtu > 0u)
+        printf(" mtu=%u", cfg->rndis_mtu);
+    printf("\n");
     return 0;
 }
 

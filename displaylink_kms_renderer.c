@@ -1212,18 +1212,16 @@ int main(int argc, char **argv)
 		if (gadget_state.netdev_name[0])
 			snprintf(link_cfg.iface, sizeof(link_cfg.iface), "%s",
 				 gadget_state.netdev_name);
-		/* Match the host's link MTU to the gadget's via DHCP option 26 so the
-		 * jumbo NCM segment size actually reduces the host-side packet count. */
-		link_cfg.mtu = gadget_cfg.ncm_mtu;
+		link_cfg.mtu = gadget_cfg.rndis_mtu;
 		/*
 		 * Pin the link mDNS name (breezy.local) to the gadget's own
 		 * address on this link so it tracks the configured CIDR rather
 		 * than the default. Strip the "/prefix" suffix.
 		 */
-		if (gadget_cfg.ncm_ip_cidr[0]) {
+		if (gadget_cfg.rndis_ip_cidr[0]) {
 			char *slash;
 			snprintf(link_cfg.link_ip, sizeof(link_cfg.link_ip), "%s",
-				 gadget_cfg.ncm_ip_cidr);
+				 gadget_cfg.rndis_ip_cidr);
 			slash = strchr(link_cfg.link_ip, '/');
 			if (slash)
 				*slash = '\0';
