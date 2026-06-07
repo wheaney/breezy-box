@@ -269,7 +269,10 @@ void breezy_overlay_update(struct breezy_overlay *ov,
 		ov->wlan_ip[0] = '\0';
 	}
 
-	bool host_connected = arping_probe(ov);
+	/* If USB/IP sessions are already imported the host is reachable (possibly
+	 * over Wi-Fi), so skip the OTG arping probe that would otherwise block
+	 * wireless-only connections from advancing past NO_HOST. */
+	bool host_connected = (imported_count > 0u) || arping_probe(ov);
 	fprintf(stderr, "breezy_overlay: iface=%s host_ip=%s arping=%d glasses=%d imported=%zu state=%d\n",
 		ov->otg_iface, ov->host_ip, (int)host_connected,
 		(int)glasses_active, imported_count, (int)ov->state);
