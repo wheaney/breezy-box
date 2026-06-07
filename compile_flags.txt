@@ -1,0 +1,7 @@
+-std=c11
+-I.
+-Icompat/include
+-Imodules/ZeroKVM/src/ZeroKvm.NativeBridge
+-Imodules/quickjs
+-I/usr/include/libdrm
+-I/usr/include/json-c

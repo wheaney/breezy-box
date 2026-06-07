@@ -1,0 +1,9 @@
+[submodule "modules/ZeroKVM"]
+	path = modules/ZeroKVM
+	url = git@github.com:wheaney/ZeroKVM.git
+[submodule "shared"]
+	path = shared
+	url = git@github.com:wheaney/breezy-desktop-shared-js.git
+[submodule "modules/quickjs"]
+	path = modules/quickjs
+	url = https://github.com/bellard/quickjs.git

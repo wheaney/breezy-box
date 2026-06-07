@@ -1,0 +1,46 @@
+{
+  "listen_host": "0.0.0.0",
+  "listen_port": 3241,
+  "show_window": true,
+  "window_scale": 1,
+  "verbose": false,
+  "defaults": {
+    "vendor_id": "0x17e9",
+    "product_id": "0x037a",
+    "usb_speed": "high",
+    "decode_width": 1920,
+    "decode_height": 1080,
+    "refresh_hz": 60,
+    "strict_native_mode": true,
+    "allow_30hz_fallback": false,
+    "decode_stream": true,
+    "manufacturer_string": "DisplayLink",
+    "product_string": "DisplayLink Adapter"
+  },
+  "devices": [
+    {
+      "name": "left",
+      "busid": "breezy-box-0",
+      "device_path": "/devices/platform/breezy-box/displaylink0",
+      "serial_string": "BREEZY0001",
+      "monitor_name": "Breezy Left",
+      "decode_width": 1920,
+      "decode_height": 1080,
+      "refresh_hz": 60,
+      "x": 0,
+      "y": 0
+    },
+    {
+      "name": "right",
+      "busid": "breezy-box-1",
+      "device_path": "/devices/platform/breezy-box/displaylink1",
+      "serial_string": "BREEZY0002",
+      "monitor_name": "Breezy Right",
+      "decode_width": 1920,
+      "decode_height": 1080,
+      "refresh_hz": 60,
+      "x": 1920,
+      "y": 0
+    }
+  ]
+}
