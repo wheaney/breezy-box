@@ -20,7 +20,6 @@ Perform one-time system-level setup required by breezy-box:
   • Load USB gadget kernel modules at boot (/etc/modules)
   • Mount configfs at boot (/etc/fstab)
   • Install the usb0 systemd-networkd profile (/etc/systemd/network/)
-  • Install the com.xronlinux.BreezyDesktop GSettings schema system-wide
 
 The changes are also applied immediately where possible so a reboot is not
 required for the current session.

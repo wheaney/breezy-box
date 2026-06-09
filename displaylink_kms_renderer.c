@@ -1459,8 +1459,10 @@ int main(int argc, char **argv)
 				       ? gadget_state.netdev_name : NULL,
 				   eth_iface, sizeof(eth_iface)) == 0) {
 		memset(&eth_link_cfg, 0, sizeof(eth_link_cfg));
-		snprintf(eth_link_cfg.iface,      sizeof(eth_link_cfg.iface),
+		snprintf(eth_link_cfg.iface,       sizeof(eth_link_cfg.iface),
 			 "%s", eth_iface);
+		snprintf(eth_link_cfg.assign_cidr, sizeof(eth_link_cfg.assign_cidr),
+			 "%s", ETH_LINK_IP_CIDR);
 		snprintf(eth_link_cfg.host_ip,    sizeof(eth_link_cfg.host_ip),
 			 "%s", ETH_HOST_IP);
 		snprintf(eth_link_cfg.lease_time, sizeof(eth_link_cfg.lease_time),
