@@ -157,6 +157,8 @@ int dp_build_fov_details(uint32_t device_width,
                           float diagonal_fov_rad,
                           float lens_distance_ratio,
                           float default_display_distance,
+                          const char *wrapping_scheme,
+                          bool curved_display,
                           struct dp_fov_details *out)
 {
     JSValue args[7], result;
@@ -170,8 +172,8 @@ int dp_build_fov_details(uint32_t device_width,
     args[2] = JS_NewFloat64(g_ctx, (double)diagonal_fov_rad);
     args[3] = JS_NewFloat64(g_ctx, (double)lens_distance_ratio);
     args[4] = JS_NewFloat64(g_ctx, (double)default_display_distance);
-    args[5] = JS_NewString(g_ctx, "horizontal");
-    args[6] = JS_NewBool(g_ctx, 1);
+    args[5] = JS_NewString(g_ctx, wrapping_scheme ? wrapping_scheme : "horizontal");
+    args[6] = JS_NewBool(g_ctx, curved_display ? 1 : 0);
     result  = JS_Call(g_ctx, g_fn_build_fov_details, JS_UNDEFINED, 7, args);
     JS_FreeValue(g_ctx, args[5]);
 
@@ -218,7 +220,13 @@ int dp_compute_placements(const struct dp_monitor_info *monitors,
                           uint32_t device_height,
                           float diagonal_fov_rad,
                           float lens_distance_ratio,
+                          float display_distance_default,
+                          float size_adj_width,
+                          float size_adj_height,
                           float arc_radius_gl,
+                          const char *wrapping_scheme,
+                          bool curved_display,
+                          float monitor_spacing,
                           struct dp_placement *placements)
 {
     int32_t auto_x[DP_MAX_MONITORS];
@@ -267,20 +275,23 @@ int dp_compute_placements(const struct dp_monitor_info *monitors,
 
     /*
      * Delegate fovDetails construction entirely to the shared JS buildFovDetails().
+     * Then override sizeAdjustedWidth/HeightPixels with the caller-computed values so
+     * monitorsToPlacements uses the correct size-adjusted viewport reference dimensions.
      * Extract completeScreenDistancePixels to derive the GL unit scale.
      */
     {
         JSValue bfd_args[7];
         JSValue bfd_result;
         JSValue v;
+        const char *scheme = (wrapping_scheme && *wrapping_scheme) ? wrapping_scheme : "horizontal";
 
         bfd_args[0] = JS_NewFloat64(g_ctx, (double)device_width);
         bfd_args[1] = JS_NewFloat64(g_ctx, (double)device_height);
         bfd_args[2] = JS_NewFloat64(g_ctx, (double)diagonal_fov_rad);
         bfd_args[3] = JS_NewFloat64(g_ctx, (double)lens_distance_ratio);
-        bfd_args[4] = JS_NewFloat64(g_ctx, 1.0);   /* defaultDisplayDistance */
-        bfd_args[5] = JS_NewString(g_ctx, "horizontal");
-        bfd_args[6] = JS_NewBool(g_ctx, 1);        /* curvedDisplay */
+        bfd_args[4] = JS_NewFloat64(g_ctx, (double)display_distance_default);
+        bfd_args[5] = JS_NewString(g_ctx, scheme);
+        bfd_args[6] = JS_NewBool(g_ctx, curved_display ? 1 : 0);
         bfd_result  = JS_Call(g_ctx, g_fn_build_fov_details, JS_UNDEFINED, 7, bfd_args);
         JS_FreeValue(g_ctx, bfd_args[5]);
 
@@ -298,6 +309,13 @@ int dp_compute_placements(const struct dp_monitor_info *monitors,
         JS_ToFloat64(g_ctx, &complete_dist_px, v);
         JS_FreeValue(g_ctx, v);
 
+        /* Override size-adjusted dimensions so monitorsToPlacements computes arc
+         * extents relative to the scaled viewport, not the raw device resolution. */
+        JS_SetPropertyStr(g_ctx, bfd_result, "sizeAdjustedWidthPixels",
+                          JS_NewFloat64(g_ctx, (double)size_adj_width));
+        JS_SetPropertyStr(g_ctx, bfd_result, "sizeAdjustedHeightPixels",
+                          JS_NewFloat64(g_ctx, (double)size_adj_height));
+
         fov_obj = bfd_result; /* transferred; freed in cleanup */
     }
 
@@ -314,7 +332,7 @@ int dp_compute_placements(const struct dp_monitor_info *monitors,
         JS_SetPropertyUint32(g_ctx, monitor_arr, (uint32_t)i, mon);
     }
 
-    spacing = JS_NewFloat64(g_ctx, 0.0);
+    spacing = JS_NewFloat64(g_ctx, (double)monitor_spacing);
 
     {
         JSValue args[3] = { fov_obj, monitor_arr, spacing };

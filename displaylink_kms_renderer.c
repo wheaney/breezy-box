@@ -33,6 +33,7 @@
 
 #include "breezy_imu.h"
 #include "breezy_overlay.h"
+#include "breezy_settings.h"
 #include "common.h"
 #include "display_renderer.h"
 #include "server.h"
@@ -118,8 +119,11 @@ struct kms_state {
 	float    device_camera_fov;        /* vertical FOV in degrees for es_perspective */
 	uint64_t last_config_poll;         /* realtime_ms() of last poll */
 
-	/* Size scale — 1.0 fills the device FOV exactly.  Placeholder for future config. */
-	float    display_size;             /* distanceAdjustedSize equivalent */
+	/* GSettings-driven display settings, polled alongside device config. */
+	struct breezy_display_settings settings;
+
+	/* Derived size values, recomputed whenever device config or settings change. */
+	float    display_size;             /* distanceAdjustedSize: (dist_default - lens_ratio) * display_size */
 	float    device_size_adj_w_px;     /* device_width  * display_size */
 	float    device_size_adj_h_px;     /* device_height * display_size */
 
@@ -132,7 +136,7 @@ struct kms_state {
 };
 
 /* ----------------------------------------------------------------
- * Device config polling
+ * Device config polling and settings wiring
  * ---------------------------------------------------------------- */
 
 static uint64_t kms_realtime_ms(void)
@@ -143,10 +147,99 @@ static uint64_t kms_realtime_ms(void)
 }
 
 /*
- * Poll the IMU module for device config at most once per second.
- * Derives display quad half-extents from the device's physical FOV so the
- * virtual display exactly fills the camera FOV at arc radius.
- * Mirrors the KWin plugin's diagonalToCrossFOVs + enable/disable logic.
+ * Resolve "automatic" or "flat+curved" wrapping scheme to a concrete value.
+ * Mirrors VirtualDisplaysActor._actual_wrap_scheme().
+ */
+static const char *kms_resolve_wrapping_scheme(
+    const char *scheme, bool curved,
+    const struct dp_monitor_info *monitors, size_t n,
+    uint32_t dev_w, uint32_t dev_h)
+{
+	bool use_auto = (strcmp(scheme, "automatic") == 0) ||
+	                (strcmp(scheme, "flat") == 0 && curved);
+	if (!use_auto)
+		return scheme; /* "horizontal", "vertical", or "flat" */
+
+	if (n == 0 || dev_w == 0 || dev_h == 0)
+		return "horizontal";
+
+	int32_t minx = INT32_MAX, maxx = INT32_MIN;
+	int32_t miny = INT32_MAX, maxy = INT32_MIN;
+	for (size_t i = 0; i < n; i++) {
+		int32_t x2 = monitors[i].x + (int32_t)monitors[i].width;
+		int32_t y2 = monitors[i].y + (int32_t)monitors[i].height;
+		if (monitors[i].x < minx) minx = monitors[i].x;
+		if (x2 > maxx)            maxx = x2;
+		if (monitors[i].y < miny) miny = monitors[i].y;
+		if (y2 > maxy)            maxy = y2;
+	}
+	float span_x = (float)(maxx - minx) / (float)dev_w;
+	float span_y = (float)(maxy - miny) / (float)dev_h;
+	return (span_x >= span_y) ? "horizontal" : "vertical";
+}
+
+/*
+ * Apply size-adjustment and viewport centering to raw monitor positions.
+ * Mirrors VirtualDisplaysActor._handle_display_size_distance_change() +
+ * _update_monitor_placements() coordinate preparation.
+ *
+ * The resulting coords are ready to pass directly to dp_compute_placements().
+ */
+static void kms_adjust_monitor_positions(
+    const struct server_options *opts,
+    uint32_t dev_w, uint32_t dev_h,
+    float dist_adj_size,
+    bool headset_as_center,
+    double viewport_offset_x, double viewport_offset_y,
+    struct dp_monitor_info *out)
+{
+	size_t n = opts->device_count;
+	float size_ox = (1.0f - dist_adj_size) / 2.0f * (float)dev_w;
+	float size_oy = (1.0f - dist_adj_size) / 2.0f * (float)dev_h;
+	float adj_dev_w = (float)dev_w * dist_adj_size;
+	float adj_dev_h = (float)dev_h * dist_adj_size;
+
+	/* Size-adjusted positions. */
+	float ax[MAX_USBIP_DEVICES], ay[MAX_USBIP_DEVICES];
+	for (size_t i = 0; i < n; i++) {
+		ax[i] = (float)opts->devices[i].x * dist_adj_size + size_ox;
+		ay[i] = (float)opts->devices[i].y * dist_adj_size + size_oy;
+	}
+
+	/* Viewport reference origin — mirrors the viewportXBegin/YBegin logic. */
+	float vpx, vpy;
+	if (headset_as_center || n == 0) {
+		/* Device display always sits at raw origin (0,0), so after size-adjust: size_ox/oy. */
+		vpx = size_ox;
+		vpy = size_oy;
+	} else {
+		float minx = ax[0], maxx = ax[0] + (float)opts->devices[0].decode_width  * dist_adj_size;
+		float miny = ay[0], maxy = ay[0] + (float)opts->devices[0].decode_height * dist_adj_size;
+		for (size_t i = 1; i < n; i++) {
+			float x2 = ax[i] + (float)opts->devices[i].decode_width  * dist_adj_size;
+			float y2 = ay[i] + (float)opts->devices[i].decode_height * dist_adj_size;
+			if (ax[i] < minx) minx = ax[i];
+			if (x2 > maxx)    maxx = x2;
+			if (ay[i] < miny) miny = ay[i];
+			if (y2 > maxy)    maxy = y2;
+		}
+		vpx = (minx + maxx) / 2.0f - adj_dev_w / 2.0f;
+		vpy = (miny + maxy) / 2.0f - adj_dev_h / 2.0f;
+	}
+
+	for (size_t i = 0; i < n; i++) {
+		out[i].x      = (int32_t)(ax[i] - vpx - (float)viewport_offset_x * adj_dev_w);
+		out[i].y      = (int32_t)(ay[i] - vpy + (float)viewport_offset_y * adj_dev_h);
+		out[i].width  = (uint32_t)((float)opts->devices[i].decode_width  * dist_adj_size);
+		out[i].height = (uint32_t)((float)opts->devices[i].decode_height * dist_adj_size);
+	}
+}
+
+/*
+ * Poll device config and GSettings at most once per second.
+ * Recomputes placements and meshes whenever either changes.
+ * Mirrors the KWin plugin's diagonalToCrossFOVs + enable/disable logic, now
+ * wiring in all display-relevant settings from com.xronlinux.BreezyDesktop.
  */
 static void kms_poll_device_config(struct kms_state *kms,
                                     const struct server_runtime *server)
@@ -157,6 +250,9 @@ static void kms_poll_device_config(struct kms_state *kms,
 	if (now - kms->last_config_poll < 1000u)
 		return;
 	kms->last_config_poll = now;
+
+	/* Re-read GSettings alongside the device config poll. */
+	breezy_settings_poll(&kms->settings, now);
 
 	struct breezy_imu_device_config cfg;
 	struct breezy_imu_pose pose;
@@ -184,11 +280,8 @@ static void kms_poll_device_config(struct kms_state *kms,
 				      server->opts.verbose);
 	}
 
-	if (active == kms->device_active && kms->device_complete_dist_px != 0.0f)
-		return;
-
-	kms->device_active    = active;
-	kms->meshes_computed  = false;
+	kms->device_active   = active;
+	kms->meshes_computed = false;
 
 	if (!active)
 		return;
@@ -200,48 +293,69 @@ static void kms_poll_device_config(struct kms_state *kms,
 	float diag_rad   = cfg.diagonal_fov_deg * (KMS_MATH_PI / 180.0f);
 	float lens_ratio = cfg.lens_distance_ratio;
 
+	/* Derive display-distance and size from settings. */
+	const struct breezy_display_settings *s = &kms->settings;
+	float dist_default = (float)breezy_settings_display_distance_default(s);
+	float dist_adj     = breezy_settings_distance_adjusted_size(s, lens_ratio);
+
+	/* Resolve wrapping scheme (handles "automatic" and "flat+curved"). */
+	struct dp_monitor_info raw_monitors[MAX_USBIP_DEVICES];
+	for (size_t i = 0u; i < opts->device_count; i++) {
+		raw_monitors[i].x      = opts->devices[i].x;
+		raw_monitors[i].y      = opts->devices[i].y;
+		raw_monitors[i].width  = opts->devices[i].decode_width;
+		raw_monitors[i].height = opts->devices[i].decode_height;
+	}
+	const char *resolved_scheme = kms_resolve_wrapping_scheme(
+	    s->monitor_wrapping_scheme, s->curved_display,
+	    raw_monitors, opts->device_count, dev_w, dev_h);
+
 	struct dp_fov_details fov_det;
-	if (dp_build_fov_details(dev_w, dev_h, diag_rad, lens_ratio, 1.0f, &fov_det) != 0) {
+	if (dp_build_fov_details(dev_w, dev_h, diag_rad, lens_ratio, dist_default,
+	                          resolved_scheme, s->curved_display, &fov_det) != 0) {
 		kms->device_active = false;
 		return;
 	}
 
-	kms->device_camera_fov        = fov_det.vertical_radians * (180.0f / KMS_MATH_PI);
-	kms->device_complete_dist_px  = fov_det.complete_dist_px;
-	kms->device_lens_dist_px      = fov_det.lens_distance_px;
-	kms->device_size_adj_w_px     = (float)dev_w * kms->display_size;
-	kms->device_size_adj_h_px     = (float)dev_h * kms->display_size;
+	kms->device_camera_fov       = fov_det.vertical_radians * (180.0f / KMS_MATH_PI);
+	kms->device_complete_dist_px = fov_det.complete_dist_px;
+	kms->device_lens_dist_px     = fov_det.lens_distance_px;
+	kms->display_size            = dist_adj;
+	kms->device_size_adj_w_px    = (float)dev_w * dist_adj;
+	kms->device_size_adj_h_px    = (float)dev_h * dist_adj;
 
-	{
-		struct dp_monitor_info monitors[MAX_USBIP_DEVICES];
-		size_t i;
-		for (i = 0u; i < opts->device_count; i++) {
-			monitors[i].x      = opts->devices[i].x;
-			monitors[i].y      = opts->devices[i].y;
-			monitors[i].width  = opts->devices[i].decode_width;
-			monitors[i].height = opts->devices[i].decode_height;
-		}
-		if (dp_compute_placements(monitors, opts->device_count,
-		                          dev_w, dev_h, diag_rad, lens_ratio,
-		                          fov_det.complete_dist_px, kms->placements) == 0) {
-			kms->placements_computed = true;
+	/* Apply size-adjustment and viewport centering to monitor positions. */
+	struct dp_monitor_info adj_monitors[MAX_USBIP_DEVICES];
+	kms_adjust_monitor_positions(opts, dev_w, dev_h, dist_adj,
+	                              s->headset_display_as_viewport_center,
+	                              s->viewport_offset_x, s->viewport_offset_y,
+	                              adj_monitors);
 
-			/* Build a curved vertex mesh for each configured display. */
-			for (i = 0u; i < opts->device_count && i < MAX_USBIP_DEVICES; i++) {
-				display_renderer_build_mesh(
-				    fov_det.complete_dist_px,
-				    fov_det.horizontal_radians, fov_det.vertical_radians,
-				    dev_w, dev_h,
-				    kms->device_size_adj_w_px, kms->device_size_adj_h_px,
-				    kms->placements[i].cnx,
-				    kms->placements[i].cny,
-				    kms->placements[i].cnz,
-				    monitors[i].width, monitors[i].height,
-				    /*horizontal_wrap=*/1,
-				    &kms->meshes[i]);
-			}
-			kms->meshes_computed = true;
+	float monitor_spacing = (float)s->monitor_spacing / 1000.0f;
+	if (dp_compute_placements(adj_monitors, opts->device_count,
+	                           dev_w, dev_h, diag_rad, lens_ratio,
+	                           dist_default,
+	                           kms->device_size_adj_w_px, kms->device_size_adj_h_px,
+	                           fov_det.complete_dist_px,
+	                           resolved_scheme, s->curved_display, monitor_spacing,
+	                           kms->placements) == 0) {
+		kms->placements_computed = true;
+
+		int horizontal_wrap = (strcmp(resolved_scheme, "horizontal") == 0) ? 1 : 0;
+		for (size_t i = 0u; i < opts->device_count && i < MAX_USBIP_DEVICES; i++) {
+			display_renderer_build_mesh(
+			    fov_det.complete_dist_px,
+			    fov_det.horizontal_radians, fov_det.vertical_radians,
+			    dev_w, dev_h,
+			    kms->device_size_adj_w_px, kms->device_size_adj_h_px,
+			    kms->placements[i].cnx,
+			    kms->placements[i].cny,
+			    kms->placements[i].cnz,
+			    adj_monitors[i].width, adj_monitors[i].height,
+			    horizontal_wrap,
+			    &kms->meshes[i]);
 		}
+		kms->meshes_computed = true;
 	}
 }
 
@@ -1012,6 +1126,7 @@ static int kms_run(struct kms_state *kms, struct server_runtime *server)
 	kms->device_size_adj_w_px     = 0.0f;
 	kms->device_size_adj_h_px     = 0.0f;
 	kms->meshes_computed          = false;
+	breezy_settings_init_defaults(&kms->settings);
 	/* Prime the overlay texture before the first frame. */
 	breezy_overlay_update(&kms->overlay, false, 0u, server->opts.device_count,
 			      server->opts.verbose);
@@ -1037,6 +1152,8 @@ static int kms_run(struct kms_state *kms, struct server_runtime *server)
 		return -1;
 	}
 
+	uint64_t last_frame_ms = 0;
+
 	while (!stop_requested) {
 		int waiting_for_flip = 1;
 		struct gbm_bo *next_bo;
@@ -1044,6 +1161,16 @@ static int kms_run(struct kms_state *kms, struct server_runtime *server)
 		int ret;
 
 		kms_poll_device_config(kms, server);
+
+		/* Honour framerate_cap: skip this iteration if not enough time has passed. */
+		if (kms->settings.framerate_cap > 0.0) {
+			uint64_t now_ms   = kms_realtime_ms();
+			uint64_t min_gap  = (uint64_t)(1000.0 / kms->settings.framerate_cap);
+			if (now_ms - last_frame_ms < min_gap)
+				continue;
+			last_frame_ms = now_ms;
+		}
+
 		kms_update_display_textures(kms, server);
 		kms_render_frame(kms, server);
 		if (!eglSwapBuffers(kms->egl_display, kms->egl_surface)) {

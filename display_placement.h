@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -71,6 +72,9 @@ struct dp_fov_details {
  *   diagonal_fov_rad           – glasses diagonal FOV in radians
  *   lens_distance_ratio        – from device config (0 = screen at lens)
  *   default_display_distance   – arc zoom factor (1.0 = fill FOV exactly)
+ *   wrapping_scheme            – "horizontal", "vertical", or "flat"
+ *                                (resolve "automatic" before calling)
+ *   curved_display             – true enables curved arc geometry
  *
  * Returns 0 on success, -1 on failure.
  */
@@ -79,19 +83,29 @@ int dp_build_fov_details(uint32_t device_width,
                           float diagonal_fov_rad,
                           float lens_distance_ratio,
                           float default_display_distance,
+                          const char *wrapping_scheme,
+                          bool curved_display,
                           struct dp_fov_details *out);
 
 /*
  * Compute GL placements for n monitors arranged on a curved arc using the
  * shared JS placement logic (monitorsToPlacements from displayPlacement.js).
  *
- * Mirrors KWin's buildFovDetails() + monitorsToPlacements() exactly:
- *   device_width/height  – physical glasses display resolution in pixels
- *   diagonal_fov_rad     – glasses diagonal FOV in radians
- *   lens_distance_ratio  – IPD/lens ratio from device config (0 = screen at lens)
- *   arc_radius_gl        – arc radius in GL units (sets the overall scale)
+ * Monitor x/y/width/height should already be viewport-centred and
+ * size-adjusted by the caller (see breezy_settings helpers).
  *
- * Monitor x/y/width/height are in device pixel coordinates.
+ *   device_width/height       – physical glasses display resolution in pixels
+ *   diagonal_fov_rad          – glasses diagonal FOV in radians
+ *   lens_distance_ratio       – from device config (0 = screen at lens)
+ *   display_distance_default  – arc zoom factor (max of distance + toggle range)
+ *   size_adj_width/height     – device dims * distance_adjusted_size
+ *   arc_radius_gl             – arc radius in GL units (sets overall scale;
+ *                               pass fov_details.complete_dist_px for 1:1)
+ *   wrapping_scheme           – "horizontal", "vertical", or "flat"
+ *                               (resolve "automatic" before calling)
+ *   curved_display            – true enables curved arc geometry
+ *   monitor_spacing           – fraction of viewport width (e.g. 0.02)
+ *
  * placements[i] is filled for each monitors[i]; indices are preserved.
  * Returns 0 on success, -1 on failure (error written to stderr).
  */
@@ -101,5 +115,11 @@ int dp_compute_placements(const struct dp_monitor_info *monitors,
                           uint32_t device_height,
                           float diagonal_fov_rad,
                           float lens_distance_ratio,
+                          float display_distance_default,
+                          float size_adj_width,
+                          float size_adj_height,
                           float arc_radius_gl,
+                          const char *wrapping_scheme,
+                          bool curved_display,
+                          float monitor_spacing,
                           struct dp_placement *placements);
