@@ -55,6 +55,12 @@ int dp_diagonal_to_cross_fovs(float diagonal_radians, float aspect_ratio,
 /*
  * Result of buildFovDetails (mirrors shared/displayPlacement.js exactly).
  * Captures all placement-relevant scalar fields from the returned object.
+ *
+ * width_px / height_px are the raw device resolution passed to buildFovDetails.
+ * size_adj_width / size_adj_height default to width_px / height_px and should
+ * be overwritten by the caller when a display-size setting is in effect
+ * (= device_px * distance_adjusted_size).  Both fields are required by
+ * dp_generate_mesh_vertices.
  */
 struct dp_fov_details {
     float complete_dist_px;       /* completeScreenDistancePixels */
@@ -62,6 +68,10 @@ struct dp_fov_details {
     float vertical_radians;       /* defaultDistanceVerticalRadians */
     float lens_distance_px;       /* lensDistancePixels */
     float full_screen_dist_px;    /* fullScreenDistancePixels */
+    float width_px;               /* widthPixels (raw device width) */
+    float height_px;              /* heightPixels (raw device height) */
+    float size_adj_width;         /* sizeAdjustedWidthPixels */
+    float size_adj_height;        /* sizeAdjustedHeightPixels */
 };
 
 /*
@@ -86,6 +96,35 @@ int dp_build_fov_details(uint32_t device_width,
                           const char *wrapping_scheme,
                           bool curved_display,
                           struct dp_fov_details *out);
+
+/*
+ * Generate triangle-strip mesh vertices for one monitor by calling
+ * generateMeshVertices() in the shared JS bundle.  The shared function
+ * uses fovConversionFns (flat or curved per axis) for radians and segment
+ * count — no conversion math is duplicated in C.
+ *
+ * Vertices are written to verts_out as tightly-packed (x, y, z, s, t) floats,
+ * with the centre offset (cx, cy, cz) already added.  The layout is compatible
+ * with display_vertex / display_renderer_draw_mesh.
+ *
+ *   fov            – fovDetails from dp_build_fov_details; size_adj_width /
+ *                    size_adj_height must be set before calling
+ *   mon_w / mon_h   – this monitor's pixel dimensions (size-adjusted)
+ *   wrapping_scheme – "horizontal" | "vertical" | "flat"; both wrap flags are
+ *                     derived independently so "flat" correctly disables both
+ *                     (mirrors CurvableDisplayMesh.qml exactly)
+ *   curved          – 1 = arc geometry, 0 = flat quad
+ *   cx/cy/cz        – GL-space centre offset (centerNoRotate from dp_placement)
+ *   verts_out       – output buffer, 5 floats per vertex
+ *   max_verts       – capacity of verts_out
+ *
+ * Returns the number of vertices written, or -1 on error.
+ */
+int dp_generate_mesh_vertices(const struct dp_fov_details *fov,
+                               float mon_w, float mon_h,
+                               const char *wrapping_scheme, int curved,
+                               float cx, float cy, float cz,
+                               float *verts_out, int max_verts);
 
 /*
  * Compute GL placements for n monitors arranged on a curved arc using the

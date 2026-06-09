@@ -144,10 +144,11 @@ void es_view_from_quat(ESMatrix *r, float qw, float qx, float qy, float qz)
 }
 
 /* ----------------------------------------------------------------
- * Mesh generation
+ * Mesh generation — moved to dp_generate_mesh_vertices() in display_placement.c
+ * which delegates to generateMeshVertices() in the shared JS bundle.
  * ---------------------------------------------------------------- */
-
-void display_renderer_build_mesh(
+#if 0  /* kept for reference; remove once callers are confirmed clean */
+static void display_renderer_build_mesh_ref(
         float radius,
         float default_h_radians, float default_v_radians,
         unsigned dev_w, unsigned dev_h,
@@ -155,24 +156,35 @@ void display_renderer_build_mesh(
         float cnx, float cny, float cnz,
         unsigned mon_w, unsigned mon_h,
         int horizontal_wrap,
+        int curved,
         struct display_mesh *out)
 {
+    /* Mirrors CurvableDisplayMesh.qml: pick flat or curved conversion functions
+     * per axis based on both the wrap axis and the curved flag, matching
+     *   horizontalConversions = horizontalWrap && curvedDisplay ? curved : flat
+     *   verticalConversions   = verticalWrap   && curvedDisplay ? curved : flat
+     */
     const float segs_per_rad = 20.0f / (DR_PI * 0.5f);
     int vertical_wrap = !horizontal_wrap;
+    int h_curved = horizontal_wrap && curved;
+    int v_curved = vertical_wrap   && curved;
 
+    /* Radians per axis — curved uses linear angular scale, flat uses asin. */
     float h_edge = sqrtf(size_adj_w * 0.5f * size_adj_w * 0.5f + radius * radius);
-    float h_radians = horizontal_wrap
+    float h_radians = h_curved
         ? ((dev_w > 0u) ? (default_h_radians / (float)dev_w * (float)mon_w) : 0.0f)
         : ((h_edge > 0.0f) ? 2.0f * asinf(fminf((float)mon_w * 0.5f / h_edge, 1.0f)) : 0.0f);
 
     float v_edge = sqrtf(size_adj_h * 0.5f * size_adj_h * 0.5f + radius * radius);
-    float v_radians = vertical_wrap
+    float v_radians = v_curved
         ? ((dev_h > 0u) ? (default_v_radians / (float)dev_h * (float)mon_h) : 0.0f)
         : ((v_edge > 0.0f) ? 2.0f * asinf(fminf((float)mon_h * 0.5f / v_edge, 1.0f)) : 0.0f);
 
+    /* Segment count — curved uses arc-proportional count, flat always gives 1.
+     * Mirrors radiansToSegments: curved → ceil(radians * segsPerRadian), flat → 1. */
     int segments = 1;
-    if (horizontal_wrap)    segments = (int)ceilf(h_radians * segs_per_rad);
-    else if (vertical_wrap) segments = (int)ceilf(v_radians * segs_per_rad);
+    if (h_curved)      segments = (int)ceilf(h_radians * segs_per_rad);
+    else if (v_curved) segments = (int)ceilf(v_radians * segs_per_rad);
     if (segments < 1) segments = 1;
 
     int count = 0;
@@ -201,7 +213,7 @@ void display_renderer_build_mesh(
             float yOff = 0.5f - t;  /* GLES2: t=0 → GL y+, t=1 → GL y- */
             float xOffPx, yOffPx, zOffPx = 0.0f;
 
-            if (horizontal_wrap) {
+            if (h_curved) {
                 float xOffRad = xOff * h_radians;
                 xOffPx = sinf(xOffRad) * radius;
                 zOffPx = radius - cosf(xOffRad) * radius;
@@ -209,7 +221,7 @@ void display_renderer_build_mesh(
                 xOffPx = (float)mon_w * xOff;
             }
 
-            if (vertical_wrap) {
+            if (v_curved) {
                 float yOffRad = yOff * v_radians;
                 yOffPx = sinf(yOffRad) * radius;
                 zOffPx = radius - cosf(yOffRad) * radius;
@@ -228,6 +240,7 @@ void display_renderer_build_mesh(
 done:
     out->vert_count = count;
 }
+#endif  /* reference only */
 
 /* ----------------------------------------------------------------
  * Renderer lifecycle

@@ -324,6 +324,11 @@ static void kms_poll_device_config(struct kms_state *kms,
 	kms->device_size_adj_w_px    = (float)dev_w * dist_adj;
 	kms->device_size_adj_h_px    = (float)dev_h * dist_adj;
 
+	/* Override sizeAdjusted* so dp_generate_mesh_vertices uses the correct
+	 * scaled viewport reference (same override done for dp_compute_placements). */
+	fov_det.size_adj_width  = kms->device_size_adj_w_px;
+	fov_det.size_adj_height = kms->device_size_adj_h_px;
+
 	/* Apply size-adjustment and viewport centering to monitor positions. */
 	struct dp_monitor_info adj_monitors[MAX_USBIP_DEVICES];
 	kms_adjust_monitor_positions(opts, dev_w, dev_h, dist_adj,
@@ -341,19 +346,22 @@ static void kms_poll_device_config(struct kms_state *kms,
 	                           kms->placements) == 0) {
 		kms->placements_computed = true;
 
-		int horizontal_wrap = (strcmp(resolved_scheme, "horizontal") == 0) ? 1 : 0;
+		/* Pass the resolved scheme string directly so generateMeshVertices() in the
+		 * shared JS derives horizontalWrap and verticalWrap independently — matching
+		 * CurvableDisplayMesh.qml exactly and correctly handling 'flat' (both false). */
+		int curved = s->curved_display ? 1 : 0;
+
 		for (size_t i = 0u; i < opts->device_count && i < MAX_USBIP_DEVICES; i++) {
-			display_renderer_build_mesh(
-			    fov_det.complete_dist_px,
-			    fov_det.horizontal_radians, fov_det.vertical_radians,
-			    dev_w, dev_h,
-			    kms->device_size_adj_w_px, kms->device_size_adj_h_px,
+			int vc = dp_generate_mesh_vertices(
+			    &fov_det,
+			    (float)adj_monitors[i].width, (float)adj_monitors[i].height,
+			    resolved_scheme, curved,
 			    kms->placements[i].cnx,
 			    kms->placements[i].cny,
 			    kms->placements[i].cnz,
-			    adj_monitors[i].width, adj_monitors[i].height,
-			    horizontal_wrap,
-			    &kms->meshes[i]);
+			    (float *)kms->meshes[i].verts,
+			    DISPLAY_MESH_MAX_VERTS);
+			kms->meshes[i].vert_count = (vc > 0) ? vc : 0;
 		}
 		kms->meshes_computed = true;
 	}

@@ -21,6 +21,7 @@ static JSContext *g_ctx;
 static JSValue    g_fn_monitors_to_placements;
 static JSValue    g_fn_diagonal_to_cross_fovs;
 static JSValue    g_fn_build_fov_details;
+static JSValue    g_fn_generate_mesh_vertices;
 
 int dp_init(void)
 {
@@ -58,9 +59,10 @@ int dp_init(void)
     JS_FreeValue(g_ctx, eval_result);
 
     global = JS_GetGlobalObject(g_ctx);
-    g_fn_monitors_to_placements = JS_GetPropertyStr(g_ctx, global, "monitorsToPlacements");
-    g_fn_diagonal_to_cross_fovs = JS_GetPropertyStr(g_ctx, global, "diagonalToCrossFOVs");
-    g_fn_build_fov_details       = JS_GetPropertyStr(g_ctx, global, "buildFovDetails");
+    g_fn_monitors_to_placements  = JS_GetPropertyStr(g_ctx, global, "monitorsToPlacements");
+    g_fn_diagonal_to_cross_fovs  = JS_GetPropertyStr(g_ctx, global, "diagonalToCrossFOVs");
+    g_fn_build_fov_details        = JS_GetPropertyStr(g_ctx, global, "buildFovDetails");
+    g_fn_generate_mesh_vertices   = JS_GetPropertyStr(g_ctx, global, "generateMeshVertices");
     JS_FreeValue(g_ctx, global);
 
     if (!JS_IsFunction(g_ctx, g_fn_monitors_to_placements)) {
@@ -78,6 +80,11 @@ int dp_init(void)
         dp_destroy();
         return -1;
     }
+    if (!JS_IsFunction(g_ctx, g_fn_generate_mesh_vertices)) {
+        fprintf(stderr, "dp: generateMeshVertices not found in JS bundle\n");
+        dp_destroy();
+        return -1;
+    }
 
     return 0;
 }
@@ -89,9 +96,11 @@ void dp_destroy(void)
     JS_FreeValue(g_ctx, g_fn_monitors_to_placements);
     JS_FreeValue(g_ctx, g_fn_diagonal_to_cross_fovs);
     JS_FreeValue(g_ctx, g_fn_build_fov_details);
-    g_fn_monitors_to_placements = JS_UNDEFINED;
-    g_fn_diagonal_to_cross_fovs = JS_UNDEFINED;
-    g_fn_build_fov_details       = JS_UNDEFINED;
+    JS_FreeValue(g_ctx, g_fn_generate_mesh_vertices);
+    g_fn_monitors_to_placements  = JS_UNDEFINED;
+    g_fn_diagonal_to_cross_fovs  = JS_UNDEFINED;
+    g_fn_build_fov_details        = JS_UNDEFINED;
+    g_fn_generate_mesh_vertices   = JS_UNDEFINED;
     JS_FreeContext(g_ctx);
     JS_FreeRuntime(g_rt);
     g_ctx = NULL;
@@ -196,11 +205,16 @@ int dp_build_fov_details(uint32_t device_width,
         JS_FreeValue(g_ctx, v); \
         out->member = (float)d
 
-        READ_FIELD("completeScreenDistancePixels", complete_dist_px);
-        READ_FIELD("defaultDistanceHorizontalRadians", horizontal_radians);
-        READ_FIELD("defaultDistanceVerticalRadians",   vertical_radians);
-        READ_FIELD("lensDistancePixels",               lens_distance_px);
-        READ_FIELD("fullScreenDistancePixels",         full_screen_dist_px);
+        READ_FIELD("completeScreenDistancePixels",      complete_dist_px);
+        READ_FIELD("defaultDistanceHorizontalRadians",  horizontal_radians);
+        READ_FIELD("defaultDistanceVerticalRadians",    vertical_radians);
+        READ_FIELD("lensDistancePixels",                lens_distance_px);
+        READ_FIELD("fullScreenDistancePixels",          full_screen_dist_px);
+        READ_FIELD("widthPixels",                       width_px);
+        READ_FIELD("heightPixels",                      height_px);
+        /* size_adj_* default to device dims; caller overrides if display_size != 1 */
+        READ_FIELD("sizeAdjustedWidthPixels",           size_adj_width);
+        READ_FIELD("sizeAdjustedHeightPixels",          size_adj_height);
 #undef READ_FIELD
     }
     ret = 0;
@@ -429,4 +443,95 @@ cleanup:
     JS_FreeValue(g_ctx, monitor_arr);
     JS_FreeValue(g_ctx, fov_obj);
     return ret;
+}
+
+/* ----------------------------------------------------------------
+ * dp_generate_mesh_vertices
+ * ---------------------------------------------------------------- */
+
+int dp_generate_mesh_vertices(const struct dp_fov_details *fov,
+                               float mon_w, float mon_h,
+                               const char *wrapping_scheme, int curved,
+                               float cx, float cy, float cz,
+                               float *verts_out, int max_verts)
+{
+    if (!fov || !verts_out || max_verts <= 0 || !g_ctx)
+        return -1;
+
+    /* Build a minimal fovDetails JS object from the C struct fields. */
+    JSValue fov_obj = JS_NewObject(g_ctx);
+    JS_SetPropertyStr(g_ctx, fov_obj, "completeScreenDistancePixels",
+                      JS_NewFloat64(g_ctx, (double)fov->complete_dist_px));
+    JS_SetPropertyStr(g_ctx, fov_obj, "defaultDistanceHorizontalRadians",
+                      JS_NewFloat64(g_ctx, (double)fov->horizontal_radians));
+    JS_SetPropertyStr(g_ctx, fov_obj, "defaultDistanceVerticalRadians",
+                      JS_NewFloat64(g_ctx, (double)fov->vertical_radians));
+    JS_SetPropertyStr(g_ctx, fov_obj, "widthPixels",
+                      JS_NewFloat64(g_ctx, (double)fov->width_px));
+    JS_SetPropertyStr(g_ctx, fov_obj, "heightPixels",
+                      JS_NewFloat64(g_ctx, (double)fov->height_px));
+    JS_SetPropertyStr(g_ctx, fov_obj, "sizeAdjustedWidthPixels",
+                      JS_NewFloat64(g_ctx, (double)fov->size_adj_width));
+    JS_SetPropertyStr(g_ctx, fov_obj, "sizeAdjustedHeightPixels",
+                      JS_NewFloat64(g_ctx, (double)fov->size_adj_height));
+
+    JSValue args[8] = {
+        fov_obj,
+        JS_NewFloat64(g_ctx, (double)mon_w),
+        JS_NewFloat64(g_ctx, (double)mon_h),
+        JS_NewString (g_ctx, wrapping_scheme ? wrapping_scheme : "flat"),
+        JS_NewBool   (g_ctx, curved),
+        JS_NewFloat64(g_ctx, (double)cx),
+        JS_NewFloat64(g_ctx, (double)cy),
+        JS_NewFloat64(g_ctx, (double)cz),
+    };
+
+    JSValue result = JS_Call(g_ctx, g_fn_generate_mesh_vertices,
+                             JS_UNDEFINED, 8, args);
+    JS_FreeValue(g_ctx, fov_obj);
+    JS_FreeValue(g_ctx, args[3]); /* wrapping_scheme string */
+
+    if (JS_IsException(result)) {
+        JSValue exc = JS_GetException(g_ctx);
+        const char *msg = JS_ToCString(g_ctx, exc);
+        fprintf(stderr, "dp: generateMeshVertices error: %s\n", msg ? msg : "(unknown)");
+        JS_FreeCString(g_ctx, msg);
+        JS_FreeValue(g_ctx, exc);
+        JS_FreeValue(g_ctx, result);
+        return -1;
+    }
+
+    JSValue len_val = JS_GetPropertyStr(g_ctx, result, "length");
+    uint32_t js_len = 0u;
+    JS_ToUint32(g_ctx, &js_len, len_val);
+    JS_FreeValue(g_ctx, len_val);
+
+    int count = 0;
+    for (uint32_t i = 0u; i < js_len && count < max_verts; i++) {
+        JSValue vtx = JS_GetPropertyUint32(g_ctx, result, i);
+        JSValue vx  = JS_GetPropertyStr(g_ctx, vtx, "x");
+        JSValue vy  = JS_GetPropertyStr(g_ctx, vtx, "y");
+        JSValue vz  = JS_GetPropertyStr(g_ctx, vtx, "z");
+        JSValue vs  = JS_GetPropertyStr(g_ctx, vtx, "s");
+        JSValue vt_ = JS_GetPropertyStr(g_ctx, vtx, "t");
+        double dx, dy, dz, ds, dt;
+        JS_ToFloat64(g_ctx, &dx, vx);
+        JS_ToFloat64(g_ctx, &dy, vy);
+        JS_ToFloat64(g_ctx, &dz, vz);
+        JS_ToFloat64(g_ctx, &ds, vs);
+        JS_ToFloat64(g_ctx, &dt, vt_);
+        JS_FreeValue(g_ctx, vx); JS_FreeValue(g_ctx, vy); JS_FreeValue(g_ctx, vz);
+        JS_FreeValue(g_ctx, vs); JS_FreeValue(g_ctx, vt_); JS_FreeValue(g_ctx, vtx);
+
+        float *v = verts_out + (size_t)count * 5u;
+        v[0] = (float)dx;
+        v[1] = (float)dy;
+        v[2] = (float)dz;
+        v[3] = (float)ds;
+        v[4] = (float)dt;
+        count++;
+    }
+
+    JS_FreeValue(g_ctx, result);
+    return count;
 }

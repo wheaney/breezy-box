@@ -1,0 +1,12 @@
+# systemd-networkd configuration for the RNDIS gadget interface.
+# Install to /etc/systemd/network/usb0.network via setup_system.sh.
+#
+# This replaces the `ip link set` / `ip addr add` calls inside the app;
+# networkd brings up the interface automatically whenever the USB gadget
+# binds to the UDC and the kernel creates usb0.
+
+[Match]
+Name=usb0
+
+[Network]
+Address=192.168.7.2/30

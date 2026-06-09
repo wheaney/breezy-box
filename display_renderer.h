@@ -57,19 +57,6 @@ struct display_mesh {
  *   default_h/v_radians defaultDistanceHorizontal/VerticalRadians from fovDetails
  *   dev_w / dev_h       fovDetails.widthPixels / heightPixels
  *   size_adj_w/h        fovDetails.sizeAdjustedWidth/HeightPixels
- *   cnx,cny,cnz         centerNoRotate in GL space (from dp_placement)
- *   mon_w / mon_h       this monitor's pixel dimensions
- *   horizontal_wrap     true → curved horizontally; false → curved vertically
- */
-void display_renderer_build_mesh(
-        float radius,
-        float default_h_radians, float default_v_radians,
-        unsigned dev_w, unsigned dev_h,
-        float size_adj_w, float size_adj_h,
-        float cnx, float cny, float cnz,
-        unsigned mon_w, unsigned mon_h,
-        int horizontal_wrap,
-        struct display_mesh *out);
 
 /* ----------------------------------------------------------------
  * Textured-quad renderer
