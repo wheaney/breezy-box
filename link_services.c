@@ -18,10 +18,10 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#define LS_DNSMASQ_PIDFILE "/run/breezy-dnsmasq.pid"
-#define LS_DNSMASQ_LEASES  "/run/breezy-dnsmasq.leases"
-#define LS_MDNS_LINK_PIDFILE "/run/breezy-avahi-publish-link.pid"
-#define LS_MDNS_WLAN_PIDFILE "/run/breezy-avahi-publish-wlan.pid"
+/* pid-file and leases paths are derived from the interface name at runtime;
+ * see link_services_start().  These helpers are called with the already-formed
+ * path strings so two link_services instances on different interfaces don't
+ * clobber each other's files. */
 
 static void kill_matching_publishers(const char *fqdn);
 static void kill_pidfile(const char *path);
@@ -279,25 +279,30 @@ void link_services_config_defaults(struct link_services_config *cfg)
  *   --dhcp-option=6 : send an empty DNS option (host keeps its own resolver)
  * The subnet mask is inferred from the interface's configured prefix.
  */
-static int start_dhcp(const struct link_services_config *cfg)
+static int start_dhcp(const struct link_services_config *cfg,
+                      const char *pidfile, const char *leases)
 {
     char a_iface[64];
     char a_range[200];
+    char a_pid[LS_PIDFILE_MAX + 16];
+    char a_lease[LS_PIDFILE_MAX + 20];
     char a_mtu[32];
 
-    kill_pidfile(LS_DNSMASQ_PIDFILE); /* clear any stale instance from a previous run */
+    kill_pidfile(pidfile); /* clear any stale instance from a previous run */
 
     snprintf(a_iface, sizeof(a_iface), "--interface=%s", cfg->iface);
     snprintf(a_range, sizeof(a_range), "--dhcp-range=%s,%s,%s",
              cfg->host_ip, cfg->host_ip, cfg->lease_time);
+    snprintf(a_pid,   sizeof(a_pid),   "--pid-file=%s",      pidfile);
+    snprintf(a_lease, sizeof(a_lease), "--dhcp-leasefile=%s", leases);
 
     const char *argv[16];
     size_t argc = 0u;
 
     argv[argc++] = "dnsmasq";
     argv[argc++] = "--conf-file=/dev/null";
-    argv[argc++] = "--pid-file=" LS_DNSMASQ_PIDFILE;
-    argv[argc++] = "--dhcp-leasefile=" LS_DNSMASQ_LEASES;
+    argv[argc++] = a_pid;
+    argv[argc++] = a_lease;
     argv[argc++] = a_iface;
     argv[argc++] = "--bind-interfaces";
     argv[argc++] = "--except-interface=lo";
@@ -324,14 +329,23 @@ static int start_dhcp(const struct link_services_config *cfg)
 /*
  * Publish the mDNS names via the system avahi daemon as explicit address
  * aliases:
- *   - link_name is pinned to link_ip so it ALWAYS resolves to the USB link.
+ *   - link_name is pinned to link_ip so breezy.local resolves to the correct
+ *     IP on the interface the host queries from.  Multiple instances (one per
+ *     interface) may publish the same FQDN with different IPs; mDNS is
+ *     link-local so each host sees only the record on its own segment.
  *   - wlan_name is pinned to the first non-link IPv4 address (prefer a
- *     wireless interface) so it resolves to the Wi-Fi/LAN path instead of the
- *     USB gadget IP.
+ *     wireless interface) so it resolves to the Wi-Fi/LAN path.
  * Returns 0 if the responder is available, -1 only when avahi itself cannot be
  * started.
+ *
+ * NOTE: kill_matching_publishers() is intentionally NOT called for the link
+ * name.  When two interfaces share the same FQDN (e.g. both publish
+ * "breezy.local"), a FQDN-wide kill would tear down the other interface's
+ * publisher.  Per-interface pid-files (link_pidfile / wlan_pidfile) are
+ * sufficient to clean up stale publishers from previous runs.
  */
 static int start_mdns(const struct link_services_config *cfg,
+                      const char *link_pidfile, const char *wlan_pidfile,
                       struct link_services_state *state)
 {
     /* Best-effort: make sure the responder is running (no-op if already up). */
@@ -344,11 +358,11 @@ static int start_mdns(const struct link_services_config *cfg,
         char wlan_ip[LS_IP_MAX];
 
         snprintf(fqdn, sizeof(fqdn), "%s.local", cfg->wlan_name);
-        kill_pidfile(LS_MDNS_WLAN_PIDFILE);
+        kill_pidfile(wlan_pidfile);
         kill_matching_publishers(fqdn);
 
         if (detect_non_link_ipv4(cfg->iface, wlan_ip, sizeof(wlan_ip)) == 0) {
-            if (spawn_publish_address(LS_MDNS_WLAN_PIDFILE, fqdn, wlan_ip) == 0) {
+            if (spawn_publish_address(wlan_pidfile, fqdn, wlan_ip) == 0) {
                 if (state)
                     state->wlan_name_set = true;
             } else {
@@ -363,19 +377,18 @@ static int start_mdns(const struct link_services_config *cfg,
         }
     }
 
-    /* Re-pin the link name, clearing any publisher left by a previous run. */
+    /* Re-pin the link name, clearing only THIS interface's previous publisher. */
     if (cfg->link_name[0] != '\0' && cfg->link_ip[0] != '\0') {
         char fqdn[LS_NAME_MAX + 8];
 
         snprintf(fqdn, sizeof(fqdn), "%s.local", cfg->link_name);
-        kill_pidfile(LS_MDNS_LINK_PIDFILE);
-        kill_matching_publishers(fqdn);
-        if (spawn_publish_address(LS_MDNS_LINK_PIDFILE, fqdn, cfg->link_ip) == 0) {
+        kill_pidfile(link_pidfile);
+        if (spawn_publish_address(link_pidfile, fqdn, cfg->link_ip) == 0) {
             if (state)
                 state->link_name_pinned = true;
         } else {
             fprintf(stderr,
-                "link_services: could not pin %s to %s via avahi (name already in use or stale publisher still exiting)\n",
+                "link_services: could not pin %s to %s via avahi\n",
                 fqdn, cfg->link_ip);
         }
     }
@@ -386,13 +399,30 @@ static int start_mdns(const struct link_services_config *cfg,
 int link_services_start(const struct link_services_config *cfg,
                         struct link_services_state *state)
 {
+    char dnsmasq_pid[LS_PIDFILE_MAX];
+    char dnsmasq_leases[LS_PIDFILE_MAX];
+    char mdns_link_pid[LS_PIDFILE_MAX];
+    char mdns_wlan_pid[LS_PIDFILE_MAX];
+
     if (state)
         memset(state, 0, sizeof(*state));
     if (!cfg || cfg->iface[0] == '\0')
         return -1;
 
+    /* Derive per-interface file paths so multiple instances don't conflict. */
+    snprintf(dnsmasq_pid,    sizeof(dnsmasq_pid),    "/run/breezy-dnsmasq-%s.pid",    cfg->iface);
+    snprintf(dnsmasq_leases, sizeof(dnsmasq_leases), "/run/breezy-dnsmasq-%s.leases", cfg->iface);
+    snprintf(mdns_link_pid,  sizeof(mdns_link_pid),  "/run/breezy-avahi-link-%s.pid", cfg->iface);
+    snprintf(mdns_wlan_pid,  sizeof(mdns_wlan_pid),  "/run/breezy-avahi-wlan-%s.pid", cfg->iface);
+
+    if (state) {
+        snprintf(state->dnsmasq_pidfile,  sizeof(state->dnsmasq_pidfile),  "%s", dnsmasq_pid);
+        snprintf(state->mdns_link_pidfile, sizeof(state->mdns_link_pidfile), "%s", mdns_link_pid);
+        snprintf(state->mdns_wlan_pidfile, sizeof(state->mdns_wlan_pidfile), "%s", mdns_wlan_pid);
+    }
+
     if (cfg->host_ip[0] != '\0') {
-        if (start_dhcp(cfg) == 0) {
+        if (start_dhcp(cfg, dnsmasq_pid, dnsmasq_leases) == 0) {
             if (state)
                 state->dhcp_running = true;
             printf("link_services: DHCP serving %s to the host on %s\n",
@@ -406,7 +436,7 @@ int link_services_start(const struct link_services_config *cfg,
 
     bool want_mdns = cfg->link_name[0] != '\0' || cfg->wlan_name[0] != '\0';
     if (want_mdns) {
-        if (start_mdns(cfg, state) == 0) {
+        if (start_mdns(cfg, mdns_link_pid, mdns_wlan_pid, state) == 0) {
             if (state && state->link_name_pinned) {
                 printf("link_services: publishing %s.local for the link address %s via mDNS\n",
                        cfg->link_name, cfg->link_ip);
@@ -427,9 +457,13 @@ int link_services_start(const struct link_services_config *cfg,
 
 void link_services_stop(struct link_services_state *state)
 {
-    kill_pidfile(LS_DNSMASQ_PIDFILE);
-    kill_pidfile(LS_MDNS_LINK_PIDFILE);
-    kill_pidfile(LS_MDNS_WLAN_PIDFILE);
-    if (state)
-        memset(state, 0, sizeof(*state));
+    if (!state)
+        return;
+    if (state->dnsmasq_pidfile[0])
+        kill_pidfile(state->dnsmasq_pidfile);
+    if (state->mdns_link_pidfile[0])
+        kill_pidfile(state->mdns_link_pidfile);
+    if (state->mdns_wlan_pidfile[0])
+        kill_pidfile(state->mdns_wlan_pidfile);
+    memset(state, 0, sizeof(*state));
 }

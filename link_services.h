@@ -31,10 +31,11 @@
  * as independent processes, so no background thread is required here.
  */
 
-#define LS_IFACE_MAX 32
-#define LS_IP_MAX    48
-#define LS_LEASE_MAX 16
-#define LS_NAME_MAX  64
+#define LS_IFACE_MAX   32
+#define LS_IP_MAX      48
+#define LS_LEASE_MAX   16
+#define LS_NAME_MAX    64
+#define LS_PIDFILE_MAX 80   /* "/run/breezy-dnsmasq-<IFNAMSIZ>.pid\0" */
 
 struct link_services_config {
     char iface[LS_IFACE_MAX];      /* link to serve, e.g. "usb0" */
@@ -55,9 +56,13 @@ struct link_services_config {
 };
 
 struct link_services_state {
-    bool dhcp_running;             /* a dnsmasq instance was launched */
-    bool wlan_name_set;            /* the non-link-name publisher is running */
-    bool link_name_pinned;         /* the pinned link-name publisher is running */
+    bool dhcp_running;
+    bool wlan_name_set;
+    bool link_name_pinned;
+    /* pid-file paths derived from cfg->iface at start time; used by stop() */
+    char dnsmasq_pidfile[LS_PIDFILE_MAX];
+    char mdns_link_pidfile[LS_PIDFILE_MAX];
+    char mdns_wlan_pidfile[LS_PIDFILE_MAX];
 };
 
 /* iface=usb0, host_ip=192.168.7.1, lease=1h, link_ip=192.168.7.2,

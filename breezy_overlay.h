@@ -43,7 +43,7 @@ enum breezy_overlay_state {
 };
 
 struct breezy_overlay {
-	/* Addresses populated by breezy_overlay_set_addresses(). */
+	/* OTG/USB gadget link — populated by breezy_overlay_set_addresses(). */
 	char link_mdns[BO_MDNS_MAX];    /* e.g. "breezy.local"     */
 	char link_ip[BO_ADDR_MAX];      /* gadget OTG IPv4          */
 	char host_ip[BO_ADDR_MAX];      /* host's DHCP address, e.g. "192.168.7.1" */
@@ -51,16 +51,23 @@ struct breezy_overlay {
 	char wlan_ip[BO_ADDR_MAX];      /* wlan/LAN IPv4, may be empty */
 	char otg_iface[BO_IFACE_MAX];   /* e.g. "usb0"              */
 
-	enum breezy_overlay_state state;
-	bool host_connected;
+	/* Direct wired Ethernet link — populated by breezy_overlay_set_eth_link(). */
+	char eth_iface[BO_IFACE_MAX];   /* e.g. "eth0"              */
+	char eth_link_ip[BO_ADDR_MAX];  /* SBC's address on the link */
+	char eth_host_ip[BO_ADDR_MAX];  /* host's DHCP address      */
 
-	bool arping_result;     /* last arping probe result, persists across calls */
+	enum breezy_overlay_state state;
+	bool host_connected;    /* host present on any path            */
+	bool otg_connected;     /* host confirmed on OTG via arping    */
+	bool eth_connected;     /* host confirmed on wired Ethernet via carrier */
+
+	bool arping_result;     /* last OTG arping result, persists across calls */
 
 	struct overlay_text tex;        /* GL texture, ready to draw */
 };
 
 /*
- * Populate address fields from link_services_config + the OTG netdev name.
+ * Populate OTG address fields from link_services_config + the OTG netdev name.
  * Must be called before the first breezy_overlay_update().
  * No GL context needed.
  */
@@ -68,6 +75,20 @@ struct link_services_config;   /* forward — include link_services.h for the fu
 void breezy_overlay_set_addresses(struct breezy_overlay *ov,
 				   const struct link_services_config *link_cfg,
 				   const char *otg_netdev);
+
+/*
+ * Populate direct wired Ethernet address fields.  Call after usb_gadget_setup()
+ * once the Ethernet interface name and its CIDR are known.
+ * No GL context needed; safe to call multiple times (overwrites previous values).
+ *
+ *   eth_iface   — kernel interface name, e.g. "eth0"
+ *   eth_link_ip — SBC's own address on the link, e.g. "192.168.8.2"
+ *   eth_host_ip — host's DHCP-assigned address, e.g. "192.168.8.1"
+ */
+void breezy_overlay_set_eth_link(struct breezy_overlay *ov,
+				  const char *eth_iface,
+				  const char *eth_link_ip,
+				  const char *eth_host_ip);
 
 /*
  * Re-evaluate state and refresh the overlay texture if anything changed.

@@ -13,8 +13,10 @@
 #include <time.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <dirent.h>
 #include <sys/select.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <limits.h>
 
 /* DRM/KMS */
@@ -1296,6 +1298,74 @@ static void *server_thread_main(void *arg)
 }
 
 /* ----------------------------------------------------------------
+ * Wired Ethernet direct-link support
+ * ---------------------------------------------------------------- */
+
+/* IP addressing for the direct wired Ethernet link.  Different subnet from
+ * the OTG link (192.168.7.x) so the two can coexist without routing conflicts. */
+#define ETH_LINK_IP_CIDR  "192.168.8.2/30"
+#define ETH_HOST_IP       "192.168.8.1"
+#define ETH_LEASE_TIME    "1h"
+
+/*
+ * Find the first physical wired Ethernet interface that is not the OTG gadget
+ * netdev and not a wireless interface.  Writes the interface name into out[cap]
+ * and returns 0 on success, -1 if none is found.
+ *
+ * Detection criteria (all must hold):
+ *   - Not "lo" (loopback)
+ *   - Not exclude_iface (the USB gadget netdev, e.g. "usb0")
+ *   - /sys/class/net/<name>/wireless/ does NOT exist  (not Wi-Fi)
+ *   - /sys/class/net/<name>/device    DOES exist      (physical hardware, not virtual)
+ */
+static int detect_wired_eth_iface(const char *exclude_iface,
+				   char *out, size_t cap)
+{
+	DIR *d;
+	struct dirent *e;
+
+	if (!out || cap == 0)
+		return -1;
+
+	d = opendir("/sys/class/net");
+	if (!d)
+		return -1;
+
+	while ((e = readdir(d)) != NULL) {
+		/* /sys/class/net/<name>/wireless  and  .../device are at most
+		 * "/sys/class/net/" (15) + IFNAMSIZ (16) + "/wireless" (9) + NUL = 41 */
+		char path[64];
+		struct stat st;
+		const char *name = e->d_name;
+
+		if (name[0] == '.')
+			continue;
+		if (strcmp(name, "lo") == 0)
+			continue;
+		if (exclude_iface && strcmp(name, exclude_iface) == 0)
+			continue;
+		/* Interface names are bounded by IFNAMSIZ (16); skip anything longer. */
+		if (strlen(name) >= 16)
+			continue;
+
+		snprintf(path, sizeof(path), "/sys/class/net/%s/wireless", name);
+		if (stat(path, &st) == 0 && S_ISDIR(st.st_mode))
+			continue;
+
+		snprintf(path, sizeof(path), "/sys/class/net/%s/device", name);
+		if (stat(path, &st) != 0)
+			continue;
+
+		snprintf(out, cap, "%s", name);
+		closedir(d);
+		return 0;
+	}
+
+	closedir(d);
+	return -1;
+}
+
+/* ----------------------------------------------------------------
  * main()
  * ---------------------------------------------------------------- */
 
@@ -1309,6 +1379,10 @@ int main(int argc, char **argv)
 	struct link_services_state link_state;
 	struct link_services_config link_cfg;
 	bool link_cfg_valid = false;
+	struct link_services_state eth_link_state;
+	struct link_services_config eth_link_cfg;
+	bool eth_link_cfg_valid = false;
+	char eth_iface[32] = "";
 	pthread_t srv_thread;
 	bool srv_thread_created = false;
 	int exit_code = EXIT_FAILURE;
@@ -1320,6 +1394,7 @@ int main(int argc, char **argv)
 	kms.drm_fd = -1;
 	memset(&gadget_state, 0, sizeof(gadget_state));
 	memset(&link_state, 0, sizeof(link_state));
+	memset(&eth_link_state, 0, sizeof(eth_link_state));
 
 	if (parse_runtime_cli_args(argc, argv, &cli) != 0) {
 		usage(argv[0]);
@@ -1372,6 +1447,44 @@ int main(int argc, char **argv)
 		link_cfg_valid = true;
 	}
 
+	/*
+	 * Start DHCP + mDNS on the wired Ethernet port for hosts that connect
+	 * via a direct cable rather than the OTG USB port.  Auto-detects the
+	 * first physical non-wireless interface that isn't the gadget netdev.
+	 * Assigns the SBC 192.168.8.2/30 and hands the host 192.168.8.1.
+	 * breezy.local resolves correctly from either path because mDNS is
+	 * link-local: each host sees the record on its own interface.
+	 */
+	if (detect_wired_eth_iface(gadget_state.netdev_name[0]
+				       ? gadget_state.netdev_name : NULL,
+				   eth_iface, sizeof(eth_iface)) == 0) {
+		memset(&eth_link_cfg, 0, sizeof(eth_link_cfg));
+		snprintf(eth_link_cfg.iface,      sizeof(eth_link_cfg.iface),
+			 "%s", eth_iface);
+		snprintf(eth_link_cfg.host_ip,    sizeof(eth_link_cfg.host_ip),
+			 "%s", ETH_HOST_IP);
+		snprintf(eth_link_cfg.lease_time, sizeof(eth_link_cfg.lease_time),
+			 "%s", ETH_LEASE_TIME);
+		snprintf(eth_link_cfg.link_ip,    sizeof(eth_link_cfg.link_ip),
+			 "%s", ETH_LINK_IP_CIDR);
+		/* Strip the "/prefix" suffix to get the bare IP for mDNS pinning. */
+		{
+			char *slash = strchr(eth_link_cfg.link_ip, '/');
+			if (slash)
+				*slash = '\0';
+		}
+		/* Publish breezy.local on this interface too; same name as OTG.
+		 * mDNS is link-local so each host sees only its own segment's record. */
+		if (link_cfg_valid && link_cfg.link_name[0])
+			snprintf(eth_link_cfg.link_name, sizeof(eth_link_cfg.link_name),
+				 "%s", link_cfg.link_name);
+
+		link_services_start(&eth_link_cfg, &eth_link_state);
+		eth_link_cfg_valid = true;
+		printf("Direct Ethernet link active on %s (%s, host %s)\n",
+		       eth_iface, ETH_LINK_IP_CIDR, ETH_HOST_IP);
+	}
+
 	if (server_runtime_init_devices(&server) != 0) {
 		fprintf(stderr, "Failed to initialise USB/IP device runtimes\n");
 		goto out;
@@ -1387,6 +1500,11 @@ int main(int argc, char **argv)
 				     link_cfg_valid ? &link_cfg : NULL,
 				     gadget_state.netdev_name[0]
 					 ? gadget_state.netdev_name : NULL);
+	if (eth_link_cfg_valid)
+		breezy_overlay_set_eth_link(&kms.overlay,
+					    eth_iface,
+					    eth_link_cfg.link_ip,
+					    ETH_HOST_IP);
 
 	if (kms_init_display_textures(&kms, &server) != 0) {
 		fprintf(stderr, "Failed to initialise display textures\n");
@@ -1416,6 +1534,7 @@ int main(int argc, char **argv)
 	kms_destroy(&kms);
 	server_runtime_destroy(&server);
 	link_services_stop(&link_state);
+	link_services_stop(&eth_link_state);
 	usb_gadget_teardown(&gadget_state);
 	breezy_imu_destroy();
 	dp_destroy();

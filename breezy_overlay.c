@@ -21,9 +21,11 @@
  * ---------------------------------------------------------------- */
 
 /*
- * Synchronously probe host connectivity with ping (ICMP echo).
+ * Synchronously probe OTG host connectivity with ping (ICMP echo).
  * Runs at most once per poll cycle (~1 s) so the blocking wait is fine:
  * ping returns immediately on a reply, or after the -W timeout otherwise.
+ * Carrier/operstate are not reliable on USB gadget interfaces, so we always
+ * ping rather than relying on link state.
  *
  *   ping -q -c 1 -W 1 -I <iface> <host_ip>
  *
@@ -55,6 +57,30 @@ static bool arping_probe(struct breezy_overlay *ov)
 	waitpid(pid, &status, 0);
 	ov->arping_result = WIFEXITED(status) && WEXITSTATUS(status) == 0;
 	return ov->arping_result;
+}
+
+/*
+ * Probe wired Ethernet host presence via carrier state.
+ * Unlike USB gadget interfaces, real Ethernet carrier is reliable: if the
+ * link is up the host NIC is running on the other end of the cable.
+ * No blocking — reads a single byte from sysfs.
+ */
+static bool eth_carrier_probe(const struct breezy_overlay *ov)
+{
+	char path[128];
+	FILE *f;
+	int val = 0;
+
+	if (ov->eth_iface[0] == '\0')
+		return false;
+
+	snprintf(path, sizeof(path), "/sys/class/net/%s/carrier", ov->eth_iface);
+	f = fopen(path, "r");
+	if (!f)
+		return false;
+	fscanf(f, "%d", &val);
+	fclose(f);
+	return val == 1;
 }
 
 static bool detect_wlan_ip(const char *exclude_iface, char *out, size_t cap)
@@ -126,78 +152,89 @@ static void rebuild_text(struct breezy_overlay *ov)
 {
 	char msg[OT_MAX_TEXT];
 
+	/*
+	 * Pick which IP to advertise based on which direct-link path is active.
+	 * Priority: wired Ethernet > OTG > wlan (falling back when unavailable).
+	 * The mDNS name (breezy.local) is the same for both wired paths; it
+	 * resolves to the correct IP on whichever interface the host queries from.
+	 */
+	const char *active_mdns;
+	const char *active_ip;
+	if (ov->eth_connected && ov->eth_link_ip[0]) {
+		active_mdns = ov->link_mdns[0] ? ov->link_mdns : ov->wlan_mdns;
+		active_ip   = ov->eth_link_ip;
+	} else if (ov->otg_connected && ov->link_ip[0]) {
+		active_mdns = ov->link_mdns[0] ? ov->link_mdns : ov->wlan_mdns;
+		active_ip   = ov->link_ip;
+	} else {
+		/* Wifi, or imports-only where the specific path is unknown. */
+		active_mdns = ov->wlan_mdns[0] ? ov->wlan_mdns : ov->link_mdns;
+		active_ip   = ov->wlan_ip;
+	}
+
 	switch (ov->state) {
 	case BREEZY_OVERLAY_NO_GLASSES:
 		snprintf(msg, sizeof(msg),
 			 "Please connect a supported pair of XR glasses");
 		break;
 
-	case BREEZY_OVERLAY_NO_HOST:
+	case BREEZY_OVERLAY_NO_HOST: {
+		bool has_eth = ov->eth_iface[0] != '\0';
+		const char *port_msg = has_eth
+			? "Connect a host using the USB OTG or Ethernet port"
+			: "Connect to a host using the USB OTG port";
 		if (ov->wlan_mdns[0] && ov->wlan_ip[0]) {
 			snprintf(msg, sizeof(msg),
-				 "Connect to a host using the USB OTG port,\n"
-				 "or visit https://%s or https://%s to get started wirelessly",
-				 ov->wlan_mdns, ov->wlan_ip);
+				 "%s,\nor visit https://%s or https://%s wirelessly",
+				 port_msg, ov->wlan_mdns, ov->wlan_ip);
 		} else if (ov->wlan_mdns[0]) {
 			snprintf(msg, sizeof(msg),
-				 "Connect to a host using the USB OTG port,\n"
-				 "or visit https://%s to get started wirelessly",
-				 ov->wlan_mdns);
+				 "%s,\nor visit https://%s wirelessly",
+				 port_msg, ov->wlan_mdns);
 		} else {
-			snprintf(msg, sizeof(msg),
-				 "Connect to a host using the USB OTG port");
+			snprintf(msg, sizeof(msg), "%s", port_msg);
 		}
 		break;
+	}
 
-	case BREEZY_OVERLAY_NO_CLIENTS: {
-		const char *mdns = ov->link_mdns[0] ? ov->link_mdns
-						     : ov->wlan_mdns;
-		const char *ip   = ov->link_ip[0]   ? ov->link_ip
-						     : ov->wlan_ip;
-		if (mdns[0] && ip[0]) {
+	case BREEZY_OVERLAY_NO_CLIENTS:
+		if (active_mdns[0] && active_ip[0]) {
 			snprintf(msg, sizeof(msg),
 				 "No USB/IP clients connected.\n"
 				 "To get started, visit https://%s or https://%s",
-				 mdns, ip);
-		} else if (mdns[0]) {
+				 active_mdns, active_ip);
+		} else if (active_mdns[0]) {
 			snprintf(msg, sizeof(msg),
 				 "No USB/IP clients connected.\n"
-				 "To get started, visit https://%s", mdns);
-		} else if (ip[0]) {
+				 "To get started, visit https://%s", active_mdns);
+		} else if (active_ip[0]) {
 			snprintf(msg, sizeof(msg),
 				 "No USB/IP clients connected.\n"
-				 "To get started, visit https://%s", ip);
+				 "To get started, visit https://%s", active_ip);
 		} else {
 			snprintf(msg, sizeof(msg),
 				 "No USB/IP clients connected.");
 		}
 		break;
-	}
 
-	case BREEZY_OVERLAY_NORMAL: {
-		/* Prefer the eth/OTG path when the host is on it. */
-		const char *mdns = (ov->host_connected && ov->link_mdns[0])
-				       ? ov->link_mdns : ov->wlan_mdns;
-		const char *ip   = (ov->host_connected && ov->link_ip[0])
-				       ? ov->link_ip   : ov->wlan_ip;
-		if (mdns[0] && ip[0]) {
+	case BREEZY_OVERLAY_NORMAL:
+		if (active_mdns[0] && active_ip[0]) {
 			snprintf(msg, sizeof(msg),
 				 "To configure your experience, visit\n"
 				 "https://%s or https://%s",
-				 mdns, ip);
-		} else if (mdns[0]) {
+				 active_mdns, active_ip);
+		} else if (active_mdns[0]) {
 			snprintf(msg, sizeof(msg),
 				 "To configure your experience, visit https://%s",
-				 mdns);
-		} else if (ip[0]) {
+				 active_mdns);
+		} else if (active_ip[0]) {
 			snprintf(msg, sizeof(msg),
 				 "To configure your experience, visit https://%s",
-				 ip);
+				 active_ip);
 		} else {
 			msg[0] = '\0';
 		}
 		break;
-	}
 	}
 
 	overlay_text_update(&ov->tex, msg);
@@ -249,6 +286,26 @@ void breezy_overlay_set_addresses(struct breezy_overlay *ov,
 		       ov->wlan_ip, sizeof(ov->wlan_ip));
 }
 
+void breezy_overlay_set_eth_link(struct breezy_overlay *ov,
+				  const char *eth_iface,
+				  const char *eth_link_ip,
+				  const char *eth_host_ip)
+{
+	if (!ov)
+		return;
+
+	ov->eth_iface[0]   = '\0';
+	ov->eth_link_ip[0] = '\0';
+	ov->eth_host_ip[0] = '\0';
+
+	if (eth_iface && eth_iface[0])
+		snprintf(ov->eth_iface, sizeof(ov->eth_iface), "%s", eth_iface);
+	if (eth_link_ip && eth_link_ip[0])
+		snprintf(ov->eth_link_ip, sizeof(ov->eth_link_ip), "%s", eth_link_ip);
+	if (eth_host_ip && eth_host_ip[0])
+		snprintf(ov->eth_host_ip, sizeof(ov->eth_host_ip), "%s", eth_host_ip);
+}
+
 void breezy_overlay_update(struct breezy_overlay *ov,
 			    bool glasses_active,
 			    size_t imported_count,
@@ -270,13 +327,28 @@ void breezy_overlay_update(struct breezy_overlay *ov,
 		ov->wlan_ip[0] = '\0';
 	}
 
-	/* If USB/IP sessions are already imported the host is reachable (possibly
-	 * over Wi-Fi), so skip the OTG arping probe that would otherwise block
-	 * wireless-only connections from advancing past NO_HOST. */
-	bool host_connected = (imported_count > 0u) || arping_probe(ov);
+	/*
+	 * Probe each direct-link path independently so the overlay can show the
+	 * correct IP for whichever one the host is on.
+	 *
+	 * OTG: ping the DHCP-assigned host IP.  When USB/IP clients are already
+	 *   imported we skip the probe and use the cached result — the 1 s ping
+	 *   timeout is unnecessary when we already know the host is reachable.
+	 *
+	 * Wired Ethernet: check carrier state only (sysfs read, non-blocking).
+	 *   Real Ethernet carrier is reliable: carrier up means a host NIC is
+	 *   running on the other end of the cable.
+	 */
+	bool otg_connected = (imported_count > 0u) ? ov->arping_result
+	                                            : arping_probe(ov);
+	bool eth_connected = eth_carrier_probe(ov);
+	bool host_connected = otg_connected || eth_connected || (imported_count > 0u);
+
 	if (verbose)
-		printf("breezy_overlay: iface=%s host_ip=%s arping=%d glasses=%d imported=%zu state=%d\n",
-		       ov->otg_iface, ov->host_ip, (int)host_connected,
+		printf("breezy_overlay: otg_iface=%s host_ip=%s otg=%d "
+		       "eth_iface=%s eth=%d glasses=%d imported=%zu state=%d\n",
+		       ov->otg_iface, ov->host_ip, (int)otg_connected,
+		       ov->eth_iface, (int)eth_connected,
 		       (int)glasses_active, imported_count, (int)ov->state);
 
 	enum breezy_overlay_state next;
@@ -290,10 +362,14 @@ void breezy_overlay_update(struct breezy_overlay *ov,
 		next = BREEZY_OVERLAY_NORMAL;
 
 	bool changed = (next != ov->state) ||
-		       (host_connected != ov->host_connected);
+		       (host_connected != ov->host_connected) ||
+		       (otg_connected  != ov->otg_connected)  ||
+		       (eth_connected  != ov->eth_connected);
 
 	ov->state          = next;
 	ov->host_connected = host_connected;
+	ov->otg_connected  = otg_connected;
+	ov->eth_connected  = eth_connected;
 
 	if (changed || !ov->tex.initialized)
 		rebuild_text(ov);
