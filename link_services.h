@@ -39,11 +39,6 @@
 
 struct link_services_config {
     char iface[LS_IFACE_MAX];      /* link to serve, e.g. "usb0" */
-    char assign_cidr[LS_IP_MAX];   /* if non-empty, assign this CIDR to iface before
-                                      starting services, e.g. "192.168.8.2/30".  Leave
-                                      empty when the address is already configured
-                                      externally (e.g. the OTG gadget is set up by
-                                      usb_gadget_setup()). */
     char host_ip[LS_IP_MAX];       /* IPv4 handed to the host via DHCP, e.g. "192.168.7.1";
                                       empty = skip DHCP (host configures its own address) */
     char lease_time[LS_LEASE_MAX]; /* dnsmasq lease time, e.g. "1h" */

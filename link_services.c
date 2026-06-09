@@ -421,21 +421,6 @@ int link_services_start(const struct link_services_config *cfg,
         snprintf(state->mdns_wlan_pidfile, sizeof(state->mdns_wlan_pidfile), "%s", mdns_wlan_pid);
     }
 
-    /*
-     * Assign a static IP to the interface when requested.  This is needed for
-     * plain Ethernet links whose address isn't configured by an external
-     * mechanism (unlike the OTG gadget, whose IP is set by usb_gadget_setup()).
-     * We bring the link up first in case it's administratively down, then add
-     * the CIDR address.  Both operations are idempotent.
-     */
-    if (cfg->assign_cidr[0] != '\0') {
-        { const char *const a[] = {"ip", "link", "set", cfg->iface, "up", NULL};
-          run_cmd(a); }
-        { const char *const a[] = {"ip", "addr", "add", cfg->assign_cidr,
-                                   "dev", cfg->iface, NULL};
-          run_cmd(a); }
-    }
-
     if (cfg->host_ip[0] != '\0') {
         if (start_dhcp(cfg, dnsmasq_pid, dnsmasq_leases) == 0) {
             if (state)
