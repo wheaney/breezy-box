@@ -1471,11 +1471,12 @@ int main(int argc, char **argv)
 			if (slash)
 				*slash = '\0';
 		}
-		/* Publish breezy.local on this interface too; same name as OTG.
-		 * mDNS is link-local so each host sees only its own segment's record. */
-		if (link_cfg_valid && link_cfg.link_name[0])
-			snprintf(eth_link_cfg.link_name, sizeof(eth_link_cfg.link_name),
-				 "%s", link_cfg.link_name);
+		/* Publish breezy.local on this interface.  Use the OTG name when
+		 * available so both paths share the same friendly name; fall back
+		 * to the hardcoded default so mDNS works even without the gadget. */
+		snprintf(eth_link_cfg.link_name, sizeof(eth_link_cfg.link_name),
+			 "%s", (link_cfg_valid && link_cfg.link_name[0])
+				 ? link_cfg.link_name : "breezy");
 
 		link_services_start(&eth_link_cfg, &eth_link_state);
 		eth_link_cfg_valid = true;
