@@ -259,13 +259,12 @@ static void kill_pidfile(const char *path)
 void link_services_config_defaults(struct link_services_config *cfg)
 {
     memset(cfg, 0, sizeof(*cfg));
-    snprintf(cfg->iface,      sizeof(cfg->iface),      "usb0");
-    snprintf(cfg->host_ip,    sizeof(cfg->host_ip),    "192.168.7.1");
-    snprintf(cfg->lease_time, sizeof(cfg->lease_time), "1h");
-    snprintf(cfg->link_ip,    sizeof(cfg->link_ip),    "192.168.7.2");
-    snprintf(cfg->link_name,  sizeof(cfg->link_name),  "breezy");
-    snprintf(cfg->wlan_name,  sizeof(cfg->wlan_name),  "breezywlan");
-    cfg->mtu = 0u;
+    snprintf(cfg->iface,     sizeof(cfg->iface),     "usb0");
+    snprintf(cfg->link_ip,   sizeof(cfg->link_ip),   "192.168.7.2");
+    snprintf(cfg->link_name, sizeof(cfg->link_name), "breezy");
+    snprintf(cfg->wlan_name, sizeof(cfg->wlan_name), "breezywlan");
+    /* host_ip intentionally empty: networkd's DHCPServer (usb0.network) serves
+     * the host address, so we don't need to spawn a dnsmasq instance here. */
 }
 
 /*
@@ -348,10 +347,12 @@ static int start_mdns(const struct link_services_config *cfg,
                       const char *link_pidfile, const char *wlan_pidfile,
                       struct link_services_state *state)
 {
-    /* Best-effort: make sure the responder is running (no-op if already up). */
+    /* Best-effort: start the system avahi-daemon if it isn't running.
+     * Fails silently when run as an unprivileged user — avahi-publish-address
+     * will still work as long as the daemon was already started at boot
+     * (which setup_system.sh ensures via "systemctl enable avahi-daemon"). */
     { const char *const a[] = {"systemctl", "start", "avahi-daemon", NULL};
-      if (run_cmd(a) != 0)
-          return -1; }
+      run_cmd(a); }
 
     if (cfg->wlan_name[0] != '\0') {
         char fqdn[LS_NAME_MAX + 8];

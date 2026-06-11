@@ -10,3 +10,11 @@ Name=usb0
 
 [Network]
 Address=192.168.7.2/30
+DHCPServer=yes
+
+[DHCPServer]
+PoolOffset=1
+PoolSize=1
+EmitDNS=no
+EmitNTP=no
+EmitRouter=no

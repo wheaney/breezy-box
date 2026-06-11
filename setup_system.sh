@@ -110,6 +110,19 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+section "avahi-daemon (mDNS responder)"
+
+# avahi-publish-address is called by the breezy app as an unprivileged user;
+# it communicates with the system avahi-daemon over D-Bus, so the daemon must
+# be running before the app starts.
+if systemctl is-enabled --quiet avahi-daemon 2>/dev/null; then
+    skip_msg "avahi-daemon already enabled"
+else
+    systemctl enable --now avahi-daemon 2>/dev/null && done_msg "enabled and started avahi-daemon" \
+        || echo "  warn: could not enable avahi-daemon — install 'avahi-daemon' and 'avahi-utils'"
+fi
+
+# ---------------------------------------------------------------------------
 section "systemd-networkd profile for direct Ethernet link"
 
 # Detect the first physical wired Ethernet interface that is not the OTG
