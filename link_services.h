@@ -39,6 +39,9 @@
 
 struct link_services_config {
     char iface[LS_IFACE_MAX];      /* link to serve, e.g. "usb0" */
+    char ip_cidr[LS_IP_MAX];       /* if non-empty, assign this address+prefix to iface
+                                      via "ip addr add" before starting DHCP, e.g. "192.168.8.2/30";
+                                      empty = interface already has its IP (e.g. RNDIS gadget) */
     char host_ip[LS_IP_MAX];       /* IPv4 handed to the host via DHCP, e.g. "192.168.7.1";
                                       empty = skip DHCP (host configures its own address) */
     char lease_time[LS_LEASE_MAX]; /* dnsmasq lease time, e.g. "1h" */
