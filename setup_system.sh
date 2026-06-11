@@ -148,6 +148,7 @@ Name=${ETH_IFACE}
 
 [Network]
 Address=192.168.8.2/30
+DHCPServer=yes
 
 [DHCPServer]
 PoolOffset=1
