@@ -2,6 +2,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <sys/types.h>
 
 /*
  * breezy_ui — launch and track the breezydesktop UI process tied to the

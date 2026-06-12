@@ -30,7 +30,8 @@ JSON_C_CFLAGS ?= $(shell $(PKG_CONFIG) --cflags json-c)
 JSON_C_LIBS ?= $(shell $(PKG_CONFIG) --libs json-c)
 GIO_CFLAGS ?= $(shell $(PKG_CONFIG) --cflags gio-2.0)
 GIO_LIBS ?= $(shell $(PKG_CONFIG) --libs gio-2.0)
-JS_BUNDLE := display_placement_bundle.h
+SRC_DIR := src
+JS_BUNDLE := $(SRC_DIR)/display_placement_bundle.h
 JS_SHARED_DIR := shared
 QUICKJS_DIR := modules/quickjs
 QUICKJS_VERSION := $(shell cat $(QUICKJS_DIR)/VERSION 2>/dev/null || echo unknown)
@@ -44,9 +45,9 @@ KMS_RENDERER_TARGET_BASE := displaylink_kms_renderer
 KMS_RENDERER_PROFILE_TARGET := $(KMS_RENDERER_TARGET_BASE)-profile
 KMS_RENDERER_TARGET := $(KMS_RENDERER_TARGET_BASE)$(PROFILE_SUFFIX)
 COMPAT_SOURCES := $(COMPAT_DIR)/src/udl_sink.c
-KMS_COMPOSITOR_SOURCES := displaylink_kms_renderer.c display_renderer.c overlay_text.c breezy_overlay.c usbip.c udl_device.c udl_runtime.c server.c display_placement.c breezy_imu.c breezy_settings.c usb_gadget.c link_services.c breezy_ui.c $(COMPAT_SOURCES)
+KMS_COMPOSITOR_SOURCES := $(addprefix $(SRC_DIR)/,displaylink_kms_renderer.c display_renderer.c overlay_text.c breezy_overlay.c usbip.c udl_device.c udl_runtime.c server.c display_placement.c breezy_imu.c breezy_settings.c usb_gadget.c link_services.c breezy_ui.c) $(COMPAT_SOURCES)
 
-CPPFLAGS += -I$(COMPAT_DIR)/include -I$(ZEROKVM_BRIDGE_INCLUDEDIR)
+CPPFLAGS += -I$(COMPAT_DIR)/include -I$(ZEROKVM_BRIDGE_INCLUDEDIR) -I$(SRC_DIR)
 LDFLAGS += -L$(ZEROKVM_BRIDGE_LIBDIR) -Wl,-rpath,$(ZEROKVM_BRIDGE_LIBDIR)
 LDLIBS += -l:ZeroKvm.NativeBridge.so
 
@@ -71,13 +72,13 @@ $(QUICKJS_OBJDIR):
 	mkdir -p $@
 
 $(KMS_RENDERER_TARGET): $(KMS_COMPOSITOR_SOURCES) $(ZEROKVM_LIB) $(JS_BUNDLE) $(QUICKJS_OBJS)
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(PROFILE_CFLAGS) $(DRM_CFLAGS) $(JSON_C_CFLAGS) $(GIO_CFLAGS) -I$(QUICKJS_DIR) -I. -pthread \
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(PROFILE_CFLAGS) $(DRM_CFLAGS) $(JSON_C_CFLAGS) $(GIO_CFLAGS) -I$(QUICKJS_DIR) -pthread \
 		-o $@ $(KMS_COMPOSITOR_SOURCES) $(QUICKJS_OBJS) \
 		$(DRM_LIBS) $(GBM_LIBS) $(EGL_LIBS) $(GLES2_LIBS) $(JSON_C_LIBS) $(GIO_LIBS) -lm $(LDFLAGS) $(LDLIBS)
 
 $(JS_BUNDLE): $(JS_SHARED_DIR)/math.js $(JS_SHARED_DIR)/displayPlacement.js $(JS_SHARED_DIR)/smoothFollow.js tools/gen_js_bundle.py
-	$(PYTHON3) tools/gen_js_bundle.py $(JS_SHARED_DIR)/math.js $(JS_SHARED_DIR)/displayPlacement.js $(JS_SHARED_DIR)/smoothFollow.js > $@.tmp
-	@if cmp -s $@.tmp $@ 2>/dev/null; then rm -f $@.tmp; else mv $@.tmp $@; fi
+	$(PYTHON3) tools/gen_js_bundle.py $(JS_SHARED_DIR)/math.js $(JS_SHARED_DIR)/displayPlacement.js $(JS_SHARED_DIR)/smoothFollow.js > $(SRC_DIR)/display_placement_bundle.h.tmp
+	@if cmp -s $(SRC_DIR)/display_placement_bundle.h.tmp $@ 2>/dev/null; then rm -f $(SRC_DIR)/display_placement_bundle.h.tmp; else mv $(SRC_DIR)/display_placement_bundle.h.tmp $@; fi
 
 clean:
 	rm -f $(KMS_RENDERER_TARGET_BASE) $(KMS_RENDERER_PROFILE_TARGET) $(JS_BUNDLE)
