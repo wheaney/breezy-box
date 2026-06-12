@@ -37,6 +37,7 @@
 #include "breezy_overlay.h"
 #include "breezy_settings.h"
 #include "common.h"
+#include "breezy_ui.h"
 #include "display_renderer.h"
 #include "server.h"
 #include "display_placement.h"
@@ -1378,6 +1379,8 @@ int main(int argc, char **argv)
 	struct kms_state kms;
 	struct usb_gadget_config gadget_cfg;
 	struct usb_gadget_state gadget_state;
+	struct breezy_ui_config ui_cfg;
+	struct breezy_ui_state ui_state;
 	struct link_services_state link_state;
 	struct link_services_config link_cfg;
 	bool link_cfg_valid = false;
@@ -1395,6 +1398,7 @@ int main(int argc, char **argv)
 	memset(&kms, 0, sizeof(kms));
 	kms.drm_fd = -1;
 	memset(&gadget_state, 0, sizeof(gadget_state));
+	memset(&ui_state, 0, sizeof(ui_state));
 	memset(&link_state, 0, sizeof(link_state));
 	memset(&eth_link_state, 0, sizeof(eth_link_state));
 
@@ -1519,7 +1523,11 @@ int main(int argc, char **argv)
 	printf("DisplayLink KMS compositor running with %zu display slot(s)\n",
 	       kms.display_count);
 
+	breezy_ui_config_defaults(&ui_cfg);
+	breezy_ui_start(&ui_cfg, &ui_state);
+
 	(void)kms_run(&kms, &server);
+	breezy_ui_reap(&ui_state);
 
 	exit_code = EXIT_SUCCESS;
 
@@ -1532,6 +1540,7 @@ int main(int argc, char **argv)
 	}
 	kms_destroy(&kms);
 	server_runtime_destroy(&server);
+	breezy_ui_stop(&ui_state);
 	link_services_stop(&link_state);
 	link_services_stop(&eth_link_state);
 	usb_gadget_teardown(&gadget_state);
