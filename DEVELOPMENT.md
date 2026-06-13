@@ -84,7 +84,7 @@ No VT restriction — run from any terminal:
 ```sh
 systemctl --user stop breezy-web
 
-# Port 80 needs CAP_NET_BIND_SERVICE; during dev it's easier to run on 8081:
+# Runs on 8081 (port 80 -> 8081 redirect is handled by nftables/iptables via setup_system.sh):
 ./breezy_web --port 8081 --web-root web/
 ```
 
@@ -138,9 +138,7 @@ with `fuser /dev/dri/card0` and kill the offending process.
 Xvfb isn't up yet.  Add a short delay or wait for `breezy-xvfb` to report
 active: `systemctl --user is-active breezy-xvfb`.
 
-**Port 80 refused (manual run)**
-CAP_NET_BIND_SERVICE isn't set on the binary during dev.  Use `--port 8081`
-for local testing, or grant the cap explicitly:
-```sh
-sudo setcap 'cap_net_bind_service+ep' ./breezy_web
-```
+**Web UI not reachable on port 80**
+`breezy-web` runs on 8081; port 80 is redirected to it by an nftables/iptables
+rule installed by `setup_system.sh`.  If the redirect isn't active, re-run
+`sudo ./setup_system.sh` or access directly on port 8081.

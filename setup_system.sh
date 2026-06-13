@@ -277,6 +277,51 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+section "Port 80 -> 8081 redirect (breezy-web)"
+
+# breezy-web runs unprivileged on 8081; redirect incoming :80 to it via nftables.
+# We persist the rule in /etc/nftables.conf if nftables is available, otherwise
+# fall back to iptables-legacy via a systemd oneshot unit.
+NFT_RULE_MARKER="# breezy-box: redirect port 80 to 8081"
+if command -v nft &>/dev/null; then
+    NFT_CONF="/etc/nftables.conf"
+    if grep -qF "$NFT_RULE_MARKER" "$NFT_CONF" 2>/dev/null; then
+        skip_msg "nftables redirect rule already in $NFT_CONF"
+    else
+        # Append a nat table with the prerouting redirect.
+        cat >> "$NFT_CONF" <<EOF
+
+$NFT_RULE_MARKER
+table ip nat {
+    chain prerouting {
+        type nat hook prerouting priority dstnat;
+        tcp dport 80 redirect to :8081
+    }
+}
+EOF
+        done_msg "added port 80 -> 8081 redirect to $NFT_CONF"
+        # Apply immediately.
+        nft -f "$NFT_CONF" 2>/dev/null && done_msg "applied nftables rules" \
+            || echo "  warn: nft -f failed — rules will apply on next boot"
+    fi
+elif command -v iptables &>/dev/null; then
+    if iptables -t nat -C PREROUTING -p tcp --dport 80 -j REDIRECT --to-port 8081 &>/dev/null; then
+        skip_msg "iptables redirect rule already active"
+    else
+        iptables -t nat -A PREROUTING -p tcp --dport 80 -j REDIRECT --to-port 8081
+        done_msg "added iptables port 80 -> 8081 redirect"
+        # Persist via iptables-persistent if available.
+        if command -v netfilter-persistent &>/dev/null; then
+            netfilter-persistent save 2>/dev/null && done_msg "saved iptables rules" || true
+        else
+            echo "  warn: install 'iptables-persistent' to persist this rule across reboots"
+        fi
+    fi
+else
+    echo "  warn: neither nft nor iptables found — install nftables and re-run"
+fi
+
+# ---------------------------------------------------------------------------
 echo
 echo "System setup complete."
 echo
