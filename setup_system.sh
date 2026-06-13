@@ -197,16 +197,17 @@ section "Getty autologin for $APP_USER on tty1"
 
 GETTY_DROPIN_DST="/etc/systemd/system/getty@tty1.service.d/autologin.conf"
 GETTY_DROPIN_SRC="$SCRIPT_DIR/systemd/system/getty@tty1.service.d/autologin.conf"
+GETTY_DROPIN_WANT="$(sed "s/breezy/$APP_USER/g" "$GETTY_DROPIN_SRC")"
+GETTY_DROPIN_CURRENT="$(cat "$GETTY_DROPIN_DST" 2>/dev/null || true)"
 
-if [[ -f "$GETTY_DROPIN_DST" ]]; then
-    skip_msg "$GETTY_DROPIN_DST already exists"
-else
+if [[ "$GETTY_DROPIN_CURRENT" != "$GETTY_DROPIN_WANT" ]]; then
     mkdir -p "$(dirname "$GETTY_DROPIN_DST")"
-    # Substitute the placeholder username with the actual APP_USER.
-    sed "s/breezy/$APP_USER/g" "$GETTY_DROPIN_SRC" > "$GETTY_DROPIN_DST"
+    echo "$GETTY_DROPIN_WANT" > "$GETTY_DROPIN_DST"
     chmod 0644 "$GETTY_DROPIN_DST"
     systemctl daemon-reload
     done_msg "installed $GETTY_DROPIN_DST (autologin as $APP_USER)"
+else
+    skip_msg "$GETTY_DROPIN_DST already up to date"
 fi
 
 # ---------------------------------------------------------------------------
@@ -214,6 +215,7 @@ section "Breezy user systemd units"
 
 USER_UNIT_SRC="$SCRIPT_DIR/systemd/user"
 USER_UNIT_DST="/etc/systemd/user"
+UNITS_CHANGED=0
 
 for unit in breezy.target breezy-renderer.service breezy-xvfb.service \
             breezy-desktop.service breezy-x11vnc.service \
@@ -224,23 +226,30 @@ for unit in breezy.target breezy-renderer.service breezy-xvfb.service \
         echo "  warn: $src not found, skipping"
         continue
     fi
-    CURRENT="$(cat "$dst" 2>/dev/null || true)"
-    NEW="$(cat "$src")"
-    if [[ "$CURRENT" != "$NEW" ]]; then
+    if ! cmp -s "$src" "$dst" 2>/dev/null; then
         install -m 0644 "$src" "$dst"
         done_msg "installed $dst"
+        UNITS_CHANGED=1
     else
         skip_msg "$dst already up to date"
     fi
 done
 
 systemctl daemon-reload
-# Enable the target for the app user so it starts with their session.
+
+# Enable and (re-)start breezy.target for the app user.
 if id "$APP_USER" &>/dev/null; then
-    su -l "$APP_USER" -s /bin/bash -c \
-        "XDG_RUNTIME_DIR=/run/user/\$(id -u) systemctl --user enable breezy.target" \
+    USER_CMD="XDG_RUNTIME_DIR=/run/user/\$(id -u) systemctl --user"
+    # Always re-enable so the WantedBy symlink reflects the current unit file.
+    su -l "$APP_USER" -s /bin/bash -c "$USER_CMD enable breezy.target" \
         2>/dev/null && done_msg "enabled breezy.target for $APP_USER" \
-        || echo "  warn: could not enable breezy.target as $APP_USER (session may not be active yet)"
+        || echo "  warn: could not enable breezy.target as $APP_USER"
+    # Restart changed units if the session is already running.
+    if [[ "$UNITS_CHANGED" -eq 1 ]]; then
+        su -l "$APP_USER" -s /bin/bash -c \
+            "$USER_CMD is-active --quiet breezy.target && $USER_CMD restart breezy.target" \
+            2>/dev/null && done_msg "restarted breezy.target (units changed)" || true
+    fi
 else
     echo "  warn: user $APP_USER not found; enable breezy.target manually after creating the user"
 fi
@@ -253,8 +262,11 @@ echo "Next steps if not done yet:"
 echo "  1. Create the app user:  useradd -m -s /bin/bash -c 'Breezy Box' $APP_USER"
 echo "     Add to groups:        usermod -aG video,render,input $APP_USER"
 echo "  2. Enable linger:        loginctl enable-linger $APP_USER"
-echo "  3. Reboot — getty autologin will start the user session and breezy.target."
-echo "  4. Rebuild with setcap for gadget configfs access until a dedicated"
+echo "  3. Fetch vendored deps and build:"
+echo "     cd /home/$APP_USER/breezy-box && make deps && make"
+echo "     cp displaylink_kms_renderer breezy_web ~/.local/bin/"
+echo "  4. Reboot — getty autologin will start the user session and breezy.target."
+echo "  5. Rebuild with setcap for gadget configfs access until a dedicated"
 echo "     setup service is in place:"
 echo "     sudo setcap 'cap_sys_admin,cap_net_admin,cap_sys_module+ep' \\"
-echo "         /home/$APP_USER/breezy-box/displaylink_kms_renderer"
+echo "         /home/$APP_USER/.local/bin/displaylink_kms_renderer"
