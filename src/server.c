@@ -19,11 +19,12 @@ void usage(const char *argv0)
 {
 	fprintf(stderr,
 		"Usage: %s [options]\n"
-		"  --config PATH           Persistent JSON config file (default: %s)\n"
+		"  --config PATH           Persistent JSON config file\n"
+		"                          (default: $XDG_CONFIG_HOME/%s)\n"
 		"  --verbose               Force verbose logging for all configured devices\n"
 		"  --help                  Show this message\n",
 		argv0,
-		DEFAULT_CONFIG_PATH);
+		DEFAULT_CONFIG_RELPATH);
 }
 
 int parse_hex16(const char *text, uint16_t *value)
@@ -101,14 +102,30 @@ int parse_runtime_cli_args(int argc, char **argv, struct runtime_cli_args *args)
 
 	if (!args)
 		return -1;
-	args->config_path = DEFAULT_CONFIG_PATH;
 	args->force_verbose = false;
+
+	/* Resolve default config path: $XDG_CONFIG_HOME/breezy-box/config.json
+	 * falling back to $HOME/.config/breezy-box/config.json. */
+	{
+		const char *xdg = getenv("XDG_CONFIG_HOME");
+		const char *home = getenv("HOME");
+		if (xdg && xdg[0])
+			snprintf(args->config_path, sizeof(args->config_path),
+				 "%s/%s", xdg, DEFAULT_CONFIG_RELPATH);
+		else if (home && home[0])
+			snprintf(args->config_path, sizeof(args->config_path),
+				 "%s/.config/%s", home, DEFAULT_CONFIG_RELPATH);
+		else
+			snprintf(args->config_path, sizeof(args->config_path),
+				 "%s", DEFAULT_CONFIG_RELPATH);
+	}
 
 	optind = 1;
 	while ((opt = getopt_long(argc, argv, "c:Vh", long_options, NULL)) != -1) {
 		switch (opt) {
 		case 'c':
-			args->config_path = optarg;
+			snprintf(args->config_path, sizeof(args->config_path),
+				 "%s", optarg);
 			break;
 		case 'V':
 			args->force_verbose = true;
@@ -371,6 +388,16 @@ int load_server_options_from_config(const char *config_path,
 
 	root = json_object_from_file(config_path);
 	if (!root) {
+		/* File absent → use a single default 1920x1080@60 display. */
+		if (access(config_path, F_OK) != 0) {
+			fprintf(stderr, "config %s not found, using default (1x 1080p@30)\n",
+				config_path);
+			configured_device_default(&opts->devices[0], 0u);
+			opts->device_count = 1u;
+			if (cli && cli->force_verbose)
+				opts->verbose = true;
+			return 0;
+		}
 		fprintf(stderr, "failed to parse config %s: %s\n",
 			config_path, json_util_get_last_err());
 		return -1;

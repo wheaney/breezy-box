@@ -4,6 +4,7 @@
 #include "udl_device.h"
 #include "udl_runtime.h"
 
+#include <limits.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdatomic.h>
@@ -11,14 +12,14 @@
 
 /* Default server configuration values */
 #define DEFAULT_LISTEN_HOST          "0.0.0.0"
-#define DEFAULT_CONFIG_PATH          "/etc/breezy-box/displaylink_usbip_multi.json"
+#define DEFAULT_CONFIG_RELPATH       "breezy-box/config.json"
 #define DEFAULT_BUSID                "breezy-box-0"
 #define DEFAULT_DEVICE_PATH          "/devices/platform/breezy-box/displaylink0"
 #define DEFAULT_MANUFACTURER_STRING  "DisplayLink"
 #define DEFAULT_PRODUCT_STRING       "DisplayLink Adapter"
 #define DEFAULT_SERIAL_STRING        "DEADBEEF0001"
 #define DEFAULT_MONITOR_NAME         "Breezy Box"
-#define DEFAULT_REFRESH_HZ           60u
+#define DEFAULT_REFRESH_HZ           30u
 #define DEFAULT_STRICT_NATIVE_MODE   true
 #define DEFAULT_ALLOW_30HZ_FALLBACK  false
 #define DEFAULT_DISPLAY_WIDTH        1920u
@@ -83,7 +84,7 @@ struct connection_context {
 
 /* CLI arguments parsed before loading the full config */
 struct runtime_cli_args {
-	const char *config_path;
+	char config_path[PATH_MAX];
 	bool force_verbose;
 };
 
