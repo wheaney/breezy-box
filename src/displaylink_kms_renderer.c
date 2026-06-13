@@ -34,7 +34,8 @@
 #include <GLES2/gl2ext.h>
 
 #include "breezy_imu.h"
-#include "breezy_overlay.h"
+#include "breezy_state.h"
+#include "overlay_text.h"
 #include "breezy_settings.h"
 #include "common.h"
 #include "display_renderer.h"
@@ -133,8 +134,11 @@ struct kms_state {
 	struct display_mesh meshes[MAX_USBIP_DEVICES];
 	bool     meshes_computed;
 
-	/* Overlay: connection-status messages above the display group. */
-	struct breezy_overlay overlay;
+	/* Overlay: GL texture for connection-status messages; text from breezy_state. */
+	struct overlay_text overlay_tex;
+
+	/* Back-pointer to the long-lived app state (not owned by the renderer). */
+	struct breezy_state *state;
 };
 
 /* ----------------------------------------------------------------
@@ -278,9 +282,14 @@ static void kms_poll_device_config(struct kms_state *kms,
 			if (slot_active)
 				active_slots++;
 		}
-		breezy_overlay_update(&kms->overlay, xr_driver_up, active,
-				      active_slots, server->opts.device_count,
-				      server->opts.verbose);
+		bool changed = breezy_state_update(kms->state, xr_driver_up, active,
+						   active_slots, server->opts.device_count,
+						   server->opts.verbose);
+		if (changed || !kms->overlay_tex.initialized) {
+			char msg[BS_MSG_MAX];
+			breezy_state_format_message(kms->state, msg, sizeof msg);
+			overlay_text_update(&kms->overlay_tex, msg);
+		}
 	}
 
 	kms->device_active   = active;
@@ -706,15 +715,17 @@ static int kms_init_gbm_egl(struct kms_state *kms)
 }
 
 /* ----------------------------------------------------------------
- * KMS initialisation
+ * Renderer initialisation / teardown
+ *
+ * renderer_init/renderer_destroy cover only the render-cycle resources:
+ * DRM fd, GBM, EGL, GL programs, display textures, and the overlay GL
+ * texture.  The long-lived breezy_state (addresses, connectivity state)
+ * is unaffected and rides through reconnect cycles unchanged.
  * ---------------------------------------------------------------- */
 
-static int kms_init(struct kms_state *kms, const char *drm_device,
-                     const struct server_options *opts)
+static int renderer_init(struct kms_state *kms, const char *drm_device)
 {
-	(void)opts;
-	memset(kms, 0, sizeof(*kms));
-	kms->drm_fd = -1;
+	kms->drm_fd      = -1;
 	kms->egl_display = EGL_NO_DISPLAY;
 	kms->egl_context = EGL_NO_CONTEXT;
 	kms->egl_surface = EGL_NO_SURFACE;
@@ -727,6 +738,55 @@ static int kms_init(struct kms_state *kms, const char *drm_device,
 		return -1;
 
 	return 0;
+}
+
+static void renderer_destroy(struct kms_state *kms)
+{
+	size_t i;
+
+	if (!kms)
+		return;
+
+	for (i = 0u; i < MAX_USBIP_DEVICES; i++) {
+		struct kms_display_tex *disp = &kms->displays[i];
+
+		if (disp->gl_tex)
+			glDeleteTextures(1, &disp->gl_tex);
+		if (disp->egl_image && kms->eglDestroyImageKHR)
+			kms->eglDestroyImageKHR(kms->egl_display, disp->egl_image);
+		if (disp->bo)
+			gbm_bo_destroy(disp->bo);
+		if (disp->fallback_tex)
+			glDeleteTextures(1, &disp->fallback_tex);
+	}
+	memset(kms->displays, 0, sizeof(kms->displays));
+	kms->display_count = 0;
+
+	display_renderer_destroy(&kms->dr);
+	overlay_text_destroy(&kms->overlay_tex);
+
+	if (kms->egl_display != EGL_NO_DISPLAY) {
+		eglMakeCurrent(kms->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+		if (kms->egl_surface != EGL_NO_SURFACE)
+			eglDestroySurface(kms->egl_display, kms->egl_surface);
+		if (kms->egl_context != EGL_NO_CONTEXT)
+			eglDestroyContext(kms->egl_display, kms->egl_context);
+		eglTerminate(kms->egl_display);
+	}
+
+	if (kms->gbm_surface)
+		gbm_surface_destroy(kms->gbm_surface);
+	if (kms->gbm_dev)
+		gbm_device_destroy(kms->gbm_dev);
+	if (kms->drm_fd >= 0)
+		close(kms->drm_fd);
+
+	kms->drm_fd      = -1;
+	kms->egl_display = EGL_NO_DISPLAY;
+	kms->egl_context = EGL_NO_CONTEXT;
+	kms->egl_surface = EGL_NO_SURFACE;
+	kms->gbm_surface = NULL;
+	kms->gbm_dev     = NULL;
 }
 
 /* ----------------------------------------------------------------
@@ -934,10 +994,10 @@ static void kms_render_frame(struct kms_state *kms,
 	glClearColor(0.04f, 0.04f, 0.08f, 1.0f);
 	glClear(GL_COLOR_BUFFER_BIT);
 
-	enum breezy_overlay_state ovstate = kms->overlay.state;
+	enum breezy_state_mode ovstate = kms->state->mode;
 
 	/* ---- Overlay-only states (no display quads) ---- */
-	if (ovstate != BREEZY_OVERLAY_NORMAL) {
+	if (ovstate != BREEZY_STATE_NORMAL) {
 		/*
 		 * Centre a text quad in the viewport using a fixed FOV camera.
 		 * The quad is sized to the texture's native pixel dimensions so
@@ -951,13 +1011,13 @@ static void kms_render_frame(struct kms_state *kms,
 		es_display_model(&model, 0.0f, 0.0f, 0.0f, -arc_dist_px);
 		es_multiply(&mvp, &model, &proj);
 
-		if (kms->overlay.tex.tex) {
-			float w_half = (float)kms->overlay.tex.tex_w * 0.5f;
-			float h_half = (float)kms->overlay.tex.tex_h * 0.5f;
+		if (kms->overlay_tex.tex) {
+			float w_half = (float)kms->overlay_tex.tex_w * 0.5f;
+			float h_half = (float)kms->overlay_tex.tex_h * 0.5f;
 			glEnable(GL_BLEND);
 			glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 			display_renderer_draw_quad_alpha(&kms->dr, &mvp,
-							 kms->overlay.tex.tex,
+							 kms->overlay_tex.tex,
 							 w_half, h_half);
 			glDisable(GL_BLEND);
 		}
@@ -1082,9 +1142,9 @@ static void kms_render_frame(struct kms_state *kms,
 	}
 
 	/* ---- Overlay info strip above the display group ---- */
-	if (kms->overlay.tex.tex) {
-		float ot_w_half = (float)kms->overlay.tex.tex_w * 0.5f;
-		float ot_h_half = (float)kms->overlay.tex.tex_h * 0.5f;
+	if (kms->overlay_tex.tex) {
+		float ot_w_half = (float)kms->overlay_tex.tex_w * 0.5f;
+		float ot_h_half = (float)kms->overlay_tex.tex_h * 0.5f;
 		float gap_px    = ot_h_half;                       /* one text-height gap */
 		float ot_y      = top_y_px + gap_px + ot_h_half;
 
@@ -1099,7 +1159,7 @@ static void kms_render_frame(struct kms_state *kms,
 		glEnable(GL_BLEND);
 		glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 		display_renderer_draw_quad_alpha(&kms->dr, &mvp,
-						 kms->overlay.tex.tex,
+						 kms->overlay_tex.tex,
 						 ot_w_half, ot_h_half);
 		glDisable(GL_BLEND);
 	}
@@ -1139,8 +1199,11 @@ static int kms_run(struct kms_state *kms, struct server_runtime *server)
 	kms->meshes_computed          = false;
 	breezy_settings_init_defaults(&kms->settings);
 	/* Prime the overlay texture before the first frame. */
-	breezy_overlay_update(&kms->overlay, false, false, 0u, server->opts.device_count,
-			      server->opts.verbose);
+	{
+		char msg[BS_MSG_MAX];
+		breezy_state_format_message(kms->state, msg, sizeof msg);
+		overlay_text_update(&kms->overlay_tex, msg);
+	}
 	kms_update_display_textures(kms, server);
 	kms_render_frame(kms, server);
 	if (!eglSwapBuffers(kms->egl_display, kms->egl_surface)) {
@@ -1243,50 +1306,6 @@ static int kms_run(struct kms_state *kms, struct server_runtime *server)
 }
 
 /* ----------------------------------------------------------------
- * KMS state teardown
- * ---------------------------------------------------------------- */
-
-static void kms_destroy(struct kms_state *kms)
-{
-	size_t i;
-
-	if (!kms)
-		return;
-
-	for (i = 0u; i < MAX_USBIP_DEVICES; i++) {
-		struct kms_display_tex *disp = &kms->displays[i];
-
-		if (disp->gl_tex)
-			glDeleteTextures(1, &disp->gl_tex);
-		if (disp->egl_image && kms->eglDestroyImageKHR)
-			kms->eglDestroyImageKHR(kms->egl_display, disp->egl_image);
-		if (disp->bo)
-			gbm_bo_destroy(disp->bo);
-		if (disp->fallback_tex)
-			glDeleteTextures(1, &disp->fallback_tex);
-	}
-
-	display_renderer_destroy(&kms->dr);
-	breezy_overlay_destroy(&kms->overlay);
-
-	if (kms->egl_display != EGL_NO_DISPLAY) {
-		eglMakeCurrent(kms->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
-		if (kms->egl_surface != EGL_NO_SURFACE)
-			eglDestroySurface(kms->egl_display, kms->egl_surface);
-		if (kms->egl_context != EGL_NO_CONTEXT)
-			eglDestroyContext(kms->egl_display, kms->egl_context);
-		eglTerminate(kms->egl_display);
-	}
-
-	if (kms->gbm_surface)
-		gbm_surface_destroy(kms->gbm_surface);
-	if (kms->gbm_dev)
-		gbm_device_destroy(kms->gbm_dev);
-	if (kms->drm_fd >= 0)
-		close(kms->drm_fd);
-}
-
-/* ----------------------------------------------------------------
  * Background USB/IP server thread
  * ---------------------------------------------------------------- */
 
@@ -1377,6 +1396,7 @@ int main(int argc, char **argv)
 	struct runtime_cli_args cli;
 	struct server_runtime server;
 	struct kms_state kms;
+	struct breezy_state bstate;
 	struct usb_gadget_config gadget_cfg;
 	struct usb_gadget_state gadget_state;
 	struct link_services_state link_state;
@@ -1395,6 +1415,8 @@ int main(int argc, char **argv)
 	server.listen_fd = -1;
 	memset(&kms, 0, sizeof(kms));
 	kms.drm_fd = -1;
+	memset(&bstate, 0, sizeof(bstate));
+	kms.state = &bstate;
 	memset(&gadget_state, 0, sizeof(gadget_state));
 	memset(&link_state, 0, sizeof(link_state));
 	memset(&eth_link_state, 0, sizeof(eth_link_state));
@@ -1491,25 +1513,19 @@ int main(int argc, char **argv)
 	}
 	atomic_init(&server.viewer_stop_requested, false);
 
-	if (kms_init(&kms, drm_device, &server.opts) != 0) {
-		fprintf(stderr, "Failed to initialise KMS compositor\n");
-		goto out;
-	}
-
-	breezy_overlay_set_addresses(&kms.overlay,
-				     link_cfg_valid ? &link_cfg : NULL,
-				     gadget_state.netdev_name[0]
-					 ? gadget_state.netdev_name : NULL);
+	/*
+	 * Populate address state once — these fields survive renderer reconnect
+	 * cycles and are never wiped by renderer_destroy().
+	 */
+	breezy_state_set_addresses(&bstate,
+				   link_cfg_valid ? &link_cfg : NULL,
+				   gadget_state.netdev_name[0]
+					? gadget_state.netdev_name : NULL);
 	if (eth_link_cfg_valid)
-		breezy_overlay_set_eth_link(&kms.overlay,
-					    eth_iface,
-					    eth_link_cfg.link_ip,
-					    ETH_HOST_IP);
-
-	if (kms_init_display_textures(&kms, &server) != 0) {
-		fprintf(stderr, "Failed to initialise display textures\n");
-		goto out;
-	}
+		breezy_state_set_eth_link(&bstate,
+					  eth_iface,
+					  eth_link_cfg.link_ip,
+					  ETH_HOST_IP);
 
 	if (pthread_create(&srv_thread, NULL, server_thread_main, &server) != 0) {
 		perror("pthread_create server");
@@ -1517,10 +1533,34 @@ int main(int argc, char **argv)
 	}
 	srv_thread_created = true;
 
-	printf("DisplayLink KMS compositor running with %zu display slot(s)\n",
-	       kms.display_count);
+	/*
+	 * Renderer reconnect loop.  The USB/IP server thread and all decode
+	 * sessions remain running throughout; only the DRM/GBM/EGL/GL layer
+	 * is torn down and rebuilt on each reconnect.
+	 */
+	while (!stop_requested) {
+		if (renderer_init(&kms, drm_device) != 0) {
+			fprintf(stderr, "kms: renderer init failed, retrying in 1 s\n");
+			nanosleep(&(struct timespec){1, 0}, NULL);
+			continue;
+		}
 
-	(void)kms_run(&kms, &server);
+		if (kms_init_display_textures(&kms, &server) != 0) {
+			fprintf(stderr, "kms: display texture init failed, retrying in 1 s\n");
+			renderer_destroy(&kms);
+			nanosleep(&(struct timespec){1, 0}, NULL);
+			continue;
+		}
+
+		printf("DisplayLink KMS compositor running with %zu display slot(s)\n",
+		       kms.display_count);
+
+		kms_run(&kms, &server);
+		renderer_destroy(&kms);
+
+		if (!stop_requested)
+			fprintf(stderr, "kms: display lost, waiting for reconnect\n");
+	}
 
 	exit_code = EXIT_SUCCESS;
 
@@ -1531,7 +1571,6 @@ int main(int argc, char **argv)
 			shutdown(server.listen_fd, SHUT_RDWR);
 		pthread_join(srv_thread, NULL);
 	}
-	kms_destroy(&kms);
 	server_runtime_destroy(&server);
 	link_services_stop(&link_state);
 	link_services_stop(&eth_link_state);
