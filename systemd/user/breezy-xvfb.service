@@ -3,7 +3,7 @@ Description=Breezy Box headless X server (Xvfb :1)
 PartOf=breezy.target
 
 [Service]
-ExecStart=/usr/bin/Xvfb :1 -screen 0 1280x720x15
+ExecStart=/usr/bin/Xvfb :1 -screen 0 1920x1080x15
 Restart=on-failure
 RestartSec=2
 

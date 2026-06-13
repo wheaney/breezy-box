@@ -272,6 +272,33 @@ bool breezy_state_update(struct breezy_state *bs,
 		       (otg_connected  != bs->otg_connected)  ||
 		       (eth_connected  != bs->eth_connected);
 
+	if (otg_connected != bs->otg_connected) {
+		if (otg_connected)
+			printf("breezy: OTG host connected (%s, host %s)\n",
+			       bs->otg_iface[0] ? bs->otg_iface : "?", bs->host_ip);
+		else
+			printf("breezy: OTG host disconnected\n");
+	}
+
+	if (eth_connected != bs->eth_connected) {
+		if (eth_connected)
+			printf("breezy: wired Ethernet host connected (%s, host %s)\n",
+			       bs->eth_iface[0] ? bs->eth_iface : "?", bs->eth_host_ip);
+		else
+			printf("breezy: wired Ethernet host disconnected\n");
+	}
+
+	static const char *const mode_names[] = {
+		[BREEZY_STATE_XR_DRIVER_DOWN] = "xr-driver-down",
+		[BREEZY_STATE_NO_GLASSES]     = "no-glasses",
+		[BREEZY_STATE_NO_HOST]        = "no-host",
+		[BREEZY_STATE_NO_CLIENTS]     = "no-clients",
+		[BREEZY_STATE_NORMAL]         = "normal",
+	};
+	if (next != bs->mode)
+		printf("breezy: state %s -> %s\n",
+		       mode_names[bs->mode], mode_names[next]);
+
 	bs->mode           = next;
 	bs->host_connected = host_connected;
 	bs->otg_connected  = otg_connected;

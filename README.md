@@ -37,13 +37,9 @@ Ideally the application will rely on gsettings to allow us to reuse the schema a
 
 Breezy Desktop relies heavily on a UI to allow the user to configure and interact with the XR Effect in real time. Ideally the Breezy Box will be a no-software solution, but still provide a powerful UI. One way to achieve this is to host the application remotely, so it runs directly on the Breezy Box, but is rendered on the host system.
 
-#### GDK Broadway
+#### NoVNC web portal
 
-In researching if there's a way to host the UI remotely, I came across GDK Broadway: 
-
-> The GDK Broadway backend provides support for displaying GTK applications in a web browser, using HTML5 and web sockets.
-
-It claims to not be well maintained, and I haven't tested it yet, so I don't know if it works with Adwaita or if it'll run into other problems with the current version of the Python GTK UI. So it's probably a long-shot, but if it does work, it seems like the ideal approach: users get the full-blown UI and they can access it using their browser without any installation needed. We would just need to expose the GDK Broadway web server over USB.
+NoVNC allows for hosting remote apps over a web server, so I can launch and host the UI on the SBC and access it using a web browser on the host with full rendering and functionality. It would be made available over the ethernet connection we have with the host PC.
 
 Some changes would be needed to allow the UI to switch how it creates virtual displays, based on whether it's running on GNOME or on a Breezy Box. Keyboard shortcuts are the biggest unknown, as those are OS-specific and may be difficult to use to trigger changes over USB. At the very least we may be able to provide solutions so people can create DIY shortcuts.
 
@@ -52,6 +48,21 @@ Some changes would be needed to allow the UI to switch how it creates virtual di
 We need a new component that will use a libcomposite integration to create the desired displays. It would always spoof at least one DisplayLink display by default, but would be able to create and remove displays in real-time based on UI interactions, and also run at startup to create the configured number of displays when connected.
 
 This component would also be responsible for decoding the damage data coming in over the DisplayLink protocol and updating a DRM buffer with the latest textures for use in the 3D rendering. Although I've listed this as its own component, this would most likely live as a separate thread in the DRM/KMS rendering application, in order to have simpler access to shared memory for rendering.
+
+But unfortunately, a single USB port can only host one DisplayLink device (you can't composite multiple DL devices into one). So to host more than one device, we'll need a USB-over-the-network solution.
+
+### USB/IP
+
+Hosting a USB/IP endpoint allows us to expose multiple DisplayLink devices over the network. But the SBC is intended to be an offline device, and WLAN latency isn't great for the DisplayLink, so the need for a direct ethernet link becomes a must. Fortunately, USB OTG composite devices can also function as ethernet links to the host, and most SBCs have ethernet ports available.
+
+### Wired Ethernet connections to the host
+
+We can provide two ethernet options:
+1. the OTG composite device can behave like an RNDIS ethernet gadget (or a composite of RNDIS and another standard for MacOS compat)
+2. the ethernet port on the SBC can be wired directly to the host (either using a USB-ethernet adapter or direct eth-to-eth if the host and SBC have the native ports for it)
+
+Both can advertise avahi compatible host names to make connections easier, and overlay messaging in the glasses can help get it set up. This connection would also serve to access the UI over NoVNC.
+
 
 ## Limitations
 

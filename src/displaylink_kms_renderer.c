@@ -527,6 +527,14 @@ static int kms_init_drm(struct kms_state *kms, const char *device)
 	}
 	kms->connector_id = connector->connector_id;
 
+	{
+		const char *type_name = drmModeGetConnectorTypeName(connector->connector_type);
+		printf("kms: display connected: %s-%u %ux%u@%uHz\n",
+		       type_name ? type_name : "Unknown",
+		       connector->connector_type_id,
+		       kms->mode.hdisplay, kms->mode.vdisplay, kms->mode.vrefresh);
+	}
+
 	for (i = 0; i < resources->count_encoders; i++) {
 		encoder = drmModeGetEncoder(kms->drm_fd, resources->encoders[i]);
 		if (encoder && encoder->encoder_id == connector->encoder_id)
@@ -563,9 +571,6 @@ static int kms_init_drm(struct kms_state *kms, const char *device)
 		return -1;
 	}
 
-	printf("KMS: mode %ux%u@%u connector=%u crtc=%u\n",
-	       kms->mode.hdisplay, kms->mode.vdisplay, kms->mode.vrefresh,
-	       kms->connector_id, kms->crtc_id);
 	return 0;
 }
 
@@ -1559,7 +1564,7 @@ int main(int argc, char **argv)
 		renderer_destroy(&kms);
 
 		if (!stop_requested)
-			fprintf(stderr, "kms: display lost, waiting for reconnect\n");
+			printf("kms: display disconnected, waiting for reconnect\n");
 	}
 
 	exit_code = EXIT_SUCCESS;
