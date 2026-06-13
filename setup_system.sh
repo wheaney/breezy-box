@@ -239,21 +239,41 @@ done
 
 systemctl daemon-reload
 
-# Enable and (re-)start breezy.target for the app user.
+# Install .bash_profile for the app user to start breezy.target on tty1 login.
+# We use .bash_profile (not .profile) so it only fires for bash login shells,
+# which is what getty gives us.  The tty check ensures it only runs on tty1
+# so SSH and other sessions are unaffected.
+#
+# NOTE: linger must NOT be enabled for this user.  If it is, systemd starts a
+# seat-less user session at boot and breezy.target lands there instead of the
+# tty1 session, where it can't take DRM master.  Disable it with:
+#   loginctl disable-linger $APP_USER
 if id "$APP_USER" &>/dev/null; then
-    USER_CMD="XDG_RUNTIME_DIR=/run/user/\$(id -u) systemctl --user"
-    # Always re-enable so the WantedBy symlink reflects the current unit file.
-    su -l "$APP_USER" -s /bin/bash -c "$USER_CMD enable breezy.target" \
-        2>/dev/null && done_msg "enabled breezy.target for $APP_USER" \
-        || echo "  warn: could not enable breezy.target as $APP_USER"
-    # Restart changed units if the session is already running.
+    PROFILE_DST="/home/$APP_USER/.bash_profile"
+    PROFILE_MARKER="# breezy-box: start breezy.target on tty1"
+    PROFILE_BLOCK="${PROFILE_MARKER}
+if [ \"\$(tty)\" = \"/dev/tty1\" ]; then
+    systemctl --user start breezy.target
+fi"
+
+    if grep -qF "$PROFILE_MARKER" "$PROFILE_DST" 2>/dev/null; then
+        skip_msg "$PROFILE_DST already has breezy.target launch block"
+    else
+        echo "" >> "$PROFILE_DST"
+        echo "$PROFILE_BLOCK" >> "$PROFILE_DST"
+        chown "$APP_USER:$APP_USER" "$PROFILE_DST"
+        done_msg "added breezy.target launch block to $PROFILE_DST"
+    fi
+
+    # Restart changed units if the user session is already running on tty1.
     if [[ "$UNITS_CHANGED" -eq 1 ]]; then
+        USER_CMD="XDG_RUNTIME_DIR=/run/user/$(id -u "$APP_USER") systemctl --user"
         su -l "$APP_USER" -s /bin/bash -c \
             "$USER_CMD is-active --quiet breezy.target && $USER_CMD restart breezy.target" \
             2>/dev/null && done_msg "restarted breezy.target (units changed)" || true
     fi
 else
-    echo "  warn: user $APP_USER not found; enable breezy.target manually after creating the user"
+    echo "  warn: user $APP_USER not found; .bash_profile will be configured when the user exists"
 fi
 
 # ---------------------------------------------------------------------------
@@ -263,12 +283,12 @@ echo
 echo "Next steps if not done yet:"
 echo "  1. Create the app user:  useradd -m -s /bin/bash -c 'Breezy Box' $APP_USER"
 echo "     Add to groups:        usermod -aG video,render,input $APP_USER"
-echo "  2. Enable linger:        loginctl enable-linger $APP_USER"
-echo "  3. Fetch vendored deps and build:"
+echo "  2. Disable linger (if previously enabled — linger breaks DRM master):"
+echo "     loginctl disable-linger $APP_USER"
+echo "  3. Fetch vendored deps and build (run as $APP_USER):"
 echo "     cd /home/$APP_USER/breezy-box && make deps && make"
 echo "     cp displaylink_kms_renderer breezy_web ~/.local/bin/"
-echo "  4. Reboot — getty autologin will start the user session and breezy.target."
-echo "  5. Rebuild with setcap for gadget configfs access until a dedicated"
-echo "     setup service is in place:"
+echo "  4. Reboot — getty autologin on tty1 will start the user session and breezy.target."
+echo "  5. After building, set capabilities for gadget configfs access:"
 echo "     sudo setcap 'cap_sys_admin,cap_net_admin,cap_sys_module+ep' \\"
 echo "         /home/$APP_USER/.local/bin/displaylink_kms_renderer"

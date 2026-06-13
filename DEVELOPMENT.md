@@ -6,8 +6,11 @@ relaunching services manually — without fighting systemd.
 ## First-time setup
 
 After running `sudo ./setup_system.sh`, reboot once so the getty autologin
-takes effect.  The user session starts, and `breezy.target` (and all its
-services) comes up automatically.
+takes effect.  The tty1 login shell starts `breezy.target` via `.bash_profile`.
+
+**Do not enable linger** for the breezy user (`loginctl enable-linger`).  Linger
+starts a seat-less user session at boot before the tty1 login, and `breezy.target`
+lands there instead — where it has no seat and the renderer can't take DRM master.
 
 ## Watching logs
 
