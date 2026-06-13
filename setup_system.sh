@@ -197,18 +197,20 @@ section "Getty autologin for $APP_USER on tty1"
 
 GETTY_DROPIN_DST="/etc/systemd/system/getty@tty1.service.d/autologin.conf"
 GETTY_DROPIN_SRC="$SCRIPT_DIR/systemd/system/getty@tty1.service.d/autologin.conf"
-GETTY_DROPIN_WANT="$(sed "s/breezy/$APP_USER/g" "$GETTY_DROPIN_SRC")"
-GETTY_DROPIN_CURRENT="$(cat "$GETTY_DROPIN_DST" 2>/dev/null || true)"
 
-if [[ "$GETTY_DROPIN_CURRENT" != "$GETTY_DROPIN_WANT" ]]; then
+# Generate the target content by substituting the placeholder username.
+GETTY_DROPIN_TMP="$(mktemp)"
+sed "s/breezy/$APP_USER/g" "$GETTY_DROPIN_SRC" > "$GETTY_DROPIN_TMP"
+
+if ! cmp -s "$GETTY_DROPIN_TMP" "$GETTY_DROPIN_DST" 2>/dev/null; then
     mkdir -p "$(dirname "$GETTY_DROPIN_DST")"
-    echo "$GETTY_DROPIN_WANT" > "$GETTY_DROPIN_DST"
-    chmod 0644 "$GETTY_DROPIN_DST"
+    install -m 0644 "$GETTY_DROPIN_TMP" "$GETTY_DROPIN_DST"
     systemctl daemon-reload
     done_msg "installed $GETTY_DROPIN_DST (autologin as $APP_USER)"
 else
     skip_msg "$GETTY_DROPIN_DST already up to date"
 fi
+rm -f "$GETTY_DROPIN_TMP"
 
 # ---------------------------------------------------------------------------
 section "Breezy user systemd units"
