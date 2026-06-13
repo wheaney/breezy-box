@@ -8,10 +8,8 @@ PartOf=breezy.target
 ExecStart=/usr/bin/x11vnc \
     -display :1 \
     -nopw -shared -forever -loop \
-    -encodings "tight zrle hextile" \
     -ncache 10 \
     -defer 10 \
-    -dnow \
     -xkb
 Restart=on-failure
 RestartSec=2
