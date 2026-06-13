@@ -3,7 +3,7 @@ Description=Breezy Box landing page server (:80)
 PartOf=breezy.target
 
 [Service]
-ExecStart=%h/.local/bin/breezy_web --port 8081
+ExecStart=%h/.local/bin/breezy_web --port 8081 --web-root %h/breezy-box/web
 Restart=on-failure
 RestartSec=2
 
