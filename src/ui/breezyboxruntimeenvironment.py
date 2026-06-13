@@ -12,7 +12,7 @@ import gettext
 import logging
 
 from gi.repository import Adw, Gtk
-from ..runtimeenvironment import ExtraGroup, ExtraTab, RuntimeEnvironment
+from ..runtimeenvironment import ExtraField, ExtraTab, RuntimeEnvironment
 
 _ = gettext.gettext
 logger = logging.getLogger('breezy_ui')
@@ -64,7 +64,7 @@ class BreezyBoxRuntimeEnvironment(RuntimeEnvironment):
         # These settings either don't apply to a headless box or are controlled
         # by the host OS / package manager rather than this UI. The built-in
         # virtual-display rows are hidden in favour of a box-specific interface
-        # (see extra_groups below).
+        # (see extra_fields below).
         return frozenset([
             'effect_enable_switch',
             'disable_physical_displays_switch',
@@ -91,10 +91,13 @@ class BreezyBoxRuntimeEnvironment(RuntimeEnvironment):
         )]
 
     @property
-    def extra_groups(self):
-        return [ExtraGroup(
+    def extra_fields(self):
+        # Re-add a box-specific virtual-displays field where the hidden built-in
+        # one used to live: the bottom of the Features group (general, column 0).
+        return [ExtraField(
             tab_name='general',
-            build_widget=self._build_virtual_displays_group,
+            column=0,
+            build_widget=self._build_virtual_displays_row,
         )]
 
     def reset_excluded_fields(self, settings):
@@ -123,18 +126,13 @@ class BreezyBoxRuntimeEnvironment(RuntimeEnvironment):
         box.append(label)
         return box
 
-    def _build_virtual_displays_group(self):
-        # Stub box-specific virtual-displays interface. The real implementation
+    def _build_virtual_displays_row(self):
+        # Stub box-specific virtual-displays field. The real implementation
         # (driven by the box's own display management) will replace this — most
         # likely loading its layout from a .ui shipped alongside this module via
         # Gtk.Builder (bin/package copies runtime *.ui into the runtimes/ dir;
         # set the 'breezydesktop' translation domain on the builder).
-        group = Adw.PreferencesGroup()
-        group.set_title(_("Virtual Displays"))
-        group.set_width_request(450)
-
         row = Adw.ActionRow()
         row.set_title(_("Virtual displays"))
         row.set_subtitle(_("Box-specific virtual display management is coming soon."))
-        group.add(row)
-        return group
+        return row
