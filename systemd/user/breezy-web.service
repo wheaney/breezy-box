@@ -1,0 +1,13 @@
+[Unit]
+Description=Breezy Box landing page server (:80)
+PartOf=breezy.target
+
+[Service]
+ExecStart=%h/.local/bin/breezy_web
+Restart=on-failure
+RestartSec=2
+# Needed to bind port 80 as a non-root user.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=breezy.target

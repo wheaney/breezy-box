@@ -173,6 +173,15 @@ static void rebuild_text(struct breezy_overlay *ov)
 	}
 
 	switch (ov->state) {
+	case BREEZY_OVERLAY_XR_DRIVER_DOWN:
+		snprintf(msg, sizeof(msg),
+			 "XR driver service is not running.\n"
+			 "Visit %s to restart it.",
+			 (active_mdns && active_mdns[0]) ? active_mdns
+			 : (active_ip && active_ip[0])   ? active_ip
+			                                 : "breezy.local");
+		break;
+
 	case BREEZY_OVERLAY_NO_GLASSES:
 		snprintf(msg, sizeof(msg),
 			 "Please connect a supported pair of XR glasses");
@@ -307,6 +316,7 @@ void breezy_overlay_set_eth_link(struct breezy_overlay *ov,
 }
 
 void breezy_overlay_update(struct breezy_overlay *ov,
+			    bool xr_driver_up,
 			    bool glasses_active,
 			    size_t imported_count,
 			    size_t device_count,
@@ -346,13 +356,15 @@ void breezy_overlay_update(struct breezy_overlay *ov,
 
 	if (verbose)
 		printf("breezy_overlay: otg_iface=%s host_ip=%s otg=%d "
-		       "eth_iface=%s eth=%d glasses=%d imported=%zu state=%d\n",
+		       "eth_iface=%s eth=%d xr_driver=%d glasses=%d imported=%zu state=%d\n",
 		       ov->otg_iface, ov->host_ip, (int)otg_connected,
 		       ov->eth_iface, (int)eth_connected,
-		       (int)glasses_active, imported_count, (int)ov->state);
+		       (int)xr_driver_up, (int)glasses_active, imported_count, (int)ov->state);
 
 	enum breezy_overlay_state next;
-	if (!glasses_active)
+	if (!xr_driver_up)
+		next = BREEZY_OVERLAY_XR_DRIVER_DOWN;
+	else if (!glasses_active)
 		next = BREEZY_OVERLAY_NO_GLASSES;
 	else if (!host_connected)
 		next = BREEZY_OVERLAY_NO_HOST;

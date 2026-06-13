@@ -9,4 +9,4 @@
 	url = https://github.com/bellard/quickjs.git
 [submodule "ui-gtk"]
 	path = ui-gtk
-	url = https://github.com/wheaney/breezy-desktop-ui-gtk.git
+	url = git@github.com:wheaney/breezy-desktop-ui-gtk.git 

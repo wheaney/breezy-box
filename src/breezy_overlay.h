@@ -8,13 +8,14 @@
 /*
  * breezy_overlay — connection-status overlay for any Breezy Box renderer.
  *
- * Tracks four states and builds the appropriate human-readable message
+ * Tracks five states and builds the appropriate human-readable message
  * as a GL texture so any GLES2 renderer can draw it:
  *
- *   BREEZY_OVERLAY_NO_GLASSES   no XR glasses detected
- *   BREEZY_OVERLAY_NO_HOST      glasses active but OTG link not enumerated
- *   BREEZY_OVERLAY_NO_CLIENTS   OTG link up but no USB/IP sessions imported
- *   BREEZY_OVERLAY_NORMAL       at least one DisplayLink session active
+ *   BREEZY_OVERLAY_XR_DRIVER_DOWN  XR driver service not running / no data
+ *   BREEZY_OVERLAY_NO_GLASSES      driver up but no XR glasses detected
+ *   BREEZY_OVERLAY_NO_HOST         glasses active but OTG link not enumerated
+ *   BREEZY_OVERLAY_NO_CLIENTS      OTG link up but no USB/IP sessions imported
+ *   BREEZY_OVERLAY_NORMAL          at least one DisplayLink session active
  *
  * Usage
  * -----
@@ -22,7 +23,7 @@
  *   breezy_overlay_set_addresses(&ov, &link_cfg, gadget_netdev);
  *
  *   // each frame (or each poll cycle):
- *   breezy_overlay_update(&ov, glasses_active, imported_count, device_count, verbose);
+ *   breezy_overlay_update(&ov, xr_driver_up, glasses_active, imported_count, device_count, verbose);
  *
  *   // render:
  *   if (ov.tex.tex)
@@ -36,6 +37,7 @@
 #define BO_IFACE_MAX 32
 
 enum breezy_overlay_state {
+	BREEZY_OVERLAY_XR_DRIVER_DOWN,
 	BREEZY_OVERLAY_NO_GLASSES,
 	BREEZY_OVERLAY_NO_HOST,
 	BREEZY_OVERLAY_NO_CLIENTS,
@@ -94,6 +96,7 @@ void breezy_overlay_set_eth_link(struct breezy_overlay *ov,
  * Re-evaluate state and refresh the overlay texture if anything changed.
  * Requires an active GL context.
  *
+ *   xr_driver_up    — true when the XR driver is producing fresh IMU data
  *   glasses_active  — true when IMU config is valid and glasses are connected
  *   imported_count  — number of device slots with an active USB/IP import
  *   device_count    — total number of configured device slots
@@ -105,6 +108,7 @@ void breezy_overlay_set_eth_link(struct breezy_overlay *ov,
  * after startup) — cheap getifaddrs() scan, done at most once per call.
  */
 void breezy_overlay_update(struct breezy_overlay *ov,
+			    bool xr_driver_up,
 			    bool glasses_active,
 			    size_t imported_count,
 			    size_t device_count,

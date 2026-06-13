@@ -1,0 +1,7 @@
+[Unit]
+Description=Breezy Box services
+Wants=breezy-renderer.service breezy-xvfb.service breezy-web.service
+After=breezy-renderer.service breezy-xvfb.service breezy-web.service
+
+[Install]
+WantedBy=graphical-session.target

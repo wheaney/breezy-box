@@ -1,0 +1,15 @@
+[Unit]
+Description=Breezy Box KMS renderer
+Documentation=https://github.com/wheaney/breezy-box
+# Soft dep: renderer starts and shows XR_DRIVER_DOWN overlay if xr-driver isn't up.
+Wants=xr-driver.service
+After=xr-driver.service
+PartOf=breezy.target
+
+[Service]
+ExecStart=%h/.local/bin/displaylink_kms_renderer
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=breezy.target

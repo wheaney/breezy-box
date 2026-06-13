@@ -193,6 +193,59 @@ EmitRouter=no"
 fi
 
 # ---------------------------------------------------------------------------
+section "Getty autologin for $APP_USER on tty1"
+
+GETTY_DROPIN_DST="/etc/systemd/system/getty@tty1.service.d/autologin.conf"
+GETTY_DROPIN_SRC="$SCRIPT_DIR/systemd/system/getty@tty1.service.d/autologin.conf"
+
+if [[ -f "$GETTY_DROPIN_DST" ]]; then
+    skip_msg "$GETTY_DROPIN_DST already exists"
+else
+    mkdir -p "$(dirname "$GETTY_DROPIN_DST")"
+    # Substitute the placeholder username with the actual APP_USER.
+    sed "s/breezy/$APP_USER/g" "$GETTY_DROPIN_SRC" > "$GETTY_DROPIN_DST"
+    chmod 0644 "$GETTY_DROPIN_DST"
+    systemctl daemon-reload
+    done_msg "installed $GETTY_DROPIN_DST (autologin as $APP_USER)"
+fi
+
+# ---------------------------------------------------------------------------
+section "Breezy user systemd units"
+
+USER_UNIT_SRC="$SCRIPT_DIR/systemd/user"
+USER_UNIT_DST="/etc/systemd/user"
+
+for unit in breezy.target breezy-renderer.service breezy-xvfb.service \
+            breezy-desktop.service breezy-x11vnc.service \
+            breezy-novnc.service breezy-web.service; do
+    dst="$USER_UNIT_DST/$unit"
+    src="$USER_UNIT_SRC/$unit"
+    if [[ ! -f "$src" ]]; then
+        echo "  warn: $src not found, skipping"
+        continue
+    fi
+    CURRENT="$(cat "$dst" 2>/dev/null || true)"
+    NEW="$(cat "$src")"
+    if [[ "$CURRENT" != "$NEW" ]]; then
+        install -m 0644 "$src" "$dst"
+        done_msg "installed $dst"
+    else
+        skip_msg "$dst already up to date"
+    fi
+done
+
+systemctl daemon-reload
+# Enable the target for the app user so it starts with their session.
+if id "$APP_USER" &>/dev/null; then
+    su -l "$APP_USER" -s /bin/bash -c \
+        "XDG_RUNTIME_DIR=/run/user/\$(id -u) systemctl --user enable breezy.target" \
+        2>/dev/null && done_msg "enabled breezy.target for $APP_USER" \
+        || echo "  warn: could not enable breezy.target as $APP_USER (session may not be active yet)"
+else
+    echo "  warn: user $APP_USER not found; enable breezy.target manually after creating the user"
+fi
+
+# ---------------------------------------------------------------------------
 echo
 echo "System setup complete."
 echo
@@ -200,7 +253,7 @@ echo "Next steps if not done yet:"
 echo "  1. Create the app user:  useradd -m -s /bin/bash -c 'Breezy Box' $APP_USER"
 echo "     Add to groups:        usermod -aG video,render,input $APP_USER"
 echo "  2. Enable linger:        loginctl enable-linger $APP_USER"
-echo "  3. Set up TTY1 auto-login — see install_usb0_peripheral_overlay.sh header for example."
+echo "  3. Reboot — getty autologin will start the user session and breezy.target."
 echo "  4. Rebuild with setcap for gadget configfs access until a dedicated"
 echo "     setup service is in place:"
 echo "     sudo setcap 'cap_sys_admin,cap_net_admin,cap_sys_module+ep' \\"

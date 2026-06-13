@@ -1,0 +1,15 @@
+[Unit]
+Description=Breezy Desktop GTK UI (on Xvfb :1)
+Requires=breezy-xvfb.service
+After=breezy-xvfb.service
+PartOf=breezy.target
+
+[Service]
+Environment=DISPLAY=:1
+Environment=GTK_A11Y=none
+ExecStart=%h/.local/bin/breezydesktop
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=breezy.target

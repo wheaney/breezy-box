@@ -1,0 +1,11 @@
+[Unit]
+Description=Breezy Box headless X server (Xvfb :1)
+PartOf=breezy.target
+
+[Service]
+ExecStart=/usr/bin/Xvfb :1 -screen 0 1920x1080x24
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=breezy.target

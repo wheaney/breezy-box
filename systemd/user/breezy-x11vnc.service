@@ -1,0 +1,20 @@
+[Unit]
+Description=Breezy Box x11vnc server (Xvfb :1 -> 5900)
+Requires=breezy-xvfb.service
+After=breezy-xvfb.service
+PartOf=breezy.target
+
+[Service]
+ExecStart=/usr/bin/x11vnc \
+    -display :1 \
+    -nopw -shared -forever -loop \
+    -encodings "tight zrle hextile" \
+    -ncache 10 \
+    -defer 10 \
+    -dnow \
+    -xkb
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=breezy.target

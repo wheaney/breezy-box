@@ -45,13 +45,19 @@ KMS_RENDERER_TARGET_BASE := displaylink_kms_renderer
 KMS_RENDERER_PROFILE_TARGET := $(KMS_RENDERER_TARGET_BASE)-profile
 KMS_RENDERER_TARGET := $(KMS_RENDERER_TARGET_BASE)$(PROFILE_SUFFIX)
 COMPAT_SOURCES := $(COMPAT_DIR)/src/udl_sink.c
-KMS_COMPOSITOR_SOURCES := $(addprefix $(SRC_DIR)/,displaylink_kms_renderer.c display_renderer.c overlay_text.c breezy_overlay.c usbip.c udl_device.c udl_runtime.c server.c display_placement.c breezy_imu.c breezy_settings.c usb_gadget.c link_services.c breezy_ui.c) $(COMPAT_SOURCES)
+KMS_COMPOSITOR_SOURCES := $(addprefix $(SRC_DIR)/,displaylink_kms_renderer.c display_renderer.c overlay_text.c breezy_overlay.c usbip.c udl_device.c udl_runtime.c server.c display_placement.c breezy_imu.c breezy_settings.c usb_gadget.c link_services.c) $(COMPAT_SOURCES)
 
 CPPFLAGS += -I$(COMPAT_DIR)/include -I$(ZEROKVM_BRIDGE_INCLUDEDIR) -I$(SRC_DIR)
 LDFLAGS += -L$(ZEROKVM_BRIDGE_LIBDIR) -Wl,-rpath,$(ZEROKVM_BRIDGE_LIBDIR)
 LDLIBS += -l:ZeroKvm.NativeBridge.so
 
-all: $(KMS_RENDERER_TARGET)
+WEB_SERVER_TARGET := breezy_web
+WEB_SERVER_SOURCES := $(SRC_DIR)/breezy_web.c $(SRC_DIR)/vendor/mongoose.c
+MONGOOSE_H := $(SRC_DIR)/vendor/mongoose.h
+MONGOOSE_C := $(SRC_DIR)/vendor/mongoose.c
+MONGOOSE_URL := https://raw.githubusercontent.com/cesanta/mongoose/master
+
+all: $(KMS_RENDERER_TARGET) $(WEB_SERVER_TARGET)
 
 profile:
 	$(MAKE) PROFILE=1 $(KMS_RENDERER_PROFILE_TARGET)
@@ -80,8 +86,18 @@ $(JS_BUNDLE): $(JS_SHARED_DIR)/math.js $(JS_SHARED_DIR)/displayPlacement.js $(JS
 	$(PYTHON3) tools/gen_js_bundle.py $(JS_SHARED_DIR)/math.js $(JS_SHARED_DIR)/displayPlacement.js $(JS_SHARED_DIR)/smoothFollow.js > $(SRC_DIR)/display_placement_bundle.h.tmp
 	@if cmp -s $(SRC_DIR)/display_placement_bundle.h.tmp $@ 2>/dev/null; then rm -f $(SRC_DIR)/display_placement_bundle.h.tmp; else mv $(SRC_DIR)/display_placement_bundle.h.tmp $@; fi
 
+deps: $(MONGOOSE_H) $(MONGOOSE_C)
+
+$(MONGOOSE_H) $(MONGOOSE_C):
+	@mkdir -p $(SRC_DIR)/vendor
+	curl -fsSL $(MONGOOSE_URL)/mongoose.h -o $(MONGOOSE_H)
+	curl -fsSL $(MONGOOSE_URL)/mongoose.c -o $(MONGOOSE_C)
+
+$(WEB_SERVER_TARGET): $(WEB_SERVER_SOURCES)
+	$(CC) $(CFLAGS) -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -DMG_ENABLE_EPOLL=1 -I$(SRC_DIR) -o $@ $(WEB_SERVER_SOURCES)
+
 clean:
-	rm -f $(KMS_RENDERER_TARGET_BASE) $(KMS_RENDERER_PROFILE_TARGET) $(JS_BUNDLE)
+	rm -f $(KMS_RENDERER_TARGET_BASE) $(KMS_RENDERER_PROFILE_TARGET) $(JS_BUNDLE) $(WEB_SERVER_TARGET)
 	rm -rf $(QUICKJS_DIR)/.obj $(QUICKJS_DIR)/.obj-profile
 
-.PHONY: all clean FORCE profile
+.PHONY: all clean deps FORCE profile
