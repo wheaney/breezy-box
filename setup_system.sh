@@ -202,6 +202,10 @@ RESET_SCRIPT_SRC="$SCRIPT_DIR/reset_usb0_otg_stack.sh"
 RESET_SCRIPT_DST="/usr/local/lib/breezy-box/reset_usb0_otg_stack.sh"
 GADGET_SERVICE_SRC="$SCRIPT_DIR/systemd/system/breezy-gadget.service"
 GADGET_SERVICE_DST="/etc/systemd/system/breezy-gadget.service"
+RESET_SERVICE_SRC="$SCRIPT_DIR/systemd/system/breezy-gadget-reset.service"
+RESET_SERVICE_DST="/etc/systemd/system/breezy-gadget-reset.service"
+UDEV_RULE_SRC="$SCRIPT_DIR/udev/99-breezy-otg-reset.rules"
+UDEV_RULE_DST="/etc/udev/rules.d/99-breezy-otg-reset.rules"
 
 if [[ ! -f "$GADGET_SCRIPT_SRC" ]]; then
     echo "  warn: $GADGET_SCRIPT_SRC not found, skipping gadget service install"
@@ -222,7 +226,7 @@ else
             skip_msg "$RESET_SCRIPT_DST already up to date"
         fi
     else
-        echo "  warn: $RESET_SCRIPT_SRC not found; ExecStartPre in breezy-gadget.service will fail"
+        echo "  warn: $RESET_SCRIPT_SRC not found"
     fi
 
     if ! cmp -s "$GADGET_SERVICE_SRC" "$GADGET_SERVICE_DST" 2>/dev/null; then
@@ -230,6 +234,21 @@ else
         done_msg "installed $GADGET_SERVICE_DST"
     else
         skip_msg "$GADGET_SERVICE_DST already up to date"
+    fi
+
+    if ! cmp -s "$RESET_SERVICE_SRC" "$RESET_SERVICE_DST" 2>/dev/null; then
+        install -m 0644 "$RESET_SERVICE_SRC" "$RESET_SERVICE_DST"
+        done_msg "installed $RESET_SERVICE_DST"
+    else
+        skip_msg "$RESET_SERVICE_DST already up to date"
+    fi
+
+    if ! cmp -s "$UDEV_RULE_SRC" "$UDEV_RULE_DST" 2>/dev/null; then
+        install -m 0644 "$UDEV_RULE_SRC" "$UDEV_RULE_DST"
+        udevadm control --reload-rules
+        done_msg "installed $UDEV_RULE_DST"
+    else
+        skip_msg "$UDEV_RULE_DST already up to date"
     fi
 
     systemctl daemon-reload

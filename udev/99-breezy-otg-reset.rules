@@ -1,0 +1,13 @@
+# Trigger an OTG PHY reset when the RK3399 usb2phy@e450 misclassifies a
+# connected USB host port as a DCP charger (BC1.2 false positive).
+# When DCP=1 the DWC3 UDC stays "not attached" and Windows sees a descriptor
+# failure.  breezy-gadget-reset.service unbinds/rebinds the PHY and DWC3
+# driver to clear the bad state, then rebinds the RNDIS gadget.
+#
+# Match: extcon change event on usb2phy@e450 where USB=1 (VBUS present) and
+# DCP=1 (charger misclassification). cable.0=USB, cable.4=DCP.
+SUBSYSTEM=="extcon", DEVPATH=="*/ff770000.syscon:usb2phy@e450/extcon/*", \
+    ACTION=="change", \
+    ATTR{cable.0/state}=="1", \
+    ATTR{cable.4/state}=="1", \
+    RUN+="/usr/bin/systemctl start --no-block breezy-gadget-reset.service"
