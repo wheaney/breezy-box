@@ -44,6 +44,43 @@ int set_socket_options(int fd)
 	if (socket_nodelay_enabled())
 		(void)setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 	(void)setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
+
+	/*
+	 * USB/IP has no application-level heartbeat, and a DisplayLink stream is
+	 * host->box OUT data plus tiny acks: when the host dies ungracefully
+	 * (crash, standby, power loss) no FIN arrives and the box blocks forever
+	 * in recv_all().  The kernel default keepalive (2h idle + 9*75s probes)
+	 * is far too slow to flip the overlay back to "no clients".  Tune it so a
+	 * dead peer is detected in ~2s:
+	 *   - TCP_KEEPIDLE:  start probing after 1s of idle
+	 *   - TCP_KEEPINTVL: 1s between probes
+	 *   - TCP_KEEPCNT:   2 unanswered probes
+	 * TCP_USER_TIMEOUT bounds the other case: a peer that dies mid-burst while
+	 * our RET_SUBMIT acks are still unacknowledged (keepalive only probes an
+	 * idle connection).  It also *overrides* keepcnt for the idle case (Linux
+	 * closes on keepalive failure only once user_timeout elapses), so it must
+	 * track the keepalive budget — keep it ~2s, not larger, or detection would
+	 * stretch back out to user_timeout regardless of keepcnt.
+	 *
+	 * Probes are header-only segments acked by the peer's kernel, so a 1s idle
+	 * trigger is cheap even though DisplayLink goes idle between damage bursts.
+	 * The tradeoff is false positives on a lossy path: 2 dropped probes (or 2s
+	 * of unacked data) in a row will kill a live connection.  Fine on a direct
+	 * sub-ms USB-OTG/Ethernet link; revisit if ever exposed over Wi-Fi/WAN.
+	 */
+	{
+		const int keepidle  = 1;
+		const int keepintvl = 1;
+		const int keepcnt   = 2;
+		const int user_timeout_ms = 2000;
+
+		(void)setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &keepidle, sizeof(keepidle));
+		(void)setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl, sizeof(keepintvl));
+		(void)setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt, sizeof(keepcnt));
+		(void)setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT,
+				 &user_timeout_ms, sizeof(user_timeout_ms));
+	}
+
 	set_socket_buffer_best_effort(fd, SO_RCVBUF, USBIP_STREAM_RCVBUF_SIZE);
 	set_socket_buffer_best_effort(fd, SO_SNDBUF, USBIP_STREAM_SNDBUF_SIZE);
 	return 0;
