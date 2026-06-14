@@ -8,6 +8,11 @@ Before=multi-user.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+# Reset the usb2phy@e450 OTG PHY before configuring the gadget.
+# At boot the BC1.2 charger detection circuit can misclassify a Windows host
+# port as DCP, leaving the UDC in "not attached" state even when bound.
+# An unbind/rebind of the PHY and DWC3 drivers clears the bad state.
+ExecStartPre=/usr/local/lib/breezy-box/reset_usb0_otg_stack.sh
 ExecStart=/usr/local/lib/breezy-box/breezy_gadget_setup.sh
 ExecStop=/bin/sh -c 'echo "" > /sys/kernel/config/usb_gadget/breezy-composite/UDC 2>/dev/null || true'
 StandardOutput=journal

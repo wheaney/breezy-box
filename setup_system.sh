@@ -198,6 +198,8 @@ section "breezy-gadget system service (OTG RNDIS setup as root)"
 # The gadget setup script runs as root so the renderer can run unprivileged.
 GADGET_SCRIPT_SRC="$SCRIPT_DIR/breezy_gadget_setup.sh"
 GADGET_SCRIPT_DST="/usr/local/lib/breezy-box/breezy_gadget_setup.sh"
+RESET_SCRIPT_SRC="$SCRIPT_DIR/reset_usb0_otg_stack.sh"
+RESET_SCRIPT_DST="/usr/local/lib/breezy-box/reset_usb0_otg_stack.sh"
 GADGET_SERVICE_SRC="$SCRIPT_DIR/systemd/system/breezy-gadget.service"
 GADGET_SERVICE_DST="/etc/systemd/system/breezy-gadget.service"
 
@@ -210,6 +212,17 @@ else
         done_msg "installed $GADGET_SCRIPT_DST"
     else
         skip_msg "$GADGET_SCRIPT_DST already up to date"
+    fi
+
+    if [[ -f "$RESET_SCRIPT_SRC" ]]; then
+        if ! cmp -s "$RESET_SCRIPT_SRC" "$RESET_SCRIPT_DST" 2>/dev/null; then
+            install -m 0755 "$RESET_SCRIPT_SRC" "$RESET_SCRIPT_DST"
+            done_msg "installed $RESET_SCRIPT_DST"
+        else
+            skip_msg "$RESET_SCRIPT_DST already up to date"
+        fi
+    else
+        echo "  warn: $RESET_SCRIPT_SRC not found; ExecStartPre in breezy-gadget.service will fail"
     fi
 
     if ! cmp -s "$GADGET_SERVICE_SRC" "$GADGET_SERVICE_DST" 2>/dev/null; then
