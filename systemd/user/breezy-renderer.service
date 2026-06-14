@@ -13,10 +13,6 @@ ExecStartPre=/bin/sh -c 'for i in $(seq 1 30); do systemctl is-active --quiet br
 ExecStart=%h/.local/bin/displaylink_kms_renderer
 Restart=on-failure
 RestartSec=2
-# CAP_NET_ADMIN is needed to bring up the usb0 interface after the system-level
-# gadget setup (breezy-gadget.service) has already configured configfs as root.
-AmbientCapabilities=CAP_NET_ADMIN
-CapabilityBoundingSet=CAP_NET_ADMIN
 
 [Install]
 WantedBy=breezy.target

@@ -116,3 +116,15 @@ sleep 0.05
 wf UDC "$UDC"
 
 echo "breezy-gadget: RNDIS gadget bound to UDC $UDC"
+
+# usb0 appears after the UDC bind; wait briefly then let networkd (usb0.network)
+# manage the address. If networkd is not present, bring up the interface manually.
+sleep 0.5
+if systemctl is-active --quiet systemd-networkd 2>/dev/null; then
+    networkctl up usb0 2>/dev/null || true
+    echo "breezy-gadget: usb0 handed to systemd-networkd"
+else
+    ip link set usb0 up 2>/dev/null || true
+    ip addr add 192.168.7.2/30 dev usb0 2>/dev/null || true
+    echo "breezy-gadget: usb0 brought up manually (192.168.7.2/30)"
+fi
