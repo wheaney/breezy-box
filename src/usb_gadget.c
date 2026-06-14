@@ -388,21 +388,27 @@ int usb_gadget_setup(const struct usb_gadget_config *cfg,
 #undef MD
 
     bring_up_net:
-    /* Bring up network interface. */
-    { const char *const argv[] = {"ip", "addr", "flush", "dev", cfg->rndis_netdev, NULL};
-      run_cmd(argv); }  /* best-effort; interface may not exist yet */
-    if (cfg->rndis_mtu > 0u) {
-        char mtu[16];
-        const char *const argv[] = {"ip", "link", "set", "dev", cfg->rndis_netdev, "mtu", mtu, NULL};
+    /*
+     * When adopted from an external setup (breezy-gadget.service), systemd-networkd
+     * owns the usb0 interface via usb0.network and brings it up automatically.
+     * Skip the ip calls to avoid racing with networkd.
+     */
+    if (!state->adopted) {
+        { const char *const argv[] = {"ip", "addr", "flush", "dev", cfg->rndis_netdev, NULL};
+          run_cmd(argv); }  /* best-effort; interface may not exist yet */
+        if (cfg->rndis_mtu > 0u) {
+            char mtu[16];
+            const char *const argv[] = {"ip", "link", "set", "dev", cfg->rndis_netdev, "mtu", mtu, NULL};
 
-        snprintf(mtu, sizeof(mtu), "%u", cfg->rndis_mtu);
-        if (run_cmd(argv) < 0)
-            return -1;
+            snprintf(mtu, sizeof(mtu), "%u", cfg->rndis_mtu);
+            if (run_cmd(argv) < 0)
+                return -1;
+        }
+        { const char *const argv[] = {"ip", "link", "set", cfg->rndis_netdev, "up", NULL};
+          if (run_cmd(argv) < 0) return -1; }
+        { const char *const argv[] = {"ip", "addr", "add", cfg->rndis_ip_cidr, "dev", cfg->rndis_netdev, NULL};
+          if (run_cmd(argv) < 0) return -1; }
     }
-    { const char *const argv[] = {"ip", "link", "set", cfg->rndis_netdev, "up", NULL};
-      if (run_cmd(argv) < 0) return -1; }
-    { const char *const argv[] = {"ip", "addr", "add", cfg->rndis_ip_cidr, "dev", cfg->rndis_netdev, NULL};
-      if (run_cmd(argv) < 0) return -1; }
 
     state->active = true;
     printf("usb_gadget: RNDIS gadget on UDC %s, iface %s %s",
@@ -418,7 +424,7 @@ void usb_gadget_teardown(struct usb_gadget_state *state)
     if (!state || !state->active)
         return;
 
-    if (state->netdev_name[0]) {
+    if (state->netdev_name[0] && !state->adopted) {
         { const char *const argv[] = {"ip", "addr", "flush", "dev", state->netdev_name, NULL};
           run_cmd(argv); }
         { const char *const argv[] = {"ip", "link", "set", state->netdev_name, "down", NULL};

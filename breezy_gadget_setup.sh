@@ -51,8 +51,8 @@ UDC="${udcs[0]}"
 
 teardown() {
     local root="$1"
-    # Unbind first; ignore errors (kernel may reject if not bound).
-    printf '\n' > "${root}/UDC" 2>/dev/null || true
+    # Unbind first; ignore errors (kernel may reject if not bound or dir absent).
+    [[ -f "${root}/UDC" ]] && printf '\n' > "${root}/UDC" 2>/dev/null || true
     rm -f  "${root}/configs/c.1/rndis.usb0"   2>/dev/null || true
     rm -f  "${root}/os_desc/c.1"               2>/dev/null || true
     rmdir  "${root}/functions/rndis.usb0/os_desc/interface.rndis" 2>/dev/null || true
