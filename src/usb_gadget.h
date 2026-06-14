@@ -39,6 +39,7 @@ struct usb_gadget_config {
 /* Runtime state owned by the caller; zero-initialise before use */
 struct usb_gadget_state {
     bool active;
+    bool adopted;   /* true when gadget was pre-configured externally; teardown skips configfs */
     char gadget_root[256];                /* /sys/kernel/config/usb_gadget/<name> */
     char udc_name[USB_GADGET_NAME_MAX];
     char netdev_name[USB_GADGET_NETDEV_MAX];

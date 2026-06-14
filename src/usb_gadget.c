@@ -203,6 +203,40 @@ void usb_gadget_config_defaults(struct usb_gadget_config *cfg)
     (void)parse_unsigned_env("BREEZY_RNDIS_MTU", &cfg->rndis_mtu);
 }
 
+/*
+ * Check whether the gadget was already configured and bound by a privileged
+ * setup step (e.g. breezy-gadget.service).  Returns true and populates udc_out
+ * if the gadget directory exists and its UDC file contains a non-empty name.
+ */
+static bool gadget_already_active(const char *root,
+                                  char *udc_out, size_t udc_cap)
+{
+    char p[512];
+    snprintf(p, sizeof(p), "%s/UDC", root);
+
+    FILE *f = fopen(p, "r");
+    if (!f)
+        return false;
+
+    char buf[USB_GADGET_NAME_MAX] = "";
+    bool ok = (fgets(buf, sizeof(buf), f) != NULL);
+    fclose(f);
+
+    if (!ok)
+        return false;
+
+    /* Strip trailing newline */
+    size_t len = strlen(buf);
+    while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r'))
+        buf[--len] = '\0';
+
+    if (len == 0)
+        return false;
+
+    snprintf(udc_out, udc_cap, "%s", buf);
+    return true;
+}
+
 int usb_gadget_setup(const struct usb_gadget_config *cfg,
                      struct usb_gadget_state *state)
 {
@@ -211,6 +245,23 @@ int usb_gadget_setup(const struct usb_gadget_config *cfg,
     char p[512], q[512];
 
     memset(state, 0, sizeof(*state));
+
+    snprintf(root, sizeof(root), "%s/%s", GADGET_BASE, cfg->gadget_name);
+
+    /*
+     * If a privileged setup step (e.g. breezy-gadget.service) already built
+     * and bound the gadget, skip the configfs work entirely and just adopt the
+     * existing gadget.  This lets the renderer run as an unprivileged user:
+     * only the subsequent ip-link/ip-addr calls need CAP_NET_ADMIN.
+     */
+    if (gadget_already_active(root, udc, sizeof(udc))) {
+        fprintf(stderr, "usb_gadget: adopting existing gadget on UDC %s\n", udc);
+        snprintf(state->gadget_root, sizeof(state->gadget_root), "%s", root);
+        snprintf(state->udc_name,    sizeof(state->udc_name),    "%s", udc);
+        snprintf(state->netdev_name, sizeof(state->netdev_name), "%s", cfg->rndis_netdev);
+        state->adopted = true;
+        goto bring_up_net;
+    }
 
     /* Unload the legacy g_rndis_displaylink module if active so the RNDIS
      * configfs gadget can claim the UDC cleanly. */
@@ -223,8 +274,6 @@ int usb_gadget_setup(const struct usb_gadget_config *cfg,
         snprintf(udc, sizeof(udc), "%s", cfg->udc_name);
     else if (detect_udc(udc, sizeof(udc)) < 0)
         return -1;
-
-    snprintf(root, sizeof(root), "%s/%s", GADGET_BASE, cfg->gadget_name);
 
     /* Remove any leftover gadget before building the new one. */
     teardown_configfs(root);
@@ -338,6 +387,7 @@ int usb_gadget_setup(const struct usb_gadget_config *cfg,
 #undef WF
 #undef MD
 
+    bring_up_net:
     /* Bring up network interface. */
     { const char *const argv[] = {"ip", "addr", "flush", "dev", cfg->rndis_netdev, NULL};
       run_cmd(argv); }  /* best-effort; interface may not exist yet */
@@ -375,7 +425,8 @@ void usb_gadget_teardown(struct usb_gadget_state *state)
           run_cmd(argv); }
     }
 
-    if (state->gadget_root[0]) {
+    /* Leave configfs intact when the gadget was set up by an external service. */
+    if (state->gadget_root[0] && !state->adopted) {
         teardown_configfs(state->gadget_root);
     }
 

@@ -4,12 +4,18 @@ Documentation=https://github.com/wheaney/breezy-box
 # Soft dep: renderer starts and shows XR_DRIVER_DOWN overlay if xr-driver isn't up.
 Wants=xr-driver.service
 After=xr-driver.service
+# Ensure the system-level gadget service has run before we start.
+After=breezy-gadget.service
 PartOf=breezy.target
 
 [Service]
 ExecStart=%h/.local/bin/displaylink_kms_renderer
 Restart=on-failure
 RestartSec=2
+# CAP_NET_ADMIN is needed to bring up the usb0 interface after the system-level
+# gadget setup (breezy-gadget.service) has already configured configfs as root.
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
 
 [Install]
 WantedBy=breezy.target

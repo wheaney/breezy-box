@@ -193,6 +193,46 @@ EmitRouter=no"
 fi
 
 # ---------------------------------------------------------------------------
+section "breezy-gadget system service (OTG RNDIS setup as root)"
+
+# The gadget setup script runs as root so the renderer can run unprivileged.
+GADGET_SCRIPT_SRC="$SCRIPT_DIR/breezy_gadget_setup.sh"
+GADGET_SCRIPT_DST="/usr/local/lib/breezy-box/breezy_gadget_setup.sh"
+GADGET_SERVICE_SRC="$SCRIPT_DIR/systemd/system/breezy-gadget.service"
+GADGET_SERVICE_DST="/etc/systemd/system/breezy-gadget.service"
+
+if [[ ! -f "$GADGET_SCRIPT_SRC" ]]; then
+    echo "  warn: $GADGET_SCRIPT_SRC not found, skipping gadget service install"
+else
+    mkdir -p "$(dirname "$GADGET_SCRIPT_DST")"
+    if ! cmp -s "$GADGET_SCRIPT_SRC" "$GADGET_SCRIPT_DST" 2>/dev/null; then
+        install -m 0755 "$GADGET_SCRIPT_SRC" "$GADGET_SCRIPT_DST"
+        done_msg "installed $GADGET_SCRIPT_DST"
+    else
+        skip_msg "$GADGET_SCRIPT_DST already up to date"
+    fi
+
+    if ! cmp -s "$GADGET_SERVICE_SRC" "$GADGET_SERVICE_DST" 2>/dev/null; then
+        install -m 0644 "$GADGET_SERVICE_SRC" "$GADGET_SERVICE_DST"
+        done_msg "installed $GADGET_SERVICE_DST"
+    else
+        skip_msg "$GADGET_SERVICE_DST already up to date"
+    fi
+
+    systemctl daemon-reload
+    if systemctl is-enabled --quiet breezy-gadget.service 2>/dev/null; then
+        skip_msg "breezy-gadget.service already enabled"
+    else
+        systemctl enable breezy-gadget.service
+        done_msg "enabled breezy-gadget.service"
+    fi
+    # Start now so the gadget comes up without a reboot.
+    systemctl start breezy-gadget.service 2>/dev/null \
+        && done_msg "started breezy-gadget.service" \
+        || echo "  warn: breezy-gadget.service failed to start — check: journalctl -u breezy-gadget"
+fi
+
+# ---------------------------------------------------------------------------
 section "Getty autologin for $APP_USER on tty1"
 
 GETTY_DROPIN_DST="/etc/systemd/system/getty@tty1.service.d/autologin.conf"
@@ -334,6 +374,5 @@ echo "  3. Fetch vendored deps and build (run as $APP_USER):"
 echo "     cd /home/$APP_USER/breezy-box && make deps && make"
 echo "     cp displaylink_kms_renderer breezy_web ~/.local/bin/"
 echo "  4. Reboot — getty autologin on tty1 will start the user session and breezy.target."
-echo "  5. After building, set capabilities for gadget configfs access:"
-echo "     sudo setcap 'cap_sys_admin,cap_net_admin,cap_sys_module+ep' \\"
-echo "         /home/$APP_USER/.local/bin/displaylink_kms_renderer"
+echo "     breezy-gadget.service runs as root at boot and sets up the OTG gadget;"
+echo "     the renderer then runs unprivileged and adopts it."
