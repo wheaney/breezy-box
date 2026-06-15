@@ -24,6 +24,17 @@ void es_multiply(ESMatrix *result, const ESMatrix *a, const ESMatrix *b);
 void es_perspective(ESMatrix *result, float fovy, float aspect,
                     float nearZ, float farZ);
 
+/*
+ * Device-FOV perspective matching KWin CameraController.buildPerspectiveMatrix()
+ * and GNOME perspective().  Built from the fixed device vertical FOV half-tangent
+ * (heightUnitDistance / 2) and device aspect (width/height) — independent of the
+ * display distance, so distance only affects world placement, not the projection.
+ */
+void es_perspective_unit(ESMatrix *result,
+                         float fov_half_vertical_tangent,
+                         float device_aspect,
+                         float nearZ, float farZ);
+
 /* Model matrix: Y-rotation by angle, then translation (tx, ty, tz). */
 void es_display_model(ESMatrix *m, float angle, float tx, float ty, float tz);
 

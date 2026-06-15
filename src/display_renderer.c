@@ -104,6 +104,33 @@ void es_perspective(ESMatrix *result, float fovy, float aspect,
     es_frustum(result, -w, w, -h, h, nearZ, farZ);
 }
 
+/*
+ * Device-FOV perspective, mirroring KWin's CameraController.buildPerspectiveMatrix()
+ * and GNOME's perspective() exactly.  The frustum is derived from the fixed device
+ * vertical FOV half-tangent (heightUnitDistance / 2) and the device aspect ratio —
+ * NOT from the display distance.  Moving displays farther/closer changes only their
+ * world placement, never the projection, so distance is honored visually.
+ *
+ *   fov_half_vertical_tangent = diagonalToCrossFOVs(...).heightUnitDistance / 2
+ *   device_aspect             = device_width / device_height
+ */
+void es_perspective_unit(ESMatrix *result,
+                         float fov_half_vertical_tangent,
+                         float device_aspect,
+                         float nearZ, float farZ)
+{
+    float f  = 1.0f / fov_half_vertical_tangent;
+    float nf = 1.0f / (nearZ - farZ);
+
+    memset(result, 0, sizeof(*result));
+    /* Column-major m[col][row]; matches the KWin row-major literal transposed. */
+    result->m[0][0] = f / device_aspect;
+    result->m[1][1] = f;
+    result->m[2][2] = (farZ + nearZ) * nf;
+    result->m[2][3] = -1.0f;
+    result->m[3][2] = (2.0f * farZ * nearZ) * nf;
+}
+
 void es_display_model(ESMatrix *m, float angle, float tx, float ty, float tz)
 {
     float ca = cosf(angle);

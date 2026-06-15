@@ -119,7 +119,11 @@ struct kms_state {
 	bool     device_active;            /* glasses connected, data valid, version OK */
 	float    device_complete_dist_px;  /* completeScreenDistancePixels — arc radius in pixel units */
 	float    device_lens_dist_px;      /* lensDistancePixels — pivot-to-eye offset along -Z */
-	float    device_camera_fov;        /* vertical FOV in degrees for es_perspective */
+	/* Fixed device-FOV projection params (distance-independent), mirroring
+	 * KWin CameraController: fovHalfVerticalTangent = heightUnitDistance/2,
+	 * device_aspect = device_width/device_height. */
+	float    device_fov_half_v_tan;
+	float    device_aspect;
 	uint64_t last_config_poll;         /* realtime_ms() of last poll */
 
 	/* GSettings-driven display settings, polled alongside device config. */
@@ -329,7 +333,24 @@ static void kms_poll_device_config(struct kms_state *kms,
 		return;
 	}
 
-	kms->device_camera_fov       = fov_det.vertical_radians * (180.0f / KMS_MATH_PI);
+	/*
+	 * Projection is built from the FIXED device FOV (independent of display
+	 * distance), exactly like KWin CameraController.buildPerspectiveMatrix():
+	 *   fovHalfVerticalTangent = diagonalToCrossFOVs(...).heightUnitDistance / 2
+	 *   aspect                 = device_width / device_height
+	 * Using the raw heightUnitDistance here — NOT defaultDistanceVerticalRadians —
+	 * is what makes the "all displays" distance actually recede the monitors
+	 * instead of the camera zooming in to compensate.
+	 */
+	kms->device_aspect = (float)dev_w / (float)dev_h;
+	{
+		struct dp_fov_lengths fov_len;
+		if (dp_diagonal_to_cross_fovs(diag_rad, kms->device_aspect, &fov_len) != 0) {
+			kms->device_active = false;
+			return;
+		}
+		kms->device_fov_half_v_tan = fov_len.height_unit * 0.5f;
+	}
 	kms->device_complete_dist_px = fov_det.complete_dist_px;
 	kms->device_lens_dist_px     = fov_det.lens_distance_px;
 	kms->display_size            = dist_adj;
@@ -1031,9 +1052,13 @@ static void kms_render_frame(struct kms_state *kms,
 
 	/*
 	 * Glasses active with at least one imported display.
-	 * Use device-derived FOV and head-tracking view rotation.
+	 * Projection uses the fixed device FOV (half-vertical-tangent + device aspect),
+	 * matching KWin CameraController exactly and independent of display distance.
+	 * The framebuffer/mode aspect is intentionally NOT used here — the reference
+	 * always projects through the device's own aspect ratio.
 	 */
-	es_perspective(&proj, kms->device_camera_fov, screen_aspect, KMS_NEAR, KMS_FAR);
+	es_perspective_unit(&proj, kms->device_fov_half_v_tan, kms->device_aspect,
+	                    KMS_NEAR, KMS_FAR);
 
 	ESMatrix view, proj_view;
 	struct breezy_imu_pose pose;
@@ -1196,7 +1221,8 @@ static int kms_run(struct kms_state *kms, struct server_runtime *server)
 	kms->device_active            = false;
 	kms->device_complete_dist_px  = 0.0f;
 	kms->device_lens_dist_px      = 0.0f;
-	kms->device_camera_fov        = KMS_CAMERA_FOV;
+	kms->device_fov_half_v_tan    = tanf(KMS_CAMERA_FOV * 0.5f * (KMS_MATH_PI / 180.0f));
+	kms->device_aspect            = (float)kms->mode.hdisplay / (float)kms->mode.vdisplay;
 	kms->last_config_poll         = 0;
 	kms->display_size             = 1.0f;
 	kms->device_size_adj_w_px     = 0.0f;
