@@ -317,6 +317,17 @@ static void kms_adjust_monitor_positions(
 		out[i].width  = (uint32_t)((float)devs[i].width  * dist_adj_size);
 		out[i].height = (uint32_t)((float)devs[i].height * dist_adj_size);
 	}
+
+	/* In the auto-x case monitors are adjacent by definition.  Enforce cumulative
+	 * x so that out[i].x == out[i-1].x + out[i-1].width exactly — monitorWrap
+	 * relies on this: it caches 'end + spacing' at nextMonitorPixel = beginPx + width,
+	 * and the next monitor's beginPixel must hit that exact key.  Independent
+	 * float→int truncation of each position can leave a 1-pixel gap that causes
+	 * monitorWrap to pick the wrong cache entry and misapply spacing. */
+	if (all_x_zero) {
+		for (size_t i = 1; i < n; i++)
+			out[i].x = out[i - 1].x + (int32_t)out[i - 1].width;
+	}
 }
 
 /* Begin a per-monitor distance ease (defined below; used by the poll to retarget
