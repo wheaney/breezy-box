@@ -141,7 +141,8 @@ struct kms_state {
 	float    device_aspect;
 	uint64_t last_config_poll;         /* realtime_ms() of last poll */
 
-	/* GSettings-driven display settings, polled alongside device config. */
+	/* GSettings-driven display settings, updated via change signal. */
+	breezy_settings_handle        *settings_handle;
 	struct breezy_display_settings settings;
 
 	/* Derived size values, recomputed whenever device config or settings change. */
@@ -291,10 +292,10 @@ static void kms_adjust_monitor_positions(
 }
 
 /*
- * Poll device config and GSettings at most once per second.
- * Recomputes placements and meshes whenever either changes.
- * Mirrors the KWin plugin's diagonalToCrossFOVs + enable/disable logic, now
- * wiring in all display-relevant settings from com.xronlinux.BreezyDesktop.
+ * Poll device config at most once per second and pick up any GSettings changes
+ * that arrived since the last call.  Recomputes placements and meshes whenever
+ * either changes.  Mirrors the KWin plugin's diagonalToCrossFOVs + enable/disable
+ * logic.
  */
 static void kms_poll_device_config(struct kms_state *kms,
                                     const struct server_runtime *server)
@@ -306,8 +307,7 @@ static void kms_poll_device_config(struct kms_state *kms,
 		return;
 	kms->last_config_poll = now;
 
-	/* Re-read GSettings alongside the device config poll. */
-	breezy_settings_poll(&kms->settings, now);
+	breezy_settings_consume_if_changed(kms->settings_handle, &kms->settings);
 
 	struct breezy_imu_device_config cfg;
 	struct breezy_imu_pose pose;
@@ -931,6 +931,9 @@ static void renderer_destroy(struct kms_state *kms)
 	kms->egl_surface = EGL_NO_SURFACE;
 	kms->gbm_surface = NULL;
 	kms->gbm_dev     = NULL;
+
+	breezy_settings_stop(kms->settings_handle);
+	kms->settings_handle = NULL;
 }
 
 /* ----------------------------------------------------------------
@@ -1495,7 +1498,11 @@ static int kms_run(struct kms_state *kms, struct server_runtime *server)
 		kms->monitor_distance[mi] = 1.0f;
 		kms->zoom_ease_active[mi] = false;
 	}
-	breezy_settings_init_defaults(&kms->settings);
+	kms->settings_handle = breezy_settings_start(&kms->settings);
+	if (!kms->settings_handle) {
+		fprintf(stderr, "kms: failed to start settings watcher\n");
+		return -1;
+	}
 	/* Prime the overlay texture before the first frame. */
 	{
 		char msg[BS_MSG_MAX];

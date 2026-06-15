@@ -33,21 +33,33 @@ struct breezy_display_settings {
 
     /* Follow */
     double  follow_threshold;           /* degrees */
-
-    uint64_t last_poll_ms;
 };
 
-/* Fill *s with the gsettings schema defaults. */
-void breezy_settings_init_defaults(struct breezy_display_settings *s);
-
-/* Read all relevant keys from GSettings into *s.  Silently skips on error. */
-void breezy_settings_read(struct breezy_display_settings *s);
+/*
+ * Opaque handle returned by breezy_settings_start().
+ * Owns the GLib main loop thread and GSettings change subscription.
+ */
+typedef struct breezy_settings_handle breezy_settings_handle;
 
 /*
- * Re-read settings at most once per second.  Pass the current realtime
- * millisecond timestamp obtained from the same clock used by the caller.
+ * Start the background GLib thread and subscribe to GSettings changes.
+ * Populates *initial with the current values before returning.
+ * Returns NULL on failure.
  */
-void breezy_settings_poll(struct breezy_display_settings *s, uint64_t now_ms);
+breezy_settings_handle *breezy_settings_start(struct breezy_display_settings *initial);
+
+/*
+ * If any GSettings key changed since the last call, copy the latest values
+ * into *out and return true.  Otherwise return false and leave *out untouched.
+ */
+bool breezy_settings_consume_if_changed(breezy_settings_handle *h,
+                                        struct breezy_display_settings *out);
+
+/*
+ * Stop the background thread and free all resources.
+ * Safe to call with NULL.
+ */
+void breezy_settings_stop(breezy_settings_handle *h);
 
 /* max(display_distance, toggle_distance_start, toggle_distance_end) */
 double breezy_settings_display_distance_default(const struct breezy_display_settings *s);
