@@ -103,9 +103,12 @@ struct kms_display_tex {
 struct kms_cfg_sig {
 	uint32_t dev_w, dev_h;
 	float    diag_rad, lens_ratio, dist_default, dist_adj, monitor_spacing;
-	bool     curved;
+	float    viewport_offset_x, viewport_offset_y;
+	bool     curved, headset_center;
 	char     scheme[32];
 	size_t   mon_count;
+	/* RAW monitor config (unscaled). Layout identity for focus reset is based on
+	 * this, so display-size (which only changes dist_adj) never resets focus. */
 	struct dp_monitor_info mons[MAX_USBIP_DEVICES];
 };
 
@@ -291,6 +294,12 @@ static void kms_adjust_monitor_positions(
 	}
 }
 
+/* Begin a per-monitor distance ease (defined below; used by the poll to retarget
+ * a focused display when the focused-distance setting changes). */
+static void kms_begin_zoom_ease(struct kms_state *kms, size_t i,
+                                float target_distance,
+                                bool needs_sequence_delay, uint64_t now_ms);
+
 /*
  * Poll device config at most once per second, or immediately when settings_dirty
  * is set (a GSettings change just arrived).  Recomputes placements and meshes
@@ -400,21 +409,39 @@ static void kms_poll_device_config(struct kms_state *kms,
 	kms->zoom_on_focus         = kms->zoom_focused_distance < dist_default;
 
 	/*
-	 * Rebuild placements/meshes — and reset focus state — only when something
-	 * layout-relevant actually changed.  Doing this unconditionally each poll
-	 * would snap a focused, zoomed-in display back out once per second and then
-	 * re-ease it in (an endless ease-in loop).
+	 * If a display is focused (or easing) and the focused-distance setting
+	 * changed, retarget it to the new value instead of waiting for it to lose
+	 * and regain focus.  Mirrors the references rebinding monitorDistance when
+	 * focusedDisplayDistance changes.
+	 */
+	if (kms->zoom_on_focus && kms->focused_monitor_index >= 0) {
+		size_t fi = (size_t)kms->focused_monitor_index;
+		float want = kms->zoom_focused_distance;
+		float cur_target = kms->zoom_ease_active[fi] ? kms->zoom_ease_target[fi]
+		                                             : kms->monitor_distance[fi];
+		if (cur_target != want)
+			kms_begin_zoom_ease(kms, fi, want, false, kms_realtime_ms());
+	}
+
+	/*
+	 * Rebuild placements/meshes only when geometry-relevant inputs change.  The
+	 * focus index and eased distances are preserved across rebuilds unless the
+	 * monitor *layout* itself changes (see layout_changed below) — otherwise a
+	 * benign setting like display-size would snap a focused display back out.
 	 */
 	struct kms_cfg_sig sig;
 	memset(&sig, 0, sizeof sig);
-	sig.dev_w           = dev_w;
-	sig.dev_h           = dev_h;
-	sig.diag_rad        = diag_rad;
-	sig.lens_ratio      = lens_ratio;
-	sig.dist_default    = dist_default;
-	sig.dist_adj        = dist_adj;
-	sig.monitor_spacing = monitor_spacing;
-	sig.curved          = s->curved_display;
+	sig.dev_w             = dev_w;
+	sig.dev_h             = dev_h;
+	sig.diag_rad          = diag_rad;
+	sig.lens_ratio        = lens_ratio;
+	sig.dist_default      = dist_default;
+	sig.dist_adj          = dist_adj;
+	sig.monitor_spacing   = monitor_spacing;
+	sig.viewport_offset_x = (float)s->viewport_offset_x;
+	sig.viewport_offset_y = (float)s->viewport_offset_y;
+	sig.curved            = s->curved_display;
+	sig.headset_center    = s->headset_display_as_viewport_center;
 	/* sig is fully zeroed above, so a bounded copy keeps it NUL-terminated. */
 	size_t sch_len = strlen(resolved_scheme);
 	if (sch_len >= sizeof(sig.scheme))
@@ -422,11 +449,23 @@ static void kms_poll_device_config(struct kms_state *kms,
 	memcpy(sig.scheme, resolved_scheme, sch_len);
 	sig.mon_count = opts->device_count;
 	for (size_t i = 0u; i < opts->device_count && i < MAX_USBIP_DEVICES; i++)
-		sig.mons[i] = adj_monitors[i];
+		sig.mons[i] = raw_monitors[i];
 
 	if (kms->has_cfg_sig && kms->placements_computed && kms->meshes_computed &&
 	    memcmp(&sig, &kms->last_cfg_sig, sizeof sig) == 0)
-		return;  /* nothing layout-relevant changed; keep focus + eased distances */
+		return;  /* nothing geometry-relevant changed; keep focus + eased distances */
+
+	/*
+	 * A layout change (different monitor count or raw rectangles) invalidates the
+	 * focus index and per-monitor distances; a pure geometry-param change
+	 * (display-size, distance, FOV, spacing, viewport offset) does not — keep the
+	 * focused display zoomed.  Compares RAW monitors so display-size, which only
+	 * scales dist_adj, never counts as a layout change.
+	 */
+	bool layout_changed = !kms->has_cfg_sig ||
+	    kms->last_cfg_sig.mon_count != sig.mon_count ||
+	    memcmp(kms->last_cfg_sig.mons, sig.mons,
+	           sig.mon_count * sizeof(sig.mons[0])) != 0;
 
 	kms->last_cfg_sig    = sig;
 	kms->has_cfg_sig     = true;
@@ -490,12 +529,19 @@ static void kms_poll_device_config(struct kms_state *kms,
 		kms->focus_dist_default = dist_default;
 		kms->focus_curved       = s->curved_display;
 
-		/* Layout changed: reset focus + snap per-monitor distance to resting. */
-		kms->focused_monitor_index = -1;
-		kms->last_focus_check_ms   = 0;
-		for (size_t mi = 0u; mi < MAX_USBIP_DEVICES; mi++) {
-			kms->monitor_distance[mi]   = kms->zoom_all_distance;
-			kms->zoom_ease_active[mi]   = false;
+		/*
+		 * Only a real layout change invalidates focus — reset it and snap
+		 * distances to resting.  For a pure geometry-param change (e.g.
+		 * display-size) keep the focused display and its eased distance so it
+		 * stays zoomed in with the rebuilt geometry instead of re-easing.
+		 */
+		if (layout_changed) {
+			kms->focused_monitor_index = -1;
+			kms->last_focus_check_ms   = 0;
+			for (size_t mi = 0u; mi < MAX_USBIP_DEVICES; mi++) {
+				kms->monitor_distance[mi] = kms->zoom_all_distance;
+				kms->zoom_ease_active[mi] = false;
+			}
 		}
 
 		/* Pass the resolved scheme string directly so generateMeshVertices() in the
