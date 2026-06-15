@@ -258,10 +258,28 @@ static void kms_adjust_monitor_positions(
 	float adj_dev_w = (float)dev_w * dist_adj_size;
 	float adj_dev_h = (float)dev_h * dist_adj_size;
 
+	/* Mirror dp_compute_placements auto-x: if all raw x=0 and n>1, assign
+	 * monitors left-to-right cumulatively so centering and offset operate on
+	 * the correct spread layout rather than stacking all monitors at x=0. */
+	bool all_x_zero = (n > 1u);
+	for (size_t i = 0; i < n && all_x_zero; i++) {
+		if (opts->devices[i].x != 0)
+			all_x_zero = false;
+	}
+	int32_t raw_x[MAX_USBIP_DEVICES];
+	if (all_x_zero) {
+		raw_x[0] = 0;
+		for (size_t i = 1; i < n; i++)
+			raw_x[i] = raw_x[i - 1] + (int32_t)opts->devices[i - 1].decode_width;
+	} else {
+		for (size_t i = 0; i < n; i++)
+			raw_x[i] = opts->devices[i].x;
+	}
+
 	/* Size-adjusted positions. */
 	float ax[MAX_USBIP_DEVICES], ay[MAX_USBIP_DEVICES];
 	for (size_t i = 0; i < n; i++) {
-		ax[i] = (float)opts->devices[i].x * dist_adj_size + size_ox;
+		ax[i] = (float)raw_x[i] * dist_adj_size + size_ox;
 		ay[i] = (float)opts->devices[i].y * dist_adj_size + size_oy;
 	}
 
