@@ -72,8 +72,8 @@ static void install_signal_handlers(void)
 
 #define KMS_ARC_SPAN   1.047197551f   /* 60° fallback arc span when JS placement unavailable */
 #define KMS_CAMERA_FOV 60.0f          /* placeholder vertical FOV (degrees) when device inactive */
-#define KMS_NEAR       1.0f           /* clip planes in pixel units, matching KWin/GNOME */
-#define KMS_FAR        10000.0f
+#define KMS_NEAR       10.0f          /* clip planes in pixel units, matching KWin's single-scene camera */
+#define KMS_FAR        10000.0f       /* near=10 (not 1) keeps 16-bit depth precise enough to sort displays */
 #define KMS_MATH_PI    3.14159265358979323846f
 #define KMS_FOCUS_CHECK_MS 500u       /* gaze focus poll cadence (KWin uses a 500ms Timer) */
 #define MAX_DRM_DEVICES 64
@@ -754,6 +754,9 @@ static int kms_init_gbm_egl(struct kms_state *kms)
 		EGL_GREEN_SIZE,      1,
 		EGL_BLUE_SIZE,       1,
 		EGL_ALPHA_SIZE,      0,
+		/* Depth buffer so overlapping display quads sort by distance (the
+		 * nearer/zoomed display wins) instead of by draw order. */
+		EGL_DEPTH_SIZE,      16,
 		EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
 		EGL_NONE
 	};
@@ -1249,7 +1252,8 @@ static void kms_render_frame(struct kms_state *kms,
 
 	glViewport(0, 0, (GLsizei)kms->mode.hdisplay, (GLsizei)kms->mode.vdisplay);
 	glClearColor(0.04f, 0.04f, 0.08f, 1.0f);
-	glClear(GL_COLOR_BUFFER_BIT);
+	glClearDepthf(1.0f);
+	glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
 	enum breezy_state_mode ovstate = kms->state->mode;
 
@@ -1316,6 +1320,15 @@ static void kms_render_frame(struct kms_state *kms,
 		kms_update_focus(kms, now_ms);
 		kms_step_zoom_eases(kms, now_ms);
 	}
+
+	/*
+	 * Display meshes are opaque: depth-test so a nearer (e.g. focused/zoomed-in)
+	 * display occludes a farther one regardless of draw order.  The blended
+	 * overlay strip below re-disables depth before compositing.
+	 */
+	glEnable(GL_DEPTH_TEST);
+	glDepthFunc(GL_LEQUAL);
+	glDepthMask(GL_TRUE);
 
 	/*
 	 * Only render slots that have an active USB/IP import.
@@ -1447,6 +1460,8 @@ static void kms_render_frame(struct kms_state *kms,
 		}
 		es_multiply(&mvp, &model, &proj_view);
 
+		/* HUD label: composite over the scene without depth occlusion. */
+		glDisable(GL_DEPTH_TEST);
 		glEnable(GL_BLEND);
 		glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 		display_renderer_draw_quad_alpha(&kms->dr, &mvp,
@@ -1454,6 +1469,9 @@ static void kms_render_frame(struct kms_state *kms,
 						 ot_w_half, ot_h_half);
 		glDisable(GL_BLEND);
 	}
+
+	/* Leave depth test disabled for the next frame's overlay-only path. */
+	glDisable(GL_DEPTH_TEST);
 }
 
 /* ----------------------------------------------------------------
