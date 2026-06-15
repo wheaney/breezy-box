@@ -292,18 +292,21 @@ static void kms_adjust_monitor_positions(
 }
 
 /*
- * Poll device config at most once per second and pick up any GSettings changes
- * that arrived since the last call.  Recomputes placements and meshes whenever
- * either changes.  Mirrors the KWin plugin's diagonalToCrossFOVs + enable/disable
- * logic.
+ * Poll device config at most once per second, or immediately when settings_dirty
+ * is set (a GSettings change just arrived).  Recomputes placements and meshes
+ * whenever either changes.  The rebuild below is guarded by a layout signature,
+ * so running this every frame on a settings change only does real work when the
+ * new settings actually move the geometry.  Mirrors the KWin plugin's
+ * diagonalToCrossFOVs + enable/disable logic.
  */
 static void kms_poll_device_config(struct kms_state *kms,
-                                    const struct server_runtime *server)
+                                    const struct server_runtime *server,
+                                    bool settings_dirty)
 {
 	const struct server_options *opts = &server->opts;
 
 	uint64_t now = kms_realtime_ms();
-	if (now - kms->last_config_poll < 1000u)
+	if (!settings_dirty && now - kms->last_config_poll < 1000u)
 		return;
 	kms->last_config_poll = now;
 
@@ -1555,8 +1558,9 @@ static int kms_run(struct kms_state *kms, struct server_runtime *server)
 		struct drm_fb *next_fb;
 		int ret;
 
-		kms_poll_device_config(kms, server);
-		breezy_settings_consume_if_changed(kms->settings_handle, &kms->settings);
+		bool settings_dirty =
+		    breezy_settings_consume_if_changed(kms->settings_handle, &kms->settings);
+		kms_poll_device_config(kms, server, settings_dirty);
 
 		/* Honour framerate_cap: skip this iteration if not enough time has passed. */
 		if (kms->settings.framerate_cap > 0.0) {
