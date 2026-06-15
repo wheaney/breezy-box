@@ -82,8 +82,8 @@ $(KMS_RENDERER_TARGET): $(KMS_COMPOSITOR_SOURCES) $(ZEROKVM_LIB) $(JS_BUNDLE) $(
 		-o $@ $(KMS_COMPOSITOR_SOURCES) $(QUICKJS_OBJS) \
 		$(DRM_LIBS) $(GBM_LIBS) $(EGL_LIBS) $(GLES2_LIBS) $(JSON_C_LIBS) $(GIO_LIBS) -lm $(LDFLAGS) $(LDLIBS)
 
-$(JS_BUNDLE): $(JS_SHARED_DIR)/math.js $(JS_SHARED_DIR)/displayPlacement.js $(JS_SHARED_DIR)/smoothFollow.js tools/gen_js_bundle.py
-	$(PYTHON3) tools/gen_js_bundle.py $(JS_SHARED_DIR)/math.js $(JS_SHARED_DIR)/displayPlacement.js $(JS_SHARED_DIR)/smoothFollow.js > $(SRC_DIR)/display_placement_bundle.h.tmp
+$(JS_BUNDLE): $(JS_SHARED_DIR)/math.js $(JS_SHARED_DIR)/displayPlacement.js $(JS_SHARED_DIR)/smoothFollow.js $(JS_SHARED_DIR)/zoomOnFocus.js tools/gen_js_bundle.py
+	$(PYTHON3) tools/gen_js_bundle.py $(JS_SHARED_DIR)/math.js $(JS_SHARED_DIR)/displayPlacement.js $(JS_SHARED_DIR)/smoothFollow.js $(JS_SHARED_DIR)/zoomOnFocus.js > $(SRC_DIR)/display_placement_bundle.h.tmp
 	@if cmp -s $(SRC_DIR)/display_placement_bundle.h.tmp $@ 2>/dev/null; then rm -f $(SRC_DIR)/display_placement_bundle.h.tmp; else mv $(SRC_DIR)/display_placement_bundle.h.tmp $@; fi
 
 deps: $(MONGOOSE_H) $(MONGOOSE_C)

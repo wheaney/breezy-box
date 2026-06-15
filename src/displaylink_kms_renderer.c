@@ -75,6 +75,7 @@ static void install_signal_handlers(void)
 #define KMS_NEAR       1.0f           /* clip planes in pixel units, matching KWin/GNOME */
 #define KMS_FAR        10000.0f
 #define KMS_MATH_PI    3.14159265358979323846f
+#define KMS_FOCUS_CHECK_MS 500u       /* gaze focus poll cadence (KWin uses a 500ms Timer) */
 #define MAX_DRM_DEVICES 64
 
 struct drm_fb {
@@ -137,6 +138,31 @@ struct kms_state {
 	/* Pre-computed curved-surface vertex meshes, rebuilt on config change. */
 	struct display_mesh meshes[MAX_USBIP_DEVICES];
 	bool     meshes_computed;
+
+	/* Zoom-on-focus state.  display_distance_default is the resting ("all
+	 * displays" / farther) multiplier used when placements were computed;
+	 * focused_distance is the nearer multiplier a focused display eases to. */
+	float    zoom_all_distance;        /* = display_distance_default */
+	float    zoom_focused_distance;    /* nearer toggle endpoint */
+	bool     zoom_on_focus;            /* focused < all */
+	int      focused_monitor_index;    /* gaze-focused slot, -1 = none */
+	uint64_t last_focus_check_ms;      /* throttle for dp_find_focused_monitor */
+	/* Per-monitor eased distance multiplier + active transition bookkeeping. */
+	float    monitor_distance[MAX_USBIP_DEVICES];
+	float    zoom_ease_start[MAX_USBIP_DEVICES];
+	float    zoom_ease_target[MAX_USBIP_DEVICES];
+	uint64_t zoom_ease_begin_ms[MAX_USBIP_DEVICES];
+	bool     zoom_ease_active[MAX_USBIP_DEVICES];
+	bool     zoom_ease_seq_delay[MAX_USBIP_DEVICES];
+
+	/* Inputs captured at placement time so the periodic focus check can call
+	 * dp_find_focused_monitor() without recomputing them every frame. */
+	struct dp_monitor_info focus_monitors[MAX_USBIP_DEVICES];
+	size_t   focus_monitor_count;
+	char     focus_scheme[32];
+	uint32_t focus_dev_w, focus_dev_h;
+	float    focus_diag_rad, focus_lens_ratio, focus_dist_default;
+	bool     focus_curved;
 
 	/* Overlay: GL texture for connection-status messages; text from breezy_state. */
 	struct overlay_text overlay_tex;
@@ -378,6 +404,41 @@ static void kms_poll_device_config(struct kms_state *kms,
 	                           resolved_scheme, s->curved_display, monitor_spacing,
 	                           kms->placements) == 0) {
 		kms->placements_computed = true;
+
+		/*
+		 * Zoom-on-focus distances.  The resting ("all displays" / farther)
+		 * multiplier is display_distance_default, which is also what placements
+		 * were computed at; the focused (nearer) multiplier is the closer toggle
+		 * endpoint.  Zoom is active whenever they differ.  Mirrors GNOME's
+		 * display_distance_default vs display_distance split.
+		 */
+		float toggle_lo = (float)((s->toggle_display_distance_start < s->toggle_display_distance_end)
+		                          ? s->toggle_display_distance_start
+		                          : s->toggle_display_distance_end);
+		kms->zoom_all_distance     = dist_default;
+		kms->zoom_focused_distance = toggle_lo;
+		kms->zoom_on_focus         = toggle_lo < dist_default;
+
+		/* Capture focus-check inputs for the periodic gaze test. */
+		kms->focus_monitor_count = opts->device_count;
+		for (size_t mi = 0u; mi < opts->device_count && mi < MAX_USBIP_DEVICES; mi++)
+			kms->focus_monitors[mi] = adj_monitors[mi];
+		strncpy(kms->focus_scheme, resolved_scheme, sizeof(kms->focus_scheme) - 1);
+		kms->focus_scheme[sizeof(kms->focus_scheme) - 1] = '\0';
+		kms->focus_dev_w        = dev_w;
+		kms->focus_dev_h        = dev_h;
+		kms->focus_diag_rad     = diag_rad;
+		kms->focus_lens_ratio   = lens_ratio;
+		kms->focus_dist_default = dist_default;
+		kms->focus_curved       = s->curved_display;
+
+		/* Reset focus + per-monitor distance to the resting state on reconfig. */
+		kms->focused_monitor_index = -1;
+		kms->last_focus_check_ms   = 0;
+		for (size_t mi = 0u; mi < MAX_USBIP_DEVICES; mi++) {
+			kms->monitor_distance[mi]   = kms->zoom_all_distance;
+			kms->zoom_ease_active[mi]   = false;
+		}
 
 		/* Pass the resolved scheme string directly so generateMeshVertices() in the
 		 * shared JS derives horizontalWrap and verticalWrap independently — matching
@@ -1007,6 +1068,102 @@ static void kms_update_display_textures(struct kms_state *kms,
 }
 
 /* ----------------------------------------------------------------
+ * Zoom-on-focus: periodic gaze focus check + per-frame distance easing
+ * ---------------------------------------------------------------- */
+
+/*
+ * Begin a distance transition for a monitor toward target_distance.
+ * needs_sequence_delay defers a focus-gaining ease-in until the previously
+ * focused display has eased out (the 150ms + 50ms lead-in), matching the
+ * sequenced animation in the references.
+ */
+static void kms_begin_zoom_ease(struct kms_state *kms, size_t i,
+                                float target_distance,
+                                bool needs_sequence_delay, uint64_t now_ms)
+{
+	if (i >= MAX_USBIP_DEVICES)
+		return;
+	kms->zoom_ease_start[i]     = kms->monitor_distance[i];
+	kms->zoom_ease_target[i]    = target_distance;
+	kms->zoom_ease_begin_ms[i]  = now_ms;
+	kms->zoom_ease_seq_delay[i] = needs_sequence_delay;
+	kms->zoom_ease_active[i]    = (kms->monitor_distance[i] != target_distance) || needs_sequence_delay;
+}
+
+/*
+ * Run the periodic gaze focus check (throttled to KMS_FOCUS_CHECK_MS).  When the
+ * focused monitor changes, kick off the matching ease-out / ease-in transitions.
+ */
+static void kms_update_focus(struct kms_state *kms, uint64_t now_ms)
+{
+	if (!kms->zoom_on_focus || !kms->placements_computed)
+		return;
+	if (now_ms - kms->last_focus_check_ms < KMS_FOCUS_CHECK_MS)
+		return;
+	kms->last_focus_check_ms = now_ms;
+
+	struct breezy_imu_pose pose;
+	if (!breezy_imu_try_get_pose(&pose))
+		return;
+
+	float focused_ratio = (kms->zoom_all_distance > 0.0f)
+	                    ? kms->zoom_focused_distance / kms->zoom_all_distance
+	                    : 1.0f;
+
+	int new_focus = dp_find_focused_monitor(
+	    kms->placements, kms->focus_monitors, kms->focus_monitor_count,
+	    pose.quat_w, pose.quat_x, pose.quat_y, pose.quat_z,
+	    pose.pos_x, pose.pos_y, pose.pos_z,
+	    kms->focused_monitor_index, focused_ratio,
+	    kms->focus_dev_w, kms->focus_dev_h, kms->focus_diag_rad,
+	    kms->focus_lens_ratio, kms->focus_dist_default,
+	    kms->device_size_adj_w_px, kms->device_size_adj_h_px,
+	    kms->focus_scheme, kms->focus_curved);
+
+	if (new_focus == kms->focused_monitor_index)
+		return;
+
+	int old_focus = kms->focused_monitor_index;
+
+	/* Ease the outgoing display back out to the resting distance. */
+	if (old_focus >= 0 && (size_t)old_focus < MAX_USBIP_DEVICES)
+		kms_begin_zoom_ease(kms, (size_t)old_focus, kms->zoom_all_distance, false, now_ms);
+
+	/* Ease the incoming display in; if another display had focus, wait for its
+	 * ease-out + pause first (the doubled-timeline / sequenced behaviour). */
+	if (new_focus >= 0 && (size_t)new_focus < MAX_USBIP_DEVICES)
+		kms_begin_zoom_ease(kms, (size_t)new_focus, kms->zoom_focused_distance,
+		                    old_focus >= 0, now_ms);
+
+	kms->focused_monitor_index = new_focus;
+}
+
+/* Advance all active distance eases toward their targets for this frame. */
+static void kms_step_zoom_eases(struct kms_state *kms, uint64_t now_ms)
+{
+	for (size_t i = 0u; i < MAX_USBIP_DEVICES; i++) {
+		if (!kms->zoom_ease_active[i])
+			continue;
+		bool gaining = kms->zoom_ease_target[i] < kms->zoom_ease_start[i];
+		float dist = kms->monitor_distance[i];
+		bool done = true;
+		if (dp_ease_distance(kms->zoom_ease_start[i], kms->zoom_ease_target[i],
+		                     (float)(now_ms - kms->zoom_ease_begin_ms[i]),
+		                     gaining, kms->zoom_ease_seq_delay[i],
+		                     &dist, &done) != 0) {
+			/* On error, snap to target so we never stall mid-transition. */
+			dist = kms->zoom_ease_target[i];
+			done = true;
+		}
+		kms->monitor_distance[i] = dist;
+		if (done) {
+			kms->monitor_distance[i] = kms->zoom_ease_target[i];
+			kms->zoom_ease_active[i] = false;
+		}
+	}
+}
+
+/* ----------------------------------------------------------------
  * Frame rendering
  * ---------------------------------------------------------------- */
 
@@ -1077,6 +1234,16 @@ static void kms_render_frame(struct kms_state *kms,
 	es_multiply(&proj_view, &view, &proj);
 
 	/*
+	 * Zoom-on-focus: poll gaze focus (self-throttled to KMS_FOCUS_CHECK_MS) and
+	 * advance the per-monitor distance eases before placing the display meshes.
+	 */
+	{
+		uint64_t now_ms = kms_realtime_ms();
+		kms_update_focus(kms, now_ms);
+		kms_step_zoom_eases(kms, now_ms);
+	}
+
+	/*
 	 * Only render slots that have an active USB/IP import.
 	 * Build a compact index array so the fallback arc spacing and the
 	 * overlay Y position are based on the visible count only.
@@ -1117,13 +1284,33 @@ static void kms_render_frame(struct kms_state *kms,
 		if (kms->meshes_computed) {
 			/*
 			 * Mesh vertices are pre-computed in GL world space relative to the
-			 * rotation origin (centerNoRotate).  Apply Y-rotation only — no
-			 * translation — so the arc curvature baked into the vertices is
-			 * preserved.  Flat displays produce a 1-segment mesh (4 vertices)
-			 * with no separate code path needed.
+			 * rotation origin (centerNoRotate).  Apply Y-rotation only — the
+			 * arc curvature baked into the vertices is preserved.  Flat displays
+			 * produce a 1-segment mesh (4 vertices) with no separate path.
+			 *
+			 * Zoom-on-focus: scale the monitor's centre position by
+			 * s = monitor_distance / zoom_all_distance (matching KWin's
+			 * centerNoRotate.times(monitorDistance/allDisplaysDistance)).  The mesh
+			 * already bakes centerNoRotate, so we add the delta (s-1)·R·cn as a
+			 * post-rotation world translation, moving the centre without rescaling
+			 * the display's own size or curvature.
 			 */
 			const struct display_mesh *mesh = &kms->meshes[i];
-			es_display_model(&model, kms->placements[i].angle, 0.0f, 0.0f, 0.0f);
+			float ang = kms->placements[i].angle;
+			float s   = (kms->zoom_all_distance > 0.0f)
+			          ? kms->monitor_distance[i] / kms->zoom_all_distance
+			          : 1.0f;
+			float ca  = cosf(ang);
+			float sa  = sinf(ang);
+			float cnx = kms->placements[i].cnx;
+			float cnz = kms->placements[i].cnz;
+			/* R(angle)·centerNoRotate in GL space (Y-rotation only). */
+			float rcn_x = ca * cnx + sa * cnz;
+			float rcn_z = -sa * cnx + ca * cnz;
+			float tdx = (s - 1.0f) * rcn_x;
+			float tdy = (s - 1.0f) * kms->placements[i].cny;
+			float tdz = (s - 1.0f) * rcn_z;
+			es_display_model(&model, ang, tdx, tdy, tdz);
 			es_multiply(&mvp, &model, &proj_view);
 			display_renderer_draw_mesh(&kms->dr, &mvp, tex,
 			                          (const float *)mesh->verts, mesh->vert_count);
@@ -1228,6 +1415,15 @@ static int kms_run(struct kms_state *kms, struct server_runtime *server)
 	kms->device_size_adj_w_px     = 0.0f;
 	kms->device_size_adj_h_px     = 0.0f;
 	kms->meshes_computed          = false;
+	kms->zoom_all_distance        = 1.0f;
+	kms->zoom_focused_distance    = 1.0f;
+	kms->zoom_on_focus            = false;
+	kms->focused_monitor_index    = -1;
+	kms->last_focus_check_ms      = 0;
+	for (size_t mi = 0u; mi < MAX_USBIP_DEVICES; mi++) {
+		kms->monitor_distance[mi] = 1.0f;
+		kms->zoom_ease_active[mi] = false;
+	}
 	breezy_settings_init_defaults(&kms->settings);
 	/* Prime the overlay texture before the first frame. */
 	{

@@ -68,6 +68,7 @@ struct display_mesh {
  *   default_h/v_radians defaultDistanceHorizontal/VerticalRadians from fovDetails
  *   dev_w / dev_h       fovDetails.widthPixels / heightPixels
  *   size_adj_w/h        fovDetails.sizeAdjustedWidth/HeightPixels
+ */
 
 /* ----------------------------------------------------------------
  * Textured-quad renderer

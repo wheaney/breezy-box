@@ -16,6 +16,9 @@ struct dp_placement {
     float tx, ty, tz;    /* GL centerLook position: (-west, up, -north) */
     float cnx, cny, cnz; /* GL centerNoRotate: same axes, used as mesh base before Y-rotation */
     float angle;         /* Y-axis rotation in radians (rotationAngleRadians.y) */
+    /* NWU centerLook [north, west, up] as returned by monitorsToPlacements,
+     * kept for dp_find_focused_monitor (which works in the driver's NWU frame). */
+    float ln_north, ln_west, ln_up;
 };
 
 /*
@@ -162,3 +165,46 @@ int dp_compute_placements(const struct dp_monitor_info *monitors,
                           bool curved_display,
                           float monitor_spacing,
                           struct dp_placement *placements);
+
+/*
+ * Find which monitor the head pose is looking at, via the shared
+ * findFocusedMonitor() in displayPlacement.js.
+ *
+ * The pose quaternion (qw,qx,qy,qz) and position (east,up,south) are in the
+ * driver's EUS frame; they are converted to NWU internally with the shared
+ * eusToNwu* helpers.  placements must carry the NWU centerLook populated by
+ * dp_compute_placements; monitors are the same size-adjusted infos used there.
+ *
+ *   current_focused_index     – previously focused index (-1 if none)
+ *   focused_monitor_distance   – display_distance / display_distance_default
+ *                                (< 1 when a focused display is zoomed in)
+ *
+ * Returns the focused monitor index, -1 if none, or -1 on error.
+ */
+int dp_find_focused_monitor(const struct dp_placement *placements,
+                            const struct dp_monitor_info *monitors,
+                            size_t n,
+                            float qw, float qx, float qy, float qz,
+                            float pos_east, float pos_up, float pos_south,
+                            int current_focused_index,
+                            float focused_monitor_distance,
+                            uint32_t device_width,
+                            uint32_t device_height,
+                            float diagonal_fov_rad,
+                            float lens_distance_ratio,
+                            float display_distance_default,
+                            float size_adj_width,
+                            float size_adj_height,
+                            const char *wrapping_scheme,
+                            bool curved_display);
+
+/*
+ * Ease a display's distance multiplier toward its target, via the shared
+ * easeDistance() in zoomOnFocus.js.  Returns 0 on success, -1 on error;
+ * *out_distance receives the eased multiplier and *out_done whether the
+ * transition has completed (may be NULL).
+ */
+int dp_ease_distance(float start_distance, float target_distance,
+                     float elapsed_ms, bool gaining_focus,
+                     bool needs_sequence_delay,
+                     float *out_distance, bool *out_done);

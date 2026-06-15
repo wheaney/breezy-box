@@ -22,6 +22,10 @@ static JSValue    g_fn_monitors_to_placements;
 static JSValue    g_fn_diagonal_to_cross_fovs;
 static JSValue    g_fn_build_fov_details;
 static JSValue    g_fn_generate_mesh_vertices;
+static JSValue    g_fn_find_focused_monitor;
+static JSValue    g_fn_eus_to_nwu_quat;
+static JSValue    g_fn_eus_to_nwu_vector;
+static JSValue    g_fn_ease_distance;
 
 int dp_init(void)
 {
@@ -63,6 +67,10 @@ int dp_init(void)
     g_fn_diagonal_to_cross_fovs  = JS_GetPropertyStr(g_ctx, global, "diagonalToCrossFOVs");
     g_fn_build_fov_details        = JS_GetPropertyStr(g_ctx, global, "buildFovDetails");
     g_fn_generate_mesh_vertices   = JS_GetPropertyStr(g_ctx, global, "generateMeshVertices");
+    g_fn_find_focused_monitor     = JS_GetPropertyStr(g_ctx, global, "findFocusedMonitor");
+    g_fn_eus_to_nwu_quat          = JS_GetPropertyStr(g_ctx, global, "eusToNwuQuat");
+    g_fn_eus_to_nwu_vector        = JS_GetPropertyStr(g_ctx, global, "eusToNwuVector");
+    g_fn_ease_distance            = JS_GetPropertyStr(g_ctx, global, "easeDistance");
     JS_FreeValue(g_ctx, global);
 
     if (!JS_IsFunction(g_ctx, g_fn_monitors_to_placements)) {
@@ -85,6 +93,22 @@ int dp_init(void)
         dp_destroy();
         return -1;
     }
+    if (!JS_IsFunction(g_ctx, g_fn_find_focused_monitor)) {
+        fprintf(stderr, "dp: findFocusedMonitor not found in JS bundle\n");
+        dp_destroy();
+        return -1;
+    }
+    if (!JS_IsFunction(g_ctx, g_fn_eus_to_nwu_quat) ||
+        !JS_IsFunction(g_ctx, g_fn_eus_to_nwu_vector)) {
+        fprintf(stderr, "dp: eusToNwu* not found in JS bundle\n");
+        dp_destroy();
+        return -1;
+    }
+    if (!JS_IsFunction(g_ctx, g_fn_ease_distance)) {
+        fprintf(stderr, "dp: easeDistance not found in JS bundle\n");
+        dp_destroy();
+        return -1;
+    }
 
     return 0;
 }
@@ -97,10 +121,18 @@ void dp_destroy(void)
     JS_FreeValue(g_ctx, g_fn_diagonal_to_cross_fovs);
     JS_FreeValue(g_ctx, g_fn_build_fov_details);
     JS_FreeValue(g_ctx, g_fn_generate_mesh_vertices);
+    JS_FreeValue(g_ctx, g_fn_find_focused_monitor);
+    JS_FreeValue(g_ctx, g_fn_eus_to_nwu_quat);
+    JS_FreeValue(g_ctx, g_fn_eus_to_nwu_vector);
+    JS_FreeValue(g_ctx, g_fn_ease_distance);
     g_fn_monitors_to_placements  = JS_UNDEFINED;
     g_fn_diagonal_to_cross_fovs  = JS_UNDEFINED;
     g_fn_build_fov_details        = JS_UNDEFINED;
     g_fn_generate_mesh_vertices   = JS_UNDEFINED;
+    g_fn_find_focused_monitor     = JS_UNDEFINED;
+    g_fn_eus_to_nwu_quat          = JS_UNDEFINED;
+    g_fn_eus_to_nwu_vector        = JS_UNDEFINED;
+    g_fn_ease_distance            = JS_UNDEFINED;
     JS_FreeContext(g_ctx);
     JS_FreeRuntime(g_rt);
     g_ctx = NULL;
@@ -432,6 +464,10 @@ int dp_compute_placements(const struct dp_monitor_info *monitors,
             placements[orig_idx].cny   = (float)( cn_up    * gl_scale);
             placements[orig_idx].cnz   = (float)(-cn_north * gl_scale);
             placements[orig_idx].angle = (float)( rot_y);
+            /* Keep NWU centerLook for findFocusedMonitor (pixel units, unscaled). */
+            placements[orig_idx].ln_north = (float)cl_north;
+            placements[orig_idx].ln_west  = (float)cl_west;
+            placements[orig_idx].ln_up    = (float)cl_up;
         }
     }
 
@@ -534,4 +570,188 @@ int dp_generate_mesh_vertices(const struct dp_fov_details *fov,
 
     JS_FreeValue(g_ctx, result);
     return count;
+}
+
+/* ----------------------------------------------------------------
+ * dp_find_focused_monitor
+ * ---------------------------------------------------------------- */
+
+/* Build a JS Float array [a, b, c] from a C array. */
+static JSValue dp_new_num_array(const double *vals, size_t n)
+{
+    JSValue arr = JS_NewArray(g_ctx);
+    for (size_t i = 0u; i < n; i++)
+        JS_SetPropertyUint32(g_ctx, arr, (uint32_t)i, JS_NewFloat64(g_ctx, vals[i]));
+    return arr;
+}
+
+/* Call a single-arg JS conversion fn (eusToNwu*) returning a length-n array into out. */
+static int dp_call_convert(JSValue fn, const double *in, size_t n, double *out)
+{
+    JSValue arg = dp_new_num_array(in, n);
+    JSValue res = JS_Call(g_ctx, fn, JS_UNDEFINED, 1, &arg);
+    JS_FreeValue(g_ctx, arg);
+    if (JS_IsException(res)) {
+        JS_FreeValue(g_ctx, res);
+        return -1;
+    }
+    for (size_t i = 0u; i < n; i++) {
+        JSValue v = JS_GetPropertyUint32(g_ctx, res, (uint32_t)i);
+        JS_ToFloat64(g_ctx, &out[i], v);
+        JS_FreeValue(g_ctx, v);
+    }
+    JS_FreeValue(g_ctx, res);
+    return 0;
+}
+
+int dp_find_focused_monitor(const struct dp_placement *placements,
+                            const struct dp_monitor_info *monitors,
+                            size_t n,
+                            float qw, float qx, float qy, float qz,
+                            float pos_east, float pos_up, float pos_south,
+                            int current_focused_index,
+                            float focused_monitor_distance,
+                            uint32_t device_width,
+                            uint32_t device_height,
+                            float diagonal_fov_rad,
+                            float lens_distance_ratio,
+                            float display_distance_default,
+                            float size_adj_width,
+                            float size_adj_height,
+                            const char *wrapping_scheme,
+                            bool curved_display)
+{
+    if (!placements || !monitors || n == 0u || !g_ctx)
+        return -1;
+    if (n > DP_MAX_MONITORS)
+        return -1;
+
+    int result_index = -1;
+
+    /* Convert EUS head pose → NWU frame using the shared helpers. */
+    double quat_eus[4] = { (double)qx, (double)qy, (double)qz, (double)qw };
+    double pos_eus[3]  = { (double)pos_east, (double)pos_up, (double)pos_south };
+    double quat_nwu[4];
+    double pos_nwu[3];
+    if (dp_call_convert(g_fn_eus_to_nwu_quat, quat_eus, 4u, quat_nwu) != 0)
+        return -1;
+    if (dp_call_convert(g_fn_eus_to_nwu_vector, pos_eus, 3u, pos_nwu) != 0)
+        return -1;
+
+    /* Rebuild fovDetails (needed by findFocusedMonitor for the angle math). */
+    JSValue fov_obj = JS_UNDEFINED;
+    {
+        JSValue bfd_args[7];
+        const char *scheme = (wrapping_scheme && *wrapping_scheme) ? wrapping_scheme : "horizontal";
+        bfd_args[0] = JS_NewFloat64(g_ctx, (double)device_width);
+        bfd_args[1] = JS_NewFloat64(g_ctx, (double)device_height);
+        bfd_args[2] = JS_NewFloat64(g_ctx, (double)diagonal_fov_rad);
+        bfd_args[3] = JS_NewFloat64(g_ctx, (double)lens_distance_ratio);
+        bfd_args[4] = JS_NewFloat64(g_ctx, (double)display_distance_default);
+        bfd_args[5] = JS_NewString(g_ctx, scheme);
+        bfd_args[6] = JS_NewBool(g_ctx, curved_display ? 1 : 0);
+        fov_obj = JS_Call(g_ctx, g_fn_build_fov_details, JS_UNDEFINED, 7, bfd_args);
+        JS_FreeValue(g_ctx, bfd_args[5]);
+        if (JS_IsException(fov_obj)) {
+            JS_FreeValue(g_ctx, fov_obj);
+            return -1;
+        }
+        JS_SetPropertyStr(g_ctx, fov_obj, "sizeAdjustedWidthPixels",
+                          JS_NewFloat64(g_ctx, (double)size_adj_width));
+        JS_SetPropertyStr(g_ctx, fov_obj, "sizeAdjustedHeightPixels",
+                          JS_NewFloat64(g_ctx, (double)size_adj_height));
+        /* findFocusedMonitor reads monitorWrappingScheme off fovDetails. */
+        JS_SetPropertyStr(g_ctx, fov_obj, "monitorWrappingScheme",
+                          JS_NewString(g_ctx, scheme));
+    }
+
+    /* monitorVectors: NWU centerLook arrays kept on the placements. */
+    JSValue monitor_vectors = JS_NewArray(g_ctx);
+    JSValue monitor_details = JS_NewArray(g_ctx);
+    for (size_t i = 0u; i < n; i++) {
+        double cl[3] = { (double)placements[i].ln_north,
+                         (double)placements[i].ln_west,
+                         (double)placements[i].ln_up };
+        JS_SetPropertyUint32(g_ctx, monitor_vectors, (uint32_t)i, dp_new_num_array(cl, 3u));
+
+        JSValue d = JS_NewObject(g_ctx);
+        JS_SetPropertyStr(g_ctx, d, "x",      JS_NewInt32(g_ctx,  monitors[i].x));
+        JS_SetPropertyStr(g_ctx, d, "y",      JS_NewInt32(g_ctx,  monitors[i].y));
+        JS_SetPropertyStr(g_ctx, d, "width",  JS_NewUint32(g_ctx, monitors[i].width));
+        JS_SetPropertyStr(g_ctx, d, "height", JS_NewUint32(g_ctx, monitors[i].height));
+        JS_SetPropertyUint32(g_ctx, monitor_details, (uint32_t)i, d);
+    }
+
+    JSValue quat_arr = dp_new_num_array(quat_nwu, 4u);
+    JSValue pos_arr  = dp_new_num_array(pos_nwu, 3u);
+
+    JSValue args[8] = {
+        quat_arr,
+        pos_arr,
+        monitor_vectors,
+        JS_NewInt32(g_ctx, current_focused_index),
+        JS_NewFloat64(g_ctx, (double)focused_monitor_distance),
+        JS_NewBool(g_ctx, 0),               /* smoothFollowEnabled = false */
+        fov_obj,
+        monitor_details
+    };
+    JSValue res = JS_Call(g_ctx, g_fn_find_focused_monitor, JS_UNDEFINED, 8, args);
+
+    if (JS_IsException(res)) {
+        JSValue exc = JS_GetException(g_ctx);
+        const char *msg = JS_ToCString(g_ctx, exc);
+        fprintf(stderr, "dp: findFocusedMonitor error: %s\n", msg ? msg : "(unknown)");
+        JS_FreeCString(g_ctx, msg);
+        JS_FreeValue(g_ctx, exc);
+    } else {
+        int32_t idx = -1;
+        JS_ToInt32(g_ctx, &idx, res);
+        result_index = idx;
+    }
+
+    JS_FreeValue(g_ctx, res);
+    JS_FreeValue(g_ctx, quat_arr);
+    JS_FreeValue(g_ctx, pos_arr);
+    JS_FreeValue(g_ctx, monitor_vectors);
+    JS_FreeValue(g_ctx, monitor_details);
+    JS_FreeValue(g_ctx, fov_obj);
+    return result_index;
+}
+
+/* ----------------------------------------------------------------
+ * dp_ease_distance — thin wrapper over the shared easeDistance().
+ * ---------------------------------------------------------------- */
+
+int dp_ease_distance(float start_distance, float target_distance,
+                     float elapsed_ms, bool gaining_focus,
+                     bool needs_sequence_delay,
+                     float *out_distance, bool *out_done)
+{
+    if (!out_distance || !g_ctx)
+        return -1;
+
+    JSValue args[5] = {
+        JS_NewFloat64(g_ctx, (double)start_distance),
+        JS_NewFloat64(g_ctx, (double)target_distance),
+        JS_NewFloat64(g_ctx, (double)elapsed_ms),
+        JS_NewBool(g_ctx, gaining_focus ? 1 : 0),
+        JS_NewBool(g_ctx, needs_sequence_delay ? 1 : 0)
+    };
+    JSValue res = JS_Call(g_ctx, g_fn_ease_distance, JS_UNDEFINED, 5, args);
+    if (JS_IsException(res)) {
+        JS_FreeValue(g_ctx, res);
+        return -1;
+    }
+
+    JSValue dv = JS_GetPropertyStr(g_ctx, res, "distance");
+    JSValue dn = JS_GetPropertyStr(g_ctx, res, "done");
+    double d = (double)target_distance;
+    JS_ToFloat64(g_ctx, &d, dv);
+    *out_distance = (float)d;
+    if (out_done)
+        *out_done = JS_ToBool(g_ctx, dn) ? true : false;
+    JS_FreeValue(g_ctx, dv);
+    JS_FreeValue(g_ctx, dn);
+    JS_FreeValue(g_ctx, res);
+    return 0;
 }
