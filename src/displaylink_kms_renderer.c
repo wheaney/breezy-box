@@ -307,8 +307,6 @@ static void kms_poll_device_config(struct kms_state *kms,
 		return;
 	kms->last_config_poll = now;
 
-	breezy_settings_consume_if_changed(kms->settings_handle, &kms->settings);
-
 	struct breezy_imu_device_config cfg;
 	struct breezy_imu_pose pose;
 	bool have_config = breezy_imu_get_config(&cfg);
@@ -1558,6 +1556,7 @@ static int kms_run(struct kms_state *kms, struct server_runtime *server)
 		int ret;
 
 		kms_poll_device_config(kms, server);
+		breezy_settings_consume_if_changed(kms->settings_handle, &kms->settings);
 
 		/* Honour framerate_cap: skip this iteration if not enough time has passed. */
 		if (kms->settings.framerate_cap > 0.0) {
