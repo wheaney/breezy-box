@@ -176,6 +176,7 @@ struct kms_state {
 	/* Inputs captured at placement time so the periodic focus check can call
 	 * dp_find_focused_monitor() without recomputing them every frame. */
 	struct dp_monitor_info focus_monitors[MAX_USBIP_DEVICES];
+	size_t   focus_slot_map[MAX_USBIP_DEVICES]; /* focus_slot_map[compact_i] = slot index */
 	size_t   focus_monitor_count;
 	char     focus_scheme[32];
 	uint32_t focus_dev_w, focus_dev_h;
@@ -244,15 +245,21 @@ static const char *kms_resolve_wrapping_scheme(
  *
  * The resulting coords are ready to pass directly to dp_compute_placements().
  */
+/*
+ * devs[i].{x,y,width,height} are the raw (pre-size-adjust) pixel positions of
+ * each connected monitor.  n is the count of entries in devs[].  out[] receives
+ * the size-adjusted, viewport-centred, offset-shifted positions ready for
+ * dp_compute_placements().
+ */
 static void kms_adjust_monitor_positions(
-    const struct server_options *opts,
+    const struct dp_monitor_info *devs,
+    size_t n,
     uint32_t dev_w, uint32_t dev_h,
     float dist_adj_size,
     bool headset_as_center,
     double viewport_offset_x, double viewport_offset_y,
     struct dp_monitor_info *out)
 {
-	size_t n = opts->device_count;
 	float size_ox = (1.0f - dist_adj_size) / 2.0f * (float)dev_w;
 	float size_oy = (1.0f - dist_adj_size) / 2.0f * (float)dev_h;
 	float adj_dev_w = (float)dev_w * dist_adj_size;
@@ -263,24 +270,24 @@ static void kms_adjust_monitor_positions(
 	 * the correct spread layout rather than stacking all monitors at x=0. */
 	bool all_x_zero = (n > 1u);
 	for (size_t i = 0; i < n && all_x_zero; i++) {
-		if (opts->devices[i].x != 0)
+		if (devs[i].x != 0)
 			all_x_zero = false;
 	}
 	int32_t raw_x[MAX_USBIP_DEVICES];
 	if (all_x_zero) {
 		raw_x[0] = 0;
 		for (size_t i = 1; i < n; i++)
-			raw_x[i] = raw_x[i - 1] + (int32_t)opts->devices[i - 1].decode_width;
+			raw_x[i] = raw_x[i - 1] + (int32_t)devs[i - 1].width;
 	} else {
 		for (size_t i = 0; i < n; i++)
-			raw_x[i] = opts->devices[i].x;
+			raw_x[i] = devs[i].x;
 	}
 
 	/* Size-adjusted positions. */
 	float ax[MAX_USBIP_DEVICES], ay[MAX_USBIP_DEVICES];
 	for (size_t i = 0; i < n; i++) {
 		ax[i] = (float)raw_x[i] * dist_adj_size + size_ox;
-		ay[i] = (float)opts->devices[i].y * dist_adj_size + size_oy;
+		ay[i] = (float)devs[i].y * dist_adj_size + size_oy;
 	}
 
 	/* Viewport reference origin — mirrors the viewportXBegin/YBegin logic. */
@@ -290,11 +297,11 @@ static void kms_adjust_monitor_positions(
 		vpx = size_ox;
 		vpy = size_oy;
 	} else {
-		float minx = ax[0], maxx = ax[0] + (float)opts->devices[0].decode_width  * dist_adj_size;
-		float miny = ay[0], maxy = ay[0] + (float)opts->devices[0].decode_height * dist_adj_size;
+		float minx = ax[0], maxx = ax[0] + (float)devs[0].width  * dist_adj_size;
+		float miny = ay[0], maxy = ay[0] + (float)devs[0].height * dist_adj_size;
 		for (size_t i = 1; i < n; i++) {
-			float x2 = ax[i] + (float)opts->devices[i].decode_width  * dist_adj_size;
-			float y2 = ay[i] + (float)opts->devices[i].decode_height * dist_adj_size;
+			float x2 = ax[i] + (float)devs[i].width  * dist_adj_size;
+			float y2 = ay[i] + (float)devs[i].height * dist_adj_size;
 			if (ax[i] < minx) minx = ax[i];
 			if (x2 > maxx)    maxx = x2;
 			if (ay[i] < miny) miny = ay[i];
@@ -307,8 +314,8 @@ static void kms_adjust_monitor_positions(
 	for (size_t i = 0; i < n; i++) {
 		out[i].x      = (int32_t)(ax[i] - vpx - (float)viewport_offset_x * adj_dev_w);
 		out[i].y      = (int32_t)(ay[i] - vpy + (float)viewport_offset_y * adj_dev_h);
-		out[i].width  = (uint32_t)((float)opts->devices[i].decode_width  * dist_adj_size);
-		out[i].height = (uint32_t)((float)opts->devices[i].decode_height * dist_adj_size);
+		out[i].width  = (uint32_t)((float)devs[i].width  * dist_adj_size);
+		out[i].height = (uint32_t)((float)devs[i].height * dist_adj_size);
 	}
 }
 
@@ -388,23 +395,37 @@ static void kms_poll_device_config(struct kms_state *kms,
 	float dist_default = (float)breezy_settings_display_distance_default(s);
 	float dist_adj     = breezy_settings_distance_adjusted_size(s, lens_ratio);
 
-	/* Resolve wrapping scheme (handles "automatic" and "flat+curved"). */
-	struct dp_monitor_info raw_monitors[MAX_USBIP_DEVICES];
+	/* Build the connected-only monitor list and slot map.
+	 * Layout (centering, viewport offset, wrapping) is based solely on
+	 * connected monitors so that disconnected slots don't skew the center. */
+	struct dp_monitor_info conn_devs[MAX_USBIP_DEVICES];
+	size_t conn_slot[MAX_USBIP_DEVICES];  /* conn_slot[compact_i] = opts slot index */
+	size_t conn_count = 0u;
 	for (size_t i = 0u; i < opts->device_count; i++) {
-		raw_monitors[i].x      = opts->devices[i].x;
-		raw_monitors[i].y      = opts->devices[i].y;
-		raw_monitors[i].width  = opts->devices[i].decode_width;
-		raw_monitors[i].height = opts->devices[i].decode_height;
+		const struct device_runtime *dev = &server->devices[i];
+		bool connected = dev->is_gadget_device
+		                     ? (dev->udl.gadget_fd >= 0)
+		                     : dev->imported;
+		if (!connected)
+			continue;
+		conn_devs[conn_count].x      = opts->devices[i].x;
+		conn_devs[conn_count].y      = opts->devices[i].y;
+		conn_devs[conn_count].width  = opts->devices[i].decode_width;
+		conn_devs[conn_count].height = opts->devices[i].decode_height;
+		conn_slot[conn_count]        = i;
+		conn_count++;
 	}
+
+	/* Resolve wrapping scheme from connected monitors only. */
 	const char *resolved_scheme = kms_resolve_wrapping_scheme(
 	    s->monitor_wrapping_scheme, s->curved_display,
-	    raw_monitors, opts->device_count, dev_w, dev_h);
+	    conn_devs, conn_count, dev_w, dev_h);
 
 	float monitor_spacing = (float)s->monitor_spacing / 1000.0f;
 
-	/* Size-adjust and viewport-centre the monitor positions. */
+	/* Size-adjust and viewport-centre the connected monitor positions. */
 	struct dp_monitor_info adj_monitors[MAX_USBIP_DEVICES];
-	kms_adjust_monitor_positions(opts, dev_w, dev_h, dist_adj,
+	kms_adjust_monitor_positions(conn_devs, conn_count, dev_w, dev_h, dist_adj,
 	                              s->headset_display_as_viewport_center,
 	                              s->viewport_offset_x, s->viewport_offset_y,
 	                              adj_monitors);
@@ -465,9 +486,9 @@ static void kms_poll_device_config(struct kms_state *kms,
 	if (sch_len >= sizeof(sig.scheme))
 		sch_len = sizeof(sig.scheme) - 1;
 	memcpy(sig.scheme, resolved_scheme, sch_len);
-	sig.mon_count = opts->device_count;
-	for (size_t i = 0u; i < opts->device_count && i < MAX_USBIP_DEVICES; i++)
-		sig.mons[i] = raw_monitors[i];
+	sig.mon_count = conn_count;
+	for (size_t i = 0u; i < conn_count && i < MAX_USBIP_DEVICES; i++)
+		sig.mons[i] = conn_devs[i];
 
 	if (kms->has_cfg_sig && kms->placements_computed && kms->meshes_computed &&
 	    memcmp(&sig, &kms->last_cfg_sig, sizeof sig) == 0)
@@ -525,19 +546,27 @@ static void kms_poll_device_config(struct kms_state *kms,
 	fov_det.size_adj_width  = kms->device_size_adj_w_px;
 	fov_det.size_adj_height = kms->device_size_adj_h_px;
 
-	if (dp_compute_placements(adj_monitors, opts->device_count,
+	/* dp_compute_placements writes placements[originalIndex] where originalIndex
+	 * is the compact array index (0..conn_count-1).  We use a scratch array and
+	 * remap to the real slot indices afterwards. */
+	struct dp_placement compact_placements[MAX_USBIP_DEVICES];
+	if (dp_compute_placements(adj_monitors, conn_count,
 	                           dev_w, dev_h, diag_rad, lens_ratio,
 	                           dist_default,
 	                           kms->device_size_adj_w_px, kms->device_size_adj_h_px,
 	                           fov_det.complete_dist_px,
 	                           resolved_scheme, s->curved_display, monitor_spacing,
-	                           kms->placements) == 0) {
+	                           compact_placements) == 0) {
+		for (size_t ci = 0u; ci < conn_count; ci++)
+			kms->placements[conn_slot[ci]] = compact_placements[ci];
 		kms->placements_computed = true;
 
 		/* Capture focus-check inputs for the periodic gaze test. */
-		kms->focus_monitor_count = opts->device_count;
-		for (size_t mi = 0u; mi < opts->device_count && mi < MAX_USBIP_DEVICES; mi++)
+		kms->focus_monitor_count = conn_count;
+		for (size_t mi = 0u; mi < conn_count && mi < MAX_USBIP_DEVICES; mi++) {
 			kms->focus_monitors[mi] = adj_monitors[mi];
+			kms->focus_slot_map[mi] = conn_slot[mi];
+		}
 		strncpy(kms->focus_scheme, resolved_scheme, sizeof(kms->focus_scheme) - 1);
 		kms->focus_scheme[sizeof(kms->focus_scheme) - 1] = '\0';
 		kms->focus_dev_w        = dev_w;
@@ -567,10 +596,11 @@ static void kms_poll_device_config(struct kms_state *kms,
 		 * CurvableDisplayMesh.qml exactly and correctly handling 'flat' (both false). */
 		int curved = s->curved_display ? 1 : 0;
 
-		for (size_t i = 0u; i < opts->device_count && i < MAX_USBIP_DEVICES; i++) {
+		for (size_t ci = 0u; ci < conn_count; ci++) {
+			size_t i = conn_slot[ci];
 			int vc = dp_generate_mesh_vertices(
 			    &fov_det,
-			    (float)adj_monitors[i].width, (float)adj_monitors[i].height,
+			    (float)adj_monitors[ci].width, (float)adj_monitors[ci].height,
 			    resolved_scheme, curved,
 			    kms->placements[i].cnx,
 			    kms->placements[i].cny,
@@ -1252,15 +1282,30 @@ static void kms_update_focus(struct kms_state *kms, uint64_t now_ms)
 	                    ? kms->zoom_focused_distance / kms->zoom_all_distance
 	                    : 1.0f;
 
-	int new_focus = dp_find_focused_monitor(
-	    kms->placements, kms->focus_monitors, kms->focus_monitor_count,
+	/* Build a compact placements array matching focus_monitors[] so
+	 * dp_find_focused_monitor sees consecutive indices 0..n-1. */
+	struct dp_placement focus_compact_placements[MAX_USBIP_DEVICES];
+	int current_compact_focus = -1;
+	for (size_t mi = 0u; mi < kms->focus_monitor_count; mi++) {
+		focus_compact_placements[mi] = kms->placements[kms->focus_slot_map[mi]];
+		if ((int)kms->focus_slot_map[mi] == kms->focused_monitor_index)
+			current_compact_focus = (int)mi;
+	}
+
+	int new_compact_focus = dp_find_focused_monitor(
+	    focus_compact_placements, kms->focus_monitors, kms->focus_monitor_count,
 	    pose.quat_w, pose.quat_x, pose.quat_y, pose.quat_z,
 	    pose.pos_x, pose.pos_y, pose.pos_z,
-	    kms->focused_monitor_index, focused_ratio,
+	    current_compact_focus, focused_ratio,
 	    kms->focus_dev_w, kms->focus_dev_h, kms->focus_diag_rad,
 	    kms->focus_lens_ratio, kms->focus_dist_default,
 	    kms->device_size_adj_w_px, kms->device_size_adj_h_px,
 	    kms->focus_scheme, kms->focus_curved);
+
+	/* Remap compact index → slot index (-1 stays -1). */
+	int new_focus = (new_compact_focus >= 0 && (size_t)new_compact_focus < kms->focus_monitor_count)
+	              ? (int)kms->focus_slot_map[(size_t)new_compact_focus]
+	              : -1;
 
 	if (new_focus == kms->focused_monitor_index)
 		return;
