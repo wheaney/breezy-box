@@ -554,17 +554,8 @@ int dp_find_focused_monitor(const struct dp_placement *placements,
 
     int result_index = -1;
 
-    /* Convert EUS head pose → NWU frame using the shared helpers. */
-    double quat_eus[4] = { (double)qx, (double)qy, (double)qz, (double)qw };
-    double pos_eus[3]  = { (double)pos_east, (double)pos_up, (double)pos_south };
-    double quat_nwu[4];
-    double pos_nwu[3];
-    if (dp_call_convert(g_fn_eus_to_nwu_quat, quat_eus, 4u, quat_nwu) != 0)
-        return -1;
-    if (dp_call_convert(g_fn_eus_to_nwu_vector, pos_eus, 3u, pos_nwu) != 0)
-        return -1;
-
-    /* Rebuild fovDetails (needed by findFocusedMonitor for the angle math). */
+    /* Rebuild fovDetails (needed by findFocusedMonitor for the angle math, and
+     * for fullScreenDistancePixels to scale the head position into pixel units). */
     const char *scheme = (wrapping_scheme && *wrapping_scheme) ? wrapping_scheme : "horizontal";
     JSValue fov_obj = dp_build_fov_obj(device_width, device_height, diagonal_fov_rad,
                                        lens_distance_ratio, display_distance_default,
@@ -576,6 +567,27 @@ int dp_find_focused_monitor(const struct dp_placement *placements,
     dp_set_size_adj(fov_obj, size_adj_width, size_adj_height);
     /* findFocusedMonitor reads monitorWrappingScheme off fovDetails. */
     JS_SetPropertyStr(g_ctx, fov_obj, "monitorWrappingScheme", JS_NewString(g_ctx, scheme));
+
+    /*
+     * Convert the EUS head pose → NWU frame.  The monitor centerLook vectors are
+     * in pixel units, so the 6DoF position (normalized by the driver) must be
+     * scaled by fullScreenDistancePixels first — mirroring the references'
+     * posePosition.times(fovDetails.fullScreenDistancePixels).  For 3DoF the
+     * position is ~0 and the scale is a no-op.  Scaling commutes with the axis
+     * permutation, so we apply it in the EUS frame before converting.
+     */
+    double full_screen_dist_px = dp_get_float(fov_obj, "fullScreenDistancePixels");
+    double quat_eus[4] = { (double)qx, (double)qy, (double)qz, (double)qw };
+    double pos_eus[3]  = { (double)pos_east  * full_screen_dist_px,
+                           (double)pos_up    * full_screen_dist_px,
+                           (double)pos_south * full_screen_dist_px };
+    double quat_nwu[4];
+    double pos_nwu[3];
+    if (dp_call_convert(g_fn_eus_to_nwu_quat, quat_eus, 4u, quat_nwu) != 0 ||
+        dp_call_convert(g_fn_eus_to_nwu_vector, pos_eus, 3u, pos_nwu) != 0) {
+        JS_FreeValue(g_ctx, fov_obj);
+        return -1;
+    }
 
     /* monitorVectors: NWU centerLook arrays kept on the placements. */
     JSValue monitor_vectors = JS_NewArray(g_ctx);

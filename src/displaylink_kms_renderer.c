@@ -95,6 +95,20 @@ struct kms_display_tex {
 	bool has_first_frame;
 };
 
+/*
+ * Snapshot of every input that affects monitor placement / mesh geometry.
+ * Compared with memcmp each poll; placements are only rebuilt when it changes.
+ * Zeroed before filling so padding never produces a spurious mismatch.
+ */
+struct kms_cfg_sig {
+	uint32_t dev_w, dev_h;
+	float    diag_rad, lens_ratio, dist_default, dist_adj, monitor_spacing;
+	bool     curved;
+	char     scheme[32];
+	size_t   mon_count;
+	struct dp_monitor_info mons[MAX_USBIP_DEVICES];
+};
+
 struct kms_state {
 	int drm_fd;
 	uint32_t crtc_id;
@@ -163,6 +177,11 @@ struct kms_state {
 	uint32_t focus_dev_w, focus_dev_h;
 	float    focus_diag_rad, focus_lens_ratio, focus_dist_default;
 	bool     focus_curved;
+
+	/* Signature of the last layout-relevant config, so the 1 Hz poll only
+	 * rebuilds placements/meshes (and resets focus) on a genuine change. */
+	struct kms_cfg_sig last_cfg_sig;
+	bool     has_cfg_sig;
 
 	/* Overlay: GL texture for connection-status messages; text from breezy_state. */
 	struct overlay_text overlay_tex;
@@ -322,11 +341,12 @@ static void kms_poll_device_config(struct kms_state *kms,
 		}
 	}
 
-	kms->device_active   = active;
-	kms->meshes_computed = false;
+	kms->device_active = active;
 
-	if (!active)
+	if (!active) {
+		kms->meshes_computed = false;
 		return;
+	}
 
 	uint32_t dev_w = (cfg.display_width  > 0) ? cfg.display_width
 	                                           : (uint32_t)kms->mode.hdisplay;
@@ -351,6 +371,65 @@ static void kms_poll_device_config(struct kms_state *kms,
 	const char *resolved_scheme = kms_resolve_wrapping_scheme(
 	    s->monitor_wrapping_scheme, s->curved_display,
 	    raw_monitors, opts->device_count, dev_w, dev_h);
+
+	float monitor_spacing = (float)s->monitor_spacing / 1000.0f;
+
+	/* Size-adjust and viewport-centre the monitor positions. */
+	struct dp_monitor_info adj_monitors[MAX_USBIP_DEVICES];
+	kms_adjust_monitor_positions(opts, dev_w, dev_h, dist_adj,
+	                              s->headset_display_as_viewport_center,
+	                              s->viewport_offset_x, s->viewport_offset_y,
+	                              adj_monitors);
+
+	/*
+	 * Zoom-on-focus distances — recomputed every poll, because the zoom switch
+	 * only flips display_distance between the focused/all toggle endpoints; it
+	 * does not change the layout.  Mirrors the UI enable rule (zoom on iff
+	 * display_distance < the "all displays" distance) and GNOME's
+	 * display_distance vs display_distance_default split:
+	 *   all      = display_distance_default = max(display_distance, start, end)
+	 *   focused  = display_distance          (the nearer value when zoom is on)
+	 *   enabled  = display_distance < all
+	 * zoom_all_distance must equal the distance placements were computed at so
+	 * the per-monitor scale (monitor_distance / zoom_all_distance) is 1.0 when
+	 * unfocused.
+	 */
+	kms->zoom_all_distance     = dist_default;
+	kms->zoom_focused_distance = (float)s->display_distance;
+	kms->zoom_on_focus         = kms->zoom_focused_distance < dist_default;
+
+	/*
+	 * Rebuild placements/meshes — and reset focus state — only when something
+	 * layout-relevant actually changed.  Doing this unconditionally each poll
+	 * would snap a focused, zoomed-in display back out once per second and then
+	 * re-ease it in (an endless ease-in loop).
+	 */
+	struct kms_cfg_sig sig;
+	memset(&sig, 0, sizeof sig);
+	sig.dev_w           = dev_w;
+	sig.dev_h           = dev_h;
+	sig.diag_rad        = diag_rad;
+	sig.lens_ratio      = lens_ratio;
+	sig.dist_default    = dist_default;
+	sig.dist_adj        = dist_adj;
+	sig.monitor_spacing = monitor_spacing;
+	sig.curved          = s->curved_display;
+	/* sig is fully zeroed above, so a bounded copy keeps it NUL-terminated. */
+	size_t sch_len = strlen(resolved_scheme);
+	if (sch_len >= sizeof(sig.scheme))
+		sch_len = sizeof(sig.scheme) - 1;
+	memcpy(sig.scheme, resolved_scheme, sch_len);
+	sig.mon_count = opts->device_count;
+	for (size_t i = 0u; i < opts->device_count && i < MAX_USBIP_DEVICES; i++)
+		sig.mons[i] = adj_monitors[i];
+
+	if (kms->has_cfg_sig && kms->placements_computed && kms->meshes_computed &&
+	    memcmp(&sig, &kms->last_cfg_sig, sizeof sig) == 0)
+		return;  /* nothing layout-relevant changed; keep focus + eased distances */
+
+	kms->last_cfg_sig    = sig;
+	kms->has_cfg_sig     = true;
+	kms->meshes_computed = false;
 
 	struct dp_fov_details fov_det;
 	if (dp_build_fov_details(dev_w, dev_h, diag_rad, lens_ratio, dist_default,
@@ -388,14 +467,6 @@ static void kms_poll_device_config(struct kms_state *kms,
 	fov_det.size_adj_width  = kms->device_size_adj_w_px;
 	fov_det.size_adj_height = kms->device_size_adj_h_px;
 
-	/* Apply size-adjustment and viewport centering to monitor positions. */
-	struct dp_monitor_info adj_monitors[MAX_USBIP_DEVICES];
-	kms_adjust_monitor_positions(opts, dev_w, dev_h, dist_adj,
-	                              s->headset_display_as_viewport_center,
-	                              s->viewport_offset_x, s->viewport_offset_y,
-	                              adj_monitors);
-
-	float monitor_spacing = (float)s->monitor_spacing / 1000.0f;
 	if (dp_compute_placements(adj_monitors, opts->device_count,
 	                           dev_w, dev_h, diag_rad, lens_ratio,
 	                           dist_default,
@@ -404,20 +475,6 @@ static void kms_poll_device_config(struct kms_state *kms,
 	                           resolved_scheme, s->curved_display, monitor_spacing,
 	                           kms->placements) == 0) {
 		kms->placements_computed = true;
-
-		/*
-		 * Zoom-on-focus distances.  The resting ("all displays" / farther)
-		 * multiplier is display_distance_default, which is also what placements
-		 * were computed at; the focused (nearer) multiplier is the closer toggle
-		 * endpoint.  Zoom is active whenever they differ.  Mirrors GNOME's
-		 * display_distance_default vs display_distance split.
-		 */
-		float toggle_lo = (float)((s->toggle_display_distance_start < s->toggle_display_distance_end)
-		                          ? s->toggle_display_distance_start
-		                          : s->toggle_display_distance_end);
-		kms->zoom_all_distance     = dist_default;
-		kms->zoom_focused_distance = toggle_lo;
-		kms->zoom_on_focus         = toggle_lo < dist_default;
 
 		/* Capture focus-check inputs for the periodic gaze test. */
 		kms->focus_monitor_count = opts->device_count;
@@ -432,7 +489,7 @@ static void kms_poll_device_config(struct kms_state *kms,
 		kms->focus_dist_default = dist_default;
 		kms->focus_curved       = s->curved_display;
 
-		/* Reset focus + per-monitor distance to the resting state on reconfig. */
+		/* Layout changed: reset focus + snap per-monitor distance to resting. */
 		kms->focused_monitor_index = -1;
 		kms->last_focus_check_ms   = 0;
 		for (size_t mi = 0u; mi < MAX_USBIP_DEVICES; mi++) {
@@ -1096,11 +1153,25 @@ static void kms_begin_zoom_ease(struct kms_state *kms, size_t i,
  */
 static void kms_update_focus(struct kms_state *kms, uint64_t now_ms)
 {
-	if (!kms->zoom_on_focus || !kms->placements_computed)
+	if (!kms->placements_computed)
 		return;
 	if (now_ms - kms->last_focus_check_ms < KMS_FOCUS_CHECK_MS)
 		return;
 	kms->last_focus_check_ms = now_ms;
+
+	/*
+	 * Zoom-on-focus disabled (e.g. the user just turned it off): ease any
+	 * still-focused display back out to the resting distance, drop focus, and
+	 * stop checking.  Without this the last focused display would stay zoomed.
+	 */
+	if (!kms->zoom_on_focus) {
+		if (kms->focused_monitor_index >= 0) {
+			kms_begin_zoom_ease(kms, (size_t)kms->focused_monitor_index,
+			                    kms->zoom_all_distance, false, now_ms);
+			kms->focused_monitor_index = -1;
+		}
+		return;
+	}
 
 	struct breezy_imu_pose pose;
 	if (!breezy_imu_try_get_pose(&pose))
