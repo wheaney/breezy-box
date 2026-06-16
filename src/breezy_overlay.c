@@ -194,11 +194,11 @@ static void rebuild_text(struct breezy_overlay *ov)
 			: "Connect to a host using the USB OTG port";
 		if (ov->wlan_mdns[0] && ov->wlan_ip[0]) {
 			snprintf(msg, sizeof(msg),
-				 "%s,\nor visit https://%s or https://%s wirelessly",
+				 "%s,\nor visit http://%s or http://%s wirelessly",
 				 port_msg, ov->wlan_mdns, ov->wlan_ip);
 		} else if (ov->wlan_mdns[0]) {
 			snprintf(msg, sizeof(msg),
-				 "%s,\nor visit https://%s wirelessly",
+				 "%s,\nor visit http://%s wirelessly",
 				 port_msg, ov->wlan_mdns);
 		} else {
 			snprintf(msg, sizeof(msg), "%s", port_msg);
@@ -210,16 +210,16 @@ static void rebuild_text(struct breezy_overlay *ov)
 		if (active_mdns[0] && active_ip[0]) {
 			snprintf(msg, sizeof(msg),
 				 "No USB/IP clients connected.\n"
-				 "To get started, visit https://%s or https://%s",
+				 "To get started, visit http://%s or http://%s",
 				 active_mdns, active_ip);
 		} else if (active_mdns[0]) {
 			snprintf(msg, sizeof(msg),
 				 "No USB/IP clients connected.\n"
-				 "To get started, visit https://%s", active_mdns);
+				 "To get started, visit http://%s", active_mdns);
 		} else if (active_ip[0]) {
 			snprintf(msg, sizeof(msg),
 				 "No USB/IP clients connected.\n"
-				 "To get started, visit https://%s", active_ip);
+				 "To get started, visit http://%s", active_ip);
 		} else {
 			snprintf(msg, sizeof(msg),
 				 "No USB/IP clients connected.");
@@ -230,15 +230,15 @@ static void rebuild_text(struct breezy_overlay *ov)
 		if (active_mdns[0] && active_ip[0]) {
 			snprintf(msg, sizeof(msg),
 				 "To configure your experience, visit\n"
-				 "https://%s or https://%s",
+				 "http://%s or http://%s",
 				 active_mdns, active_ip);
 		} else if (active_mdns[0]) {
 			snprintf(msg, sizeof(msg),
-				 "To configure your experience, visit https://%s",
+				 "To configure your experience, visit http://%s",
 				 active_mdns);
 		} else if (active_ip[0]) {
 			snprintf(msg, sizeof(msg),
-				 "To configure your experience, visit https://%s",
+				 "To configure your experience, visit http://%s",
 				 active_ip);
 		} else {
 			msg[0] = '\0';

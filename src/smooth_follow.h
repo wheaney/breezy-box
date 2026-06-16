@@ -102,6 +102,15 @@ const float *smooth_follow_camera_quat(const struct smooth_follow_state *sf);
 bool smooth_follow_is_centring(const struct smooth_follow_state *sf, int slot);
 
 /*
+ * The display slot smooth follow currently owns while engaged, or -1 if none /
+ * not following.  Callers that also run zoom-on-focus should lock the zoom focus
+ * onto this slot so the two features agree on the followed (centred) display
+ * rather than the zoom independently re-deriving focus from gaze against the
+ * displays' arc positions.
+ */
+int smooth_follow_focus_slot(const struct smooth_follow_state *sf);
+
+/*
  * Build the model matrix for the display being centred, easing between its arc
  * position (progress 0) and centred-in-front (progress 1).  The display's mesh
  * is assumed to bake its centerNoRotate offset (cnx,cny,cnz), as produced by

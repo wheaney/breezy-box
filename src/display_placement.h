@@ -178,6 +178,11 @@ int dp_compute_placements(const struct dp_monitor_info *monitors,
  *   current_focused_index     – previously focused index (-1 if none)
  *   focused_monitor_distance   – display_distance / display_distance_default
  *                                (< 1 when a focused display is zoomed in)
+ *   smooth_follow_enabled      – when true, the shared finder locks onto
+ *                                current_focused_index (if set) and otherwise
+ *                                returns the closest display unconditionally,
+ *                                bypassing FOCUS_THRESHOLD — matching the
+ *                                references' follow-mode focus selection.
  *
  * Returns the focused monitor index, -1 if none, or -1 on error.
  */
@@ -188,6 +193,7 @@ int dp_find_focused_monitor(const struct dp_placement *placements,
                             float pos_east, float pos_up, float pos_south,
                             int current_focused_index,
                             float focused_monitor_distance,
+                            bool smooth_follow_enabled,
                             uint32_t device_width,
                             uint32_t device_height,
                             float diagonal_fov_rad,

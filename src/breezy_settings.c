@@ -43,6 +43,7 @@ static void read_into(GSettings *gs, struct breezy_display_settings *s)
     s->look_ahead_override                = g_settings_get_int    (gs, "look-ahead-override");
     s->disable_anti_aliasing              = g_settings_get_boolean(gs, "disable-anti-aliasing");
     s->follow_threshold                   = g_settings_get_double (gs, "follow-threshold");
+    s->all_displays_follow_mode           = g_settings_get_boolean(gs, "legacy-follow-mode");
 }
 
 static void on_changed(GSettings *gs, const gchar *key, gpointer user_data)

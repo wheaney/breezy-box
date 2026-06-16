@@ -1276,7 +1276,8 @@ static void kms_begin_zoom_ease(struct kms_state *kms, size_t i,
  */
 static int kms_detect_focus_slot(struct kms_state *kms,
                                  float qw, float qx, float qy, float qz,
-                                 float px, float py, float pz)
+                                 float px, float py, float pz,
+                                 bool smooth_follow_enabled)
 {
 	if (!kms->placements_computed || kms->focus_monitor_count == 0u)
 		return -1;
@@ -1296,7 +1297,7 @@ static int kms_detect_focus_slot(struct kms_state *kms,
 	int nc = dp_find_focused_monitor(
 	    compact, kms->focus_monitors, kms->focus_monitor_count,
 	    qw, qx, qy, qz, px, py, pz,
-	    current_compact, focused_ratio,
+	    current_compact, focused_ratio, smooth_follow_enabled,
 	    kms->focus_dev_w, kms->focus_dev_h, kms->focus_diag_rad,
 	    kms->focus_lens_ratio, kms->focus_dist_default,
 	    kms->device_size_adj_w_px, kms->device_size_adj_h_px,
@@ -1319,7 +1320,7 @@ static int kms_sf_focus_cb(void *ctx, const float origin_quat[4], const float po
 	float pz = pose_pos ? pose_pos[2] : 0.0f;
 	return kms_detect_focus_slot(kms,
 	    origin_quat[0], origin_quat[1], origin_quat[2], origin_quat[3],
-	    px, py, pz);
+	    px, py, pz, true);
 }
 
 /*
@@ -1336,7 +1337,8 @@ static void kms_update_smooth_follow(struct kms_state *kms, uint64_t now_ms)
 	float origin_quat[4] = { pose.sf_quat_w, pose.sf_quat_x, pose.sf_quat_y, pose.sf_quat_z };
 	float pose_pos[3]    = { pose.pos_x, pose.pos_y, pose.pos_z };
 
-	smooth_follow_update(&kms->sf, have, have && pose.sf_enabled,
+	bool enabled = have && pose.sf_enabled && !kms->settings.all_displays_follow_mode;
+	smooth_follow_update(&kms->sf, have, enabled,
 	                     pose_quat, origin_quat, pose_pos, now_ms,
 	                     kms_sf_focus_cb, kms);
 }
@@ -1367,22 +1369,39 @@ static void kms_update_focus(struct kms_state *kms, uint64_t now_ms)
 		return;
 	}
 
-	struct breezy_imu_pose pose;
-	if (!breezy_imu_try_get_pose(&pose))
-		return;
+	int new_focus;
 
 	/*
-	 * While smooth follow is engaged the head pose is the (near-identity) residual
-	 * relative to the origin, so gaze focus must be evaluated against the origin
-	 * orientation instead — mirroring BreezyDesktop.qml updateFocus().
+	 * When smooth follow is engaged, zoom-on-focus locks onto the followed
+	 * (centred) display rather than re-deriving focus from gaze.  The followed
+	 * display is rendered centred-in-front while gaze focus is evaluated against
+	 * the displays' arc positions, so the two would otherwise disagree.  This
+	 * also covers enabling order: follow may have picked its slot before
+	 * zoom-on-focus turned on, and the first check here adopts it.
 	 */
-	float fq_w = kms->sf.enabled ? pose.sf_quat_w : pose.quat_w;
-	float fq_x = kms->sf.enabled ? pose.sf_quat_x : pose.quat_x;
-	float fq_y = kms->sf.enabled ? pose.sf_quat_y : pose.quat_y;
-	float fq_z = kms->sf.enabled ? pose.sf_quat_z : pose.quat_z;
+	int follow_slot = smooth_follow_focus_slot(&kms->sf);
+	if (follow_slot >= 0) {
+		new_focus = follow_slot;
+	} else {
+		struct breezy_imu_pose pose;
+		if (!breezy_imu_try_get_pose(&pose))
+			return;
 
-	int new_focus = kms_detect_focus_slot(kms, fq_w, fq_x, fq_y, fq_z,
-	                                      pose.pos_x, pose.pos_y, pose.pos_z);
+		/*
+		 * While smooth follow is engaged the head pose is the (near-identity)
+		 * residual relative to the origin, so gaze focus must be evaluated
+		 * against the origin orientation instead — mirroring BreezyDesktop.qml
+		 * updateFocus().
+		 */
+		float fq_w = kms->sf.enabled ? pose.sf_quat_w : pose.quat_w;
+		float fq_x = kms->sf.enabled ? pose.sf_quat_x : pose.quat_x;
+		float fq_y = kms->sf.enabled ? pose.sf_quat_y : pose.quat_y;
+		float fq_z = kms->sf.enabled ? pose.sf_quat_z : pose.quat_z;
+
+		new_focus = kms_detect_focus_slot(kms, fq_w, fq_x, fq_y, fq_z,
+		                                  pose.pos_x, pose.pos_y, pose.pos_z,
+		                                  kms->sf.enabled);
+	}
 
 	if (new_focus == kms->focused_monitor_index)
 		return;
@@ -1549,6 +1568,17 @@ static void kms_render_frame(struct kms_state *kms,
 	bool  first_ext = true;
 	float arc_r_px  = kms->device_complete_dist_px;
 
+	/*
+	 * The smooth-follow centred display must always render above the others, so
+	 * its draw is deferred until after the loop (see below) and replayed over a
+	 * cleared depth buffer.
+	 */
+	bool          have_follow_draw = false;
+	ESMatrix      follow_mvp;
+	GLuint        follow_tex = 0;
+	const float  *follow_verts = NULL;
+	int           follow_vert_count = 0;
+
 	for (size_t vi = 0u; vi < visible_count; vi++) {
 		size_t i = visible_idx[vi];
 		struct kms_display_tex *disp = &kms->displays[i];
@@ -1574,7 +1604,8 @@ static void kms_render_frame(struct kms_state *kms,
 			float cny = kms->placements[i].cny;
 			float cnz = kms->placements[i].cnz;
 
-			if (smooth_follow_is_centring(&kms->sf, (int)i)) {
+			bool centring = smooth_follow_is_centring(&kms->sf, (int)i);
+			if (centring) {
 				/*
 				 * Smooth-follow focused display: hand the placement to the
 				 * reusable module, which locks it centred in front of the
@@ -1604,8 +1635,17 @@ static void kms_render_frame(struct kms_state *kms,
 				es_display_model(&model, ang, tdx, tdy, tdz);
 			}
 			es_multiply(&mvp, &model, &proj_view);
-			display_renderer_draw_mesh(&kms->dr, &mvp, tex,
-			                          (const float *)mesh->verts, mesh->vert_count);
+			if (centring) {
+				/* Defer; replayed last so it occludes every other display. */
+				follow_mvp        = mvp;
+				follow_tex        = tex;
+				follow_verts      = (const float *)mesh->verts;
+				follow_vert_count = mesh->vert_count;
+				have_follow_draw  = true;
+			} else {
+				display_renderer_draw_mesh(&kms->dr, &mvp, tex,
+				                          (const float *)mesh->verts, mesh->vert_count);
+			}
 
 			float w_half  = (float)server->opts.devices[i].decode_width  * 0.5f;
 			float h_half  = (float)server->opts.devices[i].decode_height * 0.5f;
@@ -1632,6 +1672,17 @@ static void kms_render_frame(struct kms_state *kms,
 
 			if (h_half > top_y_px) top_y_px = h_half;
 		}
+	}
+
+	/*
+	 * Replay the deferred smooth-follow display last.  Clearing the depth buffer
+	 * first lets it occlude every other display regardless of its world distance,
+	 * while keeping the normal depth test so its own curved mesh self-sorts.
+	 */
+	if (have_follow_draw) {
+		glClear(GL_DEPTH_BUFFER_BIT);
+		display_renderer_draw_mesh(&kms->dr, &follow_mvp, follow_tex,
+		                          follow_verts, follow_vert_count);
 	}
 
 	/* Midpoint of the combined left-edge to right-edge span. */

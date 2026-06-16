@@ -33,6 +33,14 @@ struct breezy_display_settings {
 
     /* Follow */
     double  follow_threshold;           /* degrees */
+    /*
+     * "All displays follow" mode (the gschema's legacy-follow-mode key; KWin
+     * calls it AllDisplaysFollowMode).  When true, the driver applies follow to
+     * the pose data itself so the whole layout follows, and the renderer skips
+     * all desktop-side smooth-follow logic — rendering exactly as if smooth
+     * follow were off, even while the driver's smooth-follow flag is set.
+     */
+    bool    all_displays_follow_mode;
 };
 
 /*

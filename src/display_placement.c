@@ -537,6 +537,7 @@ int dp_find_focused_monitor(const struct dp_placement *placements,
                             float pos_east, float pos_up, float pos_south,
                             int current_focused_index,
                             float focused_monitor_distance,
+                            bool smooth_follow_enabled,
                             uint32_t device_width,
                             uint32_t device_height,
                             float diagonal_fov_rad,
@@ -615,7 +616,7 @@ int dp_find_focused_monitor(const struct dp_placement *placements,
         monitor_vectors,
         JS_NewInt32(g_ctx, current_focused_index),
         JS_NewFloat64(g_ctx, (double)focused_monitor_distance),
-        JS_NewBool(g_ctx, 0),               /* smoothFollowEnabled = false */
+        JS_NewBool(g_ctx, smooth_follow_enabled ? 1 : 0),
         fov_obj,
         monitor_details
     };

@@ -152,6 +152,11 @@ bool smooth_follow_is_centring(const struct smooth_follow_state *sf, int slot)
 	return sf->have_pose && slot == sf->focus_slot && sf->progress > 0.0f;
 }
 
+int smooth_follow_focus_slot(const struct smooth_follow_state *sf)
+{
+	return sf->enabled ? sf->focus_slot : -1;
+}
+
 void smooth_follow_focused_model(const struct smooth_follow_state *sf,
                                  float cnx, float cny, float cnz,
                                  float angle, float scale,
