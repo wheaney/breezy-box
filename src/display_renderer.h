@@ -140,3 +140,13 @@ void display_renderer_draw_mesh(const struct display_renderer *r,
                                 const ESMatrix *mvp,
                                 GLuint tex,
                                 const float *verts, int vert_count);
+
+/*
+ * Generate a mipmap chain for the given 2D texture and set trilinear
+ * minification (GL_LINEAR_MIPMAP_LINEAR) with GL_LINEAR magnification and
+ * clamped wrapping.  Call after the texture's level-0 image has been uploaded.
+ * Reduces edge shimmer when the texture is minified or sampled at a
+ * non-integer scale (e.g. text under continuous head motion).  Renderer-
+ * agnostic: requires only an active GL context.
+ */
+void display_renderer_texture_mipmap_trilinear(GLuint tex);

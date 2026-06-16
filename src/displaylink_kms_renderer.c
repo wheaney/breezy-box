@@ -943,7 +943,7 @@ static int kms_init_gbm_egl(struct kms_state *kms, bool want_msaa)
 	eglChooseConfig(kms->egl_display, config_attribs, configs, count, &matched);
 
 	if (want_msaa) {
-		static const int try_samples[] = { 8, 4, 2 };
+		static const int try_samples[] = { 4, 2 };
 		for (size_t ti = 0; ti < sizeof(try_samples)/sizeof(try_samples[0]) && !chosen_config; ti++) {
 			EGLint want_samples = (EGLint)try_samples[ti];
 			for (i = 0; i < matched && !chosen_config; i++) {

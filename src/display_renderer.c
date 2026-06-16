@@ -514,3 +514,53 @@ void display_renderer_draw_mesh(const struct display_renderer *r,
 
     glBindTexture(GL_TEXTURE_2D, 0);
 }
+
+/* True if `ext` appears as a whole token in the active GL extension string. */
+static bool dr_has_gl_ext(const char *ext)
+{
+    const char *list = (const char *)glGetString(GL_EXTENSIONS);
+    size_t len = ext ? strlen(ext) : 0;
+
+    if (!list || !len)
+        return false;
+    for (const char *p = strstr(list, ext); p; p = strstr(p + len, ext)) {
+        if ((p == list || p[-1] == ' ') && (p[len] == ' ' || p[len] == '\0'))
+            return true;
+    }
+    return false;
+}
+
+void display_renderer_texture_mipmap_trilinear(GLuint tex)
+{
+    if (!tex)
+        return;
+
+    glBindTexture(GL_TEXTURE_2D, tex);
+
+    /*
+     * GLES 2.0 only allows mipmaps on non-power-of-two textures when
+     * GL_OES_texture_npot is present; without it glGenerateMipmap on an NPOT
+     * texture is an error and sampling returns black.  The overlay/text
+     * textures are sized to the string and are essentially always NPOT, so
+     * fall back to plain GL_LINEAR when the extension is missing rather than
+     * risk a black quad.
+     */
+    if (dr_has_gl_ext("GL_OES_texture_npot")) {
+        /*
+         * Trilinear minification (GL_LINEAR_MIPMAP_LINEAR): when a texture is
+         * minified or sampled at a non-integer scale — which happens
+         * continuously under head jitter in an XR scene — trilinear blends
+         * between mip levels instead of crawling across texels, the dominant
+         * source of edge shimmer for texture-sampled content (e.g. text).
+         * Magnification stays GL_LINEAR; mipmaps only affect minification.
+         */
+        glGenerateMipmap(GL_TEXTURE_2D);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    } else {
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    }
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glBindTexture(GL_TEXTURE_2D, 0);
+}

@@ -1,4 +1,5 @@
 #include "overlay_text.h"
+#include "display_renderer.h"
 
 #include <GLES2/gl2.h>
 #include <stdint.h>
@@ -286,11 +287,8 @@ void overlay_text_update(struct overlay_text *ot, const char *text)
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA,
                  (GLsizei)final_w, (GLsizei)final_h,
                  0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glBindTexture(GL_TEXTURE_2D, 0);
+    display_renderer_texture_mipmap_trilinear(ot->tex);
 
     free(pixels);
 
