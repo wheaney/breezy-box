@@ -192,6 +192,21 @@ static void parse_and_store(void)
 	pose.quat_y =  q[2];
 	pose.quat_z = -q[0];
 
+	/*
+	 * Smooth-follow origin: SF_ORIGIN_DATA is 16 floats (4×4) like POSE_ORIENT;
+	 * only row 0 is the quaternion [x, y, z, w] in NWU.  Convert to EUS exactly
+	 * as the pose quaternion above (w unchanged, x = -y_nwu, y = z_nwu,
+	 * z = -x_nwu).  These fields sit outside the parity-protected range, matching
+	 * the GNOME/KWin readers which also parse them unguarded.
+	 */
+	pose.sf_enabled = (buf[DV_SF_ENABLED_O] != 0);
+	float sfq[4];
+	memcpy(sfq, buf + DV_SF_ORIGIN_DATA_O, sizeof(sfq));
+	pose.sf_quat_w =  sfq[3];
+	pose.sf_quat_x = -sfq[1];
+	pose.sf_quat_y =  sfq[2];
+	pose.sf_quat_z = -sfq[0];
+
 	/* Device config — relatively static, parsed alongside every pose update. */
 	struct breezy_imu_device_config config;
 	config.version = buf[DV_VERSION_O];

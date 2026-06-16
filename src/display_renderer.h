@@ -45,6 +45,14 @@ void es_display_model(ESMatrix *m, float angle, float tx, float ty, float tz);
  */
 void es_view_from_quat(ESMatrix *r, float qw, float qx, float qy, float qz);
 
+/*
+ * Forward model rotation from unit quaternion (w, x, y, z, EUS frame).
+ * The counterpart to es_view_from_quat (which builds the conjugate for the
+ * camera): this rotates geometry by the quaternion, matching es_display_model's
+ * handedness so it can be composed with translations as a model matrix.
+ */
+void es_model_from_quat(ESMatrix *r, float qw, float qx, float qy, float qz);
+
 /* ----------------------------------------------------------------
  * Curved display mesh — pre-computed once per device config change.
  * Each vertex stores (x, y, z, s, t) tightly packed; ready to pass

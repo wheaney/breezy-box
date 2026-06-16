@@ -41,6 +41,7 @@
 #include "display_renderer.h"
 #include "server.h"
 #include "display_placement.h"
+#include "smooth_follow.h"
 #include "usb_gadget.h"
 #include "link_services.h"
 
@@ -172,6 +173,11 @@ struct kms_state {
 	uint64_t zoom_ease_begin_ms[MAX_USBIP_DEVICES];
 	bool     zoom_ease_active[MAX_USBIP_DEVICES];
 	bool     zoom_ease_seq_delay[MAX_USBIP_DEVICES];
+
+	/* Smooth follow — renderer-agnostic state machine lives in smooth_follow.c;
+	 * this file only feeds it IMU data and applies its outputs to the camera and
+	 * the focused display's model matrix. */
+	struct smooth_follow_state sf;
 
 	/* Inputs captured at placement time so the periodic focus check can call
 	 * dp_find_focused_monitor() without recomputing them every frame. */
@@ -596,6 +602,9 @@ static void kms_poll_device_config(struct kms_state *kms,
 		if (layout_changed) {
 			kms->focused_monitor_index = -1;
 			kms->last_focus_check_ms   = 0;
+			/* Drop any in-flight smooth-follow centring; the slot index no
+			 * longer maps to the same display after a layout change. */
+			smooth_follow_reset_focus(&kms->sf);
 			for (size_t mi = 0u; mi < MAX_USBIP_DEVICES; mi++) {
 				kms->monitor_distance[mi] = kms->zoom_all_distance;
 				kms->zoom_ease_active[mi] = false;
@@ -1260,6 +1269,79 @@ static void kms_begin_zoom_ease(struct kms_state *kms, size_t i,
 }
 
 /*
+ * Resolve which display slot the given orientation/position is looking at, via
+ * dp_find_focused_monitor().  Builds the compact (consecutive-index) placement
+ * array the shared finder expects and remaps the result back to a device slot.
+ * Returns -1 for "none" (or when placements aren't ready).
+ */
+static int kms_detect_focus_slot(struct kms_state *kms,
+                                 float qw, float qx, float qy, float qz,
+                                 float px, float py, float pz)
+{
+	if (!kms->placements_computed || kms->focus_monitor_count == 0u)
+		return -1;
+
+	float focused_ratio = (kms->zoom_all_distance > 0.0f)
+	                    ? kms->zoom_focused_distance / kms->zoom_all_distance
+	                    : 1.0f;
+
+	struct dp_placement compact[MAX_USBIP_DEVICES];
+	int current_compact = -1;
+	for (size_t mi = 0u; mi < kms->focus_monitor_count; mi++) {
+		compact[mi] = kms->placements[kms->focus_slot_map[mi]];
+		if ((int)kms->focus_slot_map[mi] == kms->focused_monitor_index)
+			current_compact = (int)mi;
+	}
+
+	int nc = dp_find_focused_monitor(
+	    compact, kms->focus_monitors, kms->focus_monitor_count,
+	    qw, qx, qy, qz, px, py, pz,
+	    current_compact, focused_ratio,
+	    kms->focus_dev_w, kms->focus_dev_h, kms->focus_diag_rad,
+	    kms->focus_lens_ratio, kms->focus_dist_default,
+	    kms->device_size_adj_w_px, kms->device_size_adj_h_px,
+	    kms->focus_scheme, kms->focus_curved);
+
+	return (nc >= 0 && (size_t)nc < kms->focus_monitor_count)
+	     ? (int)kms->focus_slot_map[(size_t)nc]
+	     : -1;
+}
+
+/*
+ * Adapter so the reusable smooth_follow state machine can resolve the centred
+ * display through this renderer's placement bookkeeping (smooth_follow_focus_fn).
+ */
+static int kms_sf_focus_cb(void *ctx, const float origin_quat[4], const float pose_pos[3])
+{
+	struct kms_state *kms = ctx;
+	float px = pose_pos ? pose_pos[0] : 0.0f;
+	float py = pose_pos ? pose_pos[1] : 0.0f;
+	float pz = pose_pos ? pose_pos[2] : 0.0f;
+	return kms_detect_focus_slot(kms,
+	    origin_quat[0], origin_quat[1], origin_quat[2], origin_quat[3],
+	    px, py, pz);
+}
+
+/*
+ * Feed the latest IMU sample into the renderer-agnostic smooth-follow state
+ * machine.  All behaviour (easing, slerp-back window, centring math) lives in
+ * smooth_follow.c; here we only marshal the pose into its expected shape.
+ */
+static void kms_update_smooth_follow(struct kms_state *kms, uint64_t now_ms)
+{
+	struct breezy_imu_pose pose;
+	bool have = breezy_imu_try_get_pose(&pose);
+
+	float pose_quat[4]   = { pose.quat_w,    pose.quat_x,    pose.quat_y,    pose.quat_z };
+	float origin_quat[4] = { pose.sf_quat_w, pose.sf_quat_x, pose.sf_quat_y, pose.sf_quat_z };
+	float pose_pos[3]    = { pose.pos_x, pose.pos_y, pose.pos_z };
+
+	smooth_follow_update(&kms->sf, have, have && pose.sf_enabled,
+	                     pose_quat, origin_quat, pose_pos, now_ms,
+	                     kms_sf_focus_cb, kms);
+}
+
+/*
  * Run the periodic gaze focus check (throttled to KMS_FOCUS_CHECK_MS).  When the
  * focused monitor changes, kick off the matching ease-out / ease-in transitions.
  */
@@ -1289,34 +1371,18 @@ static void kms_update_focus(struct kms_state *kms, uint64_t now_ms)
 	if (!breezy_imu_try_get_pose(&pose))
 		return;
 
-	float focused_ratio = (kms->zoom_all_distance > 0.0f)
-	                    ? kms->zoom_focused_distance / kms->zoom_all_distance
-	                    : 1.0f;
+	/*
+	 * While smooth follow is engaged the head pose is the (near-identity) residual
+	 * relative to the origin, so gaze focus must be evaluated against the origin
+	 * orientation instead — mirroring BreezyDesktop.qml updateFocus().
+	 */
+	float fq_w = kms->sf.enabled ? pose.sf_quat_w : pose.quat_w;
+	float fq_x = kms->sf.enabled ? pose.sf_quat_x : pose.quat_x;
+	float fq_y = kms->sf.enabled ? pose.sf_quat_y : pose.quat_y;
+	float fq_z = kms->sf.enabled ? pose.sf_quat_z : pose.quat_z;
 
-	/* Build a compact placements array matching focus_monitors[] so
-	 * dp_find_focused_monitor sees consecutive indices 0..n-1. */
-	struct dp_placement focus_compact_placements[MAX_USBIP_DEVICES];
-	int current_compact_focus = -1;
-	for (size_t mi = 0u; mi < kms->focus_monitor_count; mi++) {
-		focus_compact_placements[mi] = kms->placements[kms->focus_slot_map[mi]];
-		if ((int)kms->focus_slot_map[mi] == kms->focused_monitor_index)
-			current_compact_focus = (int)mi;
-	}
-
-	int new_compact_focus = dp_find_focused_monitor(
-	    focus_compact_placements, kms->focus_monitors, kms->focus_monitor_count,
-	    pose.quat_w, pose.quat_x, pose.quat_y, pose.quat_z,
-	    pose.pos_x, pose.pos_y, pose.pos_z,
-	    current_compact_focus, focused_ratio,
-	    kms->focus_dev_w, kms->focus_dev_h, kms->focus_diag_rad,
-	    kms->focus_lens_ratio, kms->focus_dist_default,
-	    kms->device_size_adj_w_px, kms->device_size_adj_h_px,
-	    kms->focus_scheme, kms->focus_curved);
-
-	/* Remap compact index → slot index (-1 stays -1). */
-	int new_focus = (new_compact_focus >= 0 && (size_t)new_compact_focus < kms->focus_monitor_count)
-	              ? (int)kms->focus_slot_map[(size_t)new_compact_focus]
-	              : -1;
+	int new_focus = kms_detect_focus_slot(kms, fq_w, fq_x, fq_y, fq_z,
+	                                      pose.pos_x, pose.pos_y, pose.pos_z);
 
 	if (new_focus == kms->focused_monitor_index)
 		return;
@@ -1416,10 +1482,20 @@ static void kms_render_frame(struct kms_state *kms,
 	es_perspective_unit(&proj, kms->device_fov_half_v_tan, kms->device_aspect,
 	                    KMS_NEAR, KMS_FAR);
 
+	/*
+	 * Smooth follow: advance the state machine, then drive the whole camera from
+	 * the smooth-follow origin while follow is engaged (or still slerping back
+	 * after a disable) so every display follows the head.  Mirrors KWin's
+	 * CameraController, which picks smoothFollowOrigin over poseOrientations
+	 * whenever smoothFollowEnabled || smoothFollowDisabling.
+	 */
+	uint64_t now_ms = kms_realtime_ms();
+	kms_update_smooth_follow(kms, now_ms);
+
 	ESMatrix view, proj_view;
-	struct breezy_imu_pose pose;
-	if (breezy_imu_try_get_pose(&pose)) {
-		es_view_from_quat(&view, pose.quat_w, pose.quat_x, pose.quat_y, pose.quat_z);
+	const float *cq = smooth_follow_camera_quat(&kms->sf);
+	if (cq) {
+		es_view_from_quat(&view, cq[0], cq[1], cq[2], cq[3]);
 	} else {
 		es_load_identity(&view);
 	}
@@ -1436,11 +1512,8 @@ static void kms_render_frame(struct kms_state *kms,
 	 * Zoom-on-focus: poll gaze focus (self-throttled to KMS_FOCUS_CHECK_MS) and
 	 * advance the per-monitor distance eases before placing the display meshes.
 	 */
-	{
-		uint64_t now_ms = kms_realtime_ms();
-		kms_update_focus(kms, now_ms);
-		kms_step_zoom_eases(kms, now_ms);
-	}
+	kms_update_focus(kms, now_ms);
+	kms_step_zoom_eases(kms, now_ms);
 
 	/*
 	 * Display meshes are opaque: depth-test so a nearer (e.g. focused/zoomed-in)
@@ -1490,19 +1563,6 @@ static void kms_render_frame(struct kms_state *kms,
 		}
 
 		if (kms->meshes_computed) {
-			/*
-			 * Mesh vertices are pre-computed in GL world space relative to the
-			 * rotation origin (centerNoRotate).  Apply Y-rotation only — the
-			 * arc curvature baked into the vertices is preserved.  Flat displays
-			 * produce a 1-segment mesh (4 vertices) with no separate path.
-			 *
-			 * Zoom-on-focus: scale the monitor's centre position by
-			 * s = monitor_distance / zoom_all_distance (matching KWin's
-			 * centerNoRotate.times(monitorDistance/allDisplaysDistance)).  The mesh
-			 * already bakes centerNoRotate, so we add the delta (s-1)·R·cn as a
-			 * post-rotation world translation, moving the centre without rescaling
-			 * the display's own size or curvature.
-			 */
 			const struct display_mesh *mesh = &kms->meshes[i];
 			float ang = kms->placements[i].angle;
 			float s   = (kms->zoom_all_distance > 0.0f)
@@ -1511,14 +1571,38 @@ static void kms_render_frame(struct kms_state *kms,
 			float ca  = cosf(ang);
 			float sa  = sinf(ang);
 			float cnx = kms->placements[i].cnx;
+			float cny = kms->placements[i].cny;
 			float cnz = kms->placements[i].cnz;
-			/* R(angle)·centerNoRotate in GL space (Y-rotation only). */
-			float rcn_x = ca * cnx + sa * cnz;
-			float rcn_z = -sa * cnx + ca * cnz;
-			float tdx = (s - 1.0f) * rcn_x;
-			float tdy = (s - 1.0f) * kms->placements[i].cny;
-			float tdz = (s - 1.0f) * rcn_z;
-			es_display_model(&model, ang, tdx, tdy, tdz);
+
+			if (smooth_follow_is_centring(&kms->sf, (int)i)) {
+				/*
+				 * Smooth-follow focused display: hand the placement to the
+				 * reusable module, which locks it centred in front of the
+				 * (residual) head pose, easing between its arc position and
+				 * centred-in-front.  The camera already runs on the origin.
+				 */
+				smooth_follow_focused_model(&kms->sf, cnx, cny, cnz, ang, s, &model);
+			} else {
+				/*
+				 * Mesh vertices are pre-computed in GL world space relative to the
+				 * rotation origin (centerNoRotate).  Apply Y-rotation only — the
+				 * arc curvature baked into the vertices is preserved.  Flat displays
+				 * produce a 1-segment mesh (4 vertices) with no separate path.
+				 *
+				 * Zoom-on-focus: scale the monitor's centre position by
+				 * s = monitor_distance / zoom_all_distance (matching KWin's
+				 * centerNoRotate.times(monitorDistance/allDisplaysDistance)).  The
+				 * mesh already bakes centerNoRotate, so we add the delta (s-1)·R·cn
+				 * as a post-rotation world translation, moving the centre without
+				 * rescaling the display's own size or curvature.
+				 */
+				float rcn_x = ca * cnx + sa * cnz;
+				float rcn_z = -sa * cnx + ca * cnz;
+				float tdx = (s - 1.0f) * rcn_x;
+				float tdy = (s - 1.0f) * cny;
+				float tdz = (s - 1.0f) * rcn_z;
+				es_display_model(&model, ang, tdx, tdy, tdz);
+			}
 			es_multiply(&mvp, &model, &proj_view);
 			display_renderer_draw_mesh(&kms->dr, &mvp, tex,
 			                          (const float *)mesh->verts, mesh->vert_count);
@@ -1633,6 +1717,7 @@ static int kms_run(struct kms_state *kms, struct server_runtime *server)
 	kms->zoom_on_focus            = false;
 	kms->focused_monitor_index    = -1;
 	kms->last_focus_check_ms      = 0;
+	smooth_follow_init(&kms->sf);
 	for (size_t mi = 0u; mi < MAX_USBIP_DEVICES; mi++) {
 		kms->monitor_distance[mi] = 1.0f;
 		kms->zoom_ease_active[mi] = false;

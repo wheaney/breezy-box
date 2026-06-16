@@ -170,6 +170,26 @@ void es_view_from_quat(ESMatrix *r, float qw, float qx, float qy, float qz)
     r->m[3][3] =  1.0f;
 }
 
+void es_model_from_quat(ESMatrix *r, float qw, float qx, float qy, float qz)
+{
+    float xx = qx * qx, yy = qy * qy, zz = qz * qz;
+    float xy = qx * qy, xz = qx * qz, yz = qy * qz;
+    float wx = qw * qx, wy = qw * qy, wz = qw * qz;
+
+    memset(r, 0, sizeof(*r));
+    /* Column-major m[col][row]; the transpose of es_view_from_quat's conjugate. */
+    r->m[0][0] = 1.0f - 2.0f * (yy + zz);
+    r->m[0][1] =        2.0f * (xy + wz);
+    r->m[0][2] =        2.0f * (xz - wy);
+    r->m[1][0] =        2.0f * (xy - wz);
+    r->m[1][1] = 1.0f - 2.0f * (xx + zz);
+    r->m[1][2] =        2.0f * (yz + wx);
+    r->m[2][0] =        2.0f * (xz + wy);
+    r->m[2][1] =        2.0f * (yz - wx);
+    r->m[2][2] = 1.0f - 2.0f * (xx + yy);
+    r->m[3][3] = 1.0f;
+}
+
 /* ----------------------------------------------------------------
  * Mesh generation — moved to dp_generate_mesh_vertices() in display_placement.c
  * which delegates to generateMeshVertices() in the shared JS bundle.
