@@ -37,6 +37,7 @@
 #include "breezy_state.h"
 #include "overlay_text.h"
 #include "breezy_settings.h"
+#include "breezy_driver_control.h"
 #include "common.h"
 #include "display_renderer.h"
 #include "server.h"
@@ -1778,6 +1779,7 @@ static int kms_run(struct kms_state *kms, struct server_runtime *server)
 		fprintf(stderr, "kms: failed to start settings watcher\n");
 		return -1;
 	}
+	breezy_driver_control_update(&kms->settings);
 	/* Prime the overlay texture before the first frame. */
 	{
 		char msg[BS_MSG_MAX];
@@ -1816,6 +1818,8 @@ static int kms_run(struct kms_state *kms, struct server_runtime *server)
 
 		bool settings_dirty =
 		    breezy_settings_consume_if_changed(kms->settings_handle, &kms->settings);
+		if (settings_dirty)
+			breezy_driver_control_update(&kms->settings);
 		kms_poll_device_config(kms, server, settings_dirty);
 
 		/* Honour framerate_cap: skip this iteration if not enough time has passed. */

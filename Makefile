@@ -45,7 +45,7 @@ KMS_RENDERER_TARGET_BASE := displaylink_kms_renderer
 KMS_RENDERER_PROFILE_TARGET := $(KMS_RENDERER_TARGET_BASE)-profile
 KMS_RENDERER_TARGET := $(KMS_RENDERER_TARGET_BASE)$(PROFILE_SUFFIX)
 COMPAT_SOURCES := $(COMPAT_DIR)/src/udl_sink.c
-KMS_COMPOSITOR_SOURCES := $(addprefix $(SRC_DIR)/,displaylink_kms_renderer.c display_renderer.c overlay_text.c breezy_state.c usbip.c udl_device.c udl_runtime.c server.c display_placement.c smooth_follow.c breezy_imu.c breezy_settings.c usb_gadget.c link_services.c) $(COMPAT_SOURCES)
+KMS_COMPOSITOR_SOURCES := $(addprefix $(SRC_DIR)/,displaylink_kms_renderer.c display_renderer.c overlay_text.c breezy_state.c usbip.c udl_device.c udl_runtime.c server.c display_placement.c smooth_follow.c breezy_imu.c breezy_settings.c breezy_driver_control.c usb_gadget.c link_services.c) $(COMPAT_SOURCES)
 
 CPPFLAGS += -I$(COMPAT_DIR)/include -I$(ZEROKVM_BRIDGE_INCLUDEDIR) -I$(SRC_DIR)
 LDFLAGS += -L$(ZEROKVM_BRIDGE_LIBDIR) -Wl,-rpath,$(ZEROKVM_BRIDGE_LIBDIR)
