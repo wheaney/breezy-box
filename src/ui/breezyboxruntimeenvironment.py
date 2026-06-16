@@ -74,7 +74,14 @@ class BreezyBoxRuntimeEnvironment(RuntimeEnvironment):
             'remove_virtual_displays_on_disable_switch',
             'virtual_displays_row',
             'launch_display_settings_row',
+            'headset_display_as_viewport_center_switch',
         ])
+
+    @property
+    def multiple_displays_fields_always_unlocked(self):
+        # The box has no connected-display awareness in the UI, so the
+        # wrapping scheme and monitor spacing fields are always available.
+        return True
 
     @property
     def excluded_tab_names(self):
