@@ -198,9 +198,6 @@ struct kms_state {
 	/* Overlay: GL texture for connection-status messages; text from breezy_state. */
 	struct overlay_text overlay_tex;
 
-	/* Actual MSAA sample count used by the EGL config (0 = no MSAA). */
-	int msaa_samples;
-
 	/* Back-pointer to the long-lived app state (not owned by the renderer). */
 	struct breezy_state *state;
 };
@@ -933,30 +930,43 @@ static int kms_init_gbm_egl(struct kms_state *kms, bool want_msaa)
 	}
 
 	/*
-	 * Config selection: when MSAA is requested, try EGL_SAMPLES 8→4→2 first
-	 * via the portable helper.  On success the driver resolves multisampling
-	 * transparently during eglSwapBuffers — no FBO or explicit blit needed.
-	 * Fall through to the standard no-MSAA path on failure.
+	 * Config selection: enumerate all matching configs so we can filter by
+	 * EGL_NATIVE_VISUAL_ID == GBM_FORMAT_XRGB8888, which is required for
+	 * eglCreateWindowSurface against a GBM surface.  When MSAA is requested,
+	 * prefer the highest-sample config that also passes the visual-ID check;
+	 * fall back to a no-MSAA config if none do.
 	 */
+	eglGetConfigs(kms->egl_display, NULL, 0, &count);
+	configs = calloc((size_t)count, sizeof(*configs));
+	if (!configs)
+		return -1;
+	eglChooseConfig(kms->egl_display, config_attribs, configs, count, &matched);
+
 	if (want_msaa) {
-		EGLConfig msaa_config = NULL;
-		int samples = display_renderer_msaa_choose_config(
-		    kms->egl_display, config_attribs, 8, &msaa_config);
-		if (samples >= 2) {
-			chosen_config = msaa_config;
-			kms->msaa_samples = samples;
-			printf("kms: MSAA %dx enabled via EGL_SAMPLES\n", samples);
+		static const int try_samples[] = { 8, 4, 2 };
+		for (size_t ti = 0; ti < sizeof(try_samples)/sizeof(try_samples[0]) && !chosen_config; ti++) {
+			EGLint want_samples = (EGLint)try_samples[ti];
+			for (i = 0; i < matched && !chosen_config; i++) {
+				EGLint visual, samples;
+				eglGetConfigAttrib(kms->egl_display, configs[i], EGL_NATIVE_VISUAL_ID, &visual);
+				eglGetConfigAttrib(kms->egl_display, configs[i], EGL_SAMPLES, &samples);
+				if ((uint32_t)visual == GBM_FORMAT_XRGB8888 && samples == want_samples) {
+					chosen_config = configs[i];
+					printf("kms: MSAA %dx enabled via EGL_SAMPLES\n", (int)samples);
+				}
+			}
 		}
+		if (!chosen_config)
+			printf("kms: MSAA unavailable, rendering without anti-aliasing\n");
+	} else {
+		printf("kms: MSAA disabled (anti-aliasing off)\n");
 	}
 
 	if (!chosen_config) {
-		/* Standard path: pick the first config matching GBM_FORMAT_XRGB8888. */
-		eglGetConfigs(kms->egl_display, NULL, 0, &count);
-		configs = calloc((size_t)count, sizeof(*configs));
-		if (!configs)
-			return -1;
-		eglChooseConfig(kms->egl_display, config_attribs, configs, count, &matched);
-		chosen_config = configs[0];
+		/* No-MSAA fallback: first config matching GBM_FORMAT_XRGB8888,
+		 * defaulting to configs[0] if none carries the expected visual. */
+		if (matched > 0)
+			chosen_config = configs[0];
 		for (i = 0; i < matched; i++) {
 			EGLint visual;
 			eglGetConfigAttrib(kms->egl_display, configs[i], EGL_NATIVE_VISUAL_ID, &visual);
@@ -965,12 +975,9 @@ static int kms_init_gbm_egl(struct kms_state *kms, bool want_msaa)
 				break;
 			}
 		}
-		free(configs);
-		if (!want_msaa)
-			printf("kms: MSAA disabled (anti-aliasing off)\n");
-		else
-			printf("kms: MSAA unavailable, rendering without anti-aliasing\n");
 	}
+
+	free(configs);
 
 	kms->egl_context = eglCreateContext(kms->egl_display, chosen_config,
 	                                     EGL_NO_CONTEXT, context_attribs);
@@ -1019,7 +1026,6 @@ static int renderer_init(struct kms_state *kms, const char *drm_device, bool wan
 	kms->egl_display = EGL_NO_DISPLAY;
 	kms->egl_context = EGL_NO_CONTEXT;
 	kms->egl_surface = EGL_NO_SURFACE;
-	kms->msaa_samples = 0;
 
 	if (kms_init_drm(kms, drm_device) != 0)
 		return -1;

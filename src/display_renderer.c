@@ -6,8 +6,6 @@
 #include <string.h>
 #include <stdbool.h>
 
-#include <EGL/egl.h>
-
 #define DR_PLACEHOLDER_SIZE 64u
 #define DR_PI 3.14159265358979323846f
 
@@ -515,59 +513,4 @@ void display_renderer_draw_mesh(const struct display_renderer *r,
     glDisableVertexAttribArray((GLuint)r->attr_uv);
 
     glBindTexture(GL_TEXTURE_2D, 0);
-}
-
-/* ----------------------------------------------------------------
- * EGL MSAA config selection (renderer-agnostic)
- *
- * When rendering to a GBM-backed EGL surface (KMS path), MSAA must be
- * requested at EGL config selection time via EGL_SAMPLES.  The driver then
- * resolves the multisampled backbuffer to the scanout buffer transparently
- * during eglSwapBuffers — no FBO or explicit blit is needed.
- *
- * Tries descending sample counts (max_samples → 4 → 2) until eglChooseConfig
- * returns a matching config.  Returns the achieved sample count on success, 0
- * on failure (caller should fall back to its no-MSAA config).
- * ---------------------------------------------------------------- */
-
-int display_renderer_msaa_choose_config(EGLDisplay display,
-                                        const EGLint *base_attribs,
-                                        int max_samples,
-                                        EGLConfig *config_out)
-{
-    if (!display || !base_attribs || !config_out)
-        return 0;
-
-    /* Count base_attribs entries (up to and including EGL_NONE). */
-    int base_len = 0;
-    while (base_attribs[base_len] != EGL_NONE)
-        base_len += 2;
-    /* base_len now points at the EGL_NONE sentinel; total slots needed:
-     * base_len + 4 (EGL_SAMPLE_BUFFERS,1,EGL_SAMPLES,N) + 1 (EGL_NONE) */
-    if (base_len > 64)
-        return 0;
-
-    EGLint attribs[72];
-    for (int i = 0; i < base_len; i++)
-        attribs[i] = base_attribs[i];
-    attribs[base_len + 0] = EGL_SAMPLE_BUFFERS;
-    attribs[base_len + 1] = 1;
-    attribs[base_len + 2] = EGL_SAMPLES;
-    attribs[base_len + 3] = 0; /* filled per attempt */
-    attribs[base_len + 4] = EGL_NONE;
-
-    static const int try_counts[] = { 8, 4, 2 };
-    for (size_t ti = 0; ti < sizeof(try_counts)/sizeof(try_counts[0]); ti++) {
-        int n = try_counts[ti];
-        if (n > max_samples)
-            continue;
-        attribs[base_len + 3] = (EGLint)n;
-        EGLint matched = 0;
-        EGLConfig cfg = NULL;
-        if (eglChooseConfig(display, attribs, &cfg, 1, &matched) && matched > 0 && cfg) {
-            *config_out = cfg;
-            return n;
-        }
-    }
-    return 0;
 }

@@ -1,8 +1,6 @@
 #pragma once
 
-#include <stdbool.h>
 #include <GLES2/gl2.h>
-#include <EGL/egl.h>
 
 /*
  * Column-major 4×4 matrix: m[col][row].
@@ -108,28 +106,6 @@ int  display_renderer_init(struct display_renderer *r);
 
 /* Release all GL objects before destroying the EGL context. */
 void display_renderer_destroy(struct display_renderer *r);
-
-/* ----------------------------------------------------------------
- * EGL MSAA config selection — renderer-agnostic helper.
- *
- * Probes the EGL display for a config that matches the requested attributes
- * plus EGL_SAMPLES at the given level, working down from max_samples to 2.
- * Returns the chosen sample count (≥2) on success, or 0 if none was found.
- *
- * Usage: call before eglCreateContext/eglCreateWindowSurface.  Pass the
- * returned EGLConfig to both.  When the return value is 0, fall back to the
- * no-MSAA config that eglChooseConfig would have returned.
- *
- *   display     — the EGLDisplay (must already be initialised)
- *   base_attribs — EGL_NONE-terminated attribute list without EGL_SAMPLES /
- *                  EGL_SAMPLE_BUFFERS; those are appended internally
- *   max_samples  — highest sample count to try (e.g. 8); clamped to 2 minimum
- *   config_out   — receives the chosen EGLConfig on success
- * ---------------------------------------------------------------- */
-int display_renderer_msaa_choose_config(EGLDisplay display,
-                                        const EGLint *base_attribs,
-                                        int max_samples,
-                                        EGLConfig *config_out);
 
 /*
  * Draw one textured quad centred at the model-space origin.
