@@ -387,7 +387,7 @@ int dp_compute_placements(const struct dp_monitor_info *monitors,
         for (i = 0u; i < (size_t)result_len && i < n; i++) {
             JSValue item = JS_GetPropertyUint32(g_ctx, call_result, (uint32_t)i);
             int32_t orig_idx = (int32_t)dp_get_float(item, "originalIndex");
-            double cl[3], cn[3], rot_y;
+            double cl[3], cn[3], rot_x, rot_y;
             JSValue v;
 
             if (orig_idx < 0 || (size_t)orig_idx >= n) {
@@ -406,6 +406,7 @@ int dp_compute_placements(const struct dp_monitor_info *monitors,
             JS_FreeValue(g_ctx, v);
 
             v = JS_GetPropertyStr(g_ctx, item, "rotationAngleRadians");
+            rot_x = dp_get_float(v, "x");
             rot_y = dp_get_float(v, "y");
             JS_FreeValue(g_ctx, v);
 
@@ -421,7 +422,8 @@ int dp_compute_placements(const struct dp_monitor_info *monitors,
             placements[orig_idx].cnx   = (float)(-cn[1] * gl_scale);
             placements[orig_idx].cny   = (float)( cn[2] * gl_scale);
             placements[orig_idx].cnz   = (float)(-cn[0] * gl_scale);
-            placements[orig_idx].angle = (float)rot_y;
+            placements[orig_idx].angle   = (float)rot_y;
+            placements[orig_idx].angle_x = (float)rot_x;
             /* Keep NWU centerLook for findFocusedMonitor (pixel units, unscaled). */
             placements[orig_idx].ln_north = (float)cl[0];
             placements[orig_idx].ln_west  = (float)cl[1];

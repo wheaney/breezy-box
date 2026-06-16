@@ -14,8 +14,9 @@ struct dp_monitor_info {
 /* GL-space transform for a display on the arc. */
 struct dp_placement {
     float tx, ty, tz;    /* GL centerLook position: (-west, up, -north) */
-    float cnx, cny, cnz; /* GL centerNoRotate: same axes, used as mesh base before Y-rotation */
-    float angle;         /* Y-axis rotation in radians (rotationAngleRadians.y) */
+    float cnx, cny, cnz; /* GL centerNoRotate: same axes, used as mesh base before arc rotation */
+    float angle;         /* Y-axis rotation in radians (rotationAngleRadians.y) — horizontal scheme */
+    float angle_x;       /* X-axis rotation in radians (rotationAngleRadians.x) — vertical scheme */
     /* NWU centerLook [north, west, up] as returned by monitorsToPlacements,
      * kept for dp_find_focused_monitor (which works in the driver's NWU frame). */
     float ln_north, ln_west, ln_up;

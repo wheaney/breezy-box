@@ -148,6 +148,23 @@ void es_display_model(ESMatrix *m, float angle, float tx, float ty, float tz)
     m->m[3][3] =  1.0f;
 }
 
+void es_display_model_x(ESMatrix *m, float angle_x, float tx, float ty, float tz)
+{
+    float ca = cosf(angle_x);
+    float sa = sinf(angle_x);
+
+    memset(m, 0, sizeof(*m));
+    m->m[0][0] =  1.0f;
+    m->m[1][1] =  ca;
+    m->m[1][2] =  sa;
+    m->m[2][1] = -sa;
+    m->m[2][2] =  ca;
+    m->m[3][0] =  tx;
+    m->m[3][1] =  ty;
+    m->m[3][2] =  tz;
+    m->m[3][3] =  1.0f;
+}
+
 void es_view_from_quat(ESMatrix *r, float qw, float qx, float qy, float qz)
 {
     /* Conjugate: invert rotation so world counter-rotates with head. */

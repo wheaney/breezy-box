@@ -1600,12 +1600,11 @@ static void kms_render_frame(struct kms_state *kms,
 
 		if (kms->meshes_computed) {
 			const struct display_mesh *mesh = &kms->meshes[i];
-			float ang = kms->placements[i].angle;
+			float ang   = kms->placements[i].angle;
+			float ang_x = kms->placements[i].angle_x;
 			float s   = (kms->zoom_all_distance > 0.0f)
 			          ? kms->monitor_distance[i] / kms->zoom_all_distance
 			          : 1.0f;
-			float ca  = cosf(ang);
-			float sa  = sinf(ang);
 			float cnx = kms->placements[i].cnx;
 			float cny = kms->placements[i].cny;
 			float cnz = kms->placements[i].cnz;
@@ -1619,20 +1618,25 @@ static void kms_render_frame(struct kms_state *kms,
 				 * centred-in-front.  The camera already runs on the origin.
 				 */
 				smooth_follow_focused_model(&kms->sf, cnx, cny, cnz, ang, s, &model);
+			} else if (ang_x != 0.0f) {
+				/*
+				 * Vertical wrapping scheme: arc rotation is around the X axis.
+				 * centerNoRotate has up=0; the X-rotation swings it up/down on
+				 * the arc.  Zoom translation uses the X-rotated center:
+				 *   rcn_y = -sa_x * cnz,  rcn_z = ca_x * cnz  (cny=0)
+				 */
+				float ca_x = cosf(ang_x);
+				float sa_x = sinf(ang_x);
+				float tdx = (s - 1.0f) * cnx;
+				float tdy = (s - 1.0f) * (-sa_x * cnz);
+				float tdz = (s - 1.0f) * ( ca_x * cnz);
+				es_display_model_x(&model, ang_x, tdx, tdy, tdz);
 			} else {
 				/*
-				 * Mesh vertices are pre-computed in GL world space relative to the
-				 * rotation origin (centerNoRotate).  Apply Y-rotation only — the
-				 * arc curvature baked into the vertices is preserved.  Flat displays
-				 * produce a 1-segment mesh (4 vertices) with no separate path.
-				 *
-				 * Zoom-on-focus: scale the monitor's centre position by
-				 * s = monitor_distance / zoom_all_distance (matching KWin's
-				 * centerNoRotate.times(monitorDistance/allDisplaysDistance)).  The
-				 * mesh already bakes centerNoRotate, so we add the delta (s-1)·R·cn
-				 * as a post-rotation world translation, moving the centre without
-				 * rescaling the display's own size or curvature.
+				 * Horizontal / flat scheme: arc rotation is around the Y axis.
 				 */
+				float ca = cosf(ang);
+				float sa = sinf(ang);
 				float rcn_x = ca * cnx + sa * cnz;
 				float rcn_z = -sa * cnx + ca * cnz;
 				float tdx = (s - 1.0f) * rcn_x;

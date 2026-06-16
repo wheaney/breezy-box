@@ -38,6 +38,9 @@ void es_perspective_unit(ESMatrix *result,
 /* Model matrix: Y-rotation by angle, then translation (tx, ty, tz). */
 void es_display_model(ESMatrix *m, float angle, float tx, float ty, float tz);
 
+/* Model matrix: X-rotation by angle_x, then translation (tx, ty, tz). */
+void es_display_model_x(ESMatrix *m, float angle_x, float tx, float ty, float tz);
+
 /*
  * View rotation from unit quaternion (w, x, y, z, EUS frame).
  * Builds the conjugate rotation so world geometry counter-rotates
