@@ -198,8 +198,8 @@ struct kms_state {
 	/* Overlay: GL texture for connection-status messages; text from breezy_state. */
 	struct overlay_text overlay_tex;
 
-	/* MSAA framebuffer — active when disable_anti_aliasing is false. */
-	struct display_renderer_msaa msaa;
+	/* Actual MSAA sample count used by the EGL config (0 = no MSAA). */
+	int msaa_samples;
 
 	/* Back-pointer to the long-lived app state (not owned by the renderer). */
 	struct breezy_state *state;
@@ -854,7 +854,7 @@ static bool kms_has_ext(const char *list, const char *ext)
 	return false;
 }
 
-static int kms_init_gbm_egl(struct kms_state *kms)
+static int kms_init_gbm_egl(struct kms_state *kms, bool want_msaa)
 {
 	EGLint major, minor;
 	const char *client_exts, *dpy_exts, *gl_exts;
@@ -932,21 +932,45 @@ static int kms_init_gbm_egl(struct kms_state *kms)
 		return -1;
 	}
 
-	eglGetConfigs(kms->egl_display, NULL, 0, &count);
-	configs = calloc((size_t)count, sizeof(*configs));
-	if (!configs)
-		return -1;
-	eglChooseConfig(kms->egl_display, config_attribs, configs, count, &matched);
-	chosen_config = configs[0];
-	for (i = 0; i < matched; i++) {
-		EGLint visual;
-		eglGetConfigAttrib(kms->egl_display, configs[i], EGL_NATIVE_VISUAL_ID, &visual);
-		if ((uint32_t)visual == GBM_FORMAT_XRGB8888) {
-			chosen_config = configs[i];
-			break;
+	/*
+	 * Config selection: when MSAA is requested, try EGL_SAMPLES 8→4→2 first
+	 * via the portable helper.  On success the driver resolves multisampling
+	 * transparently during eglSwapBuffers — no FBO or explicit blit needed.
+	 * Fall through to the standard no-MSAA path on failure.
+	 */
+	if (want_msaa) {
+		EGLConfig msaa_config = NULL;
+		int samples = display_renderer_msaa_choose_config(
+		    kms->egl_display, config_attribs, 8, &msaa_config);
+		if (samples >= 2) {
+			chosen_config = msaa_config;
+			kms->msaa_samples = samples;
+			printf("kms: MSAA %dx enabled via EGL_SAMPLES\n", samples);
 		}
 	}
-	free(configs);
+
+	if (!chosen_config) {
+		/* Standard path: pick the first config matching GBM_FORMAT_XRGB8888. */
+		eglGetConfigs(kms->egl_display, NULL, 0, &count);
+		configs = calloc((size_t)count, sizeof(*configs));
+		if (!configs)
+			return -1;
+		eglChooseConfig(kms->egl_display, config_attribs, configs, count, &matched);
+		chosen_config = configs[0];
+		for (i = 0; i < matched; i++) {
+			EGLint visual;
+			eglGetConfigAttrib(kms->egl_display, configs[i], EGL_NATIVE_VISUAL_ID, &visual);
+			if ((uint32_t)visual == GBM_FORMAT_XRGB8888) {
+				chosen_config = configs[i];
+				break;
+			}
+		}
+		free(configs);
+		if (!want_msaa)
+			printf("kms: MSAA disabled (anti-aliasing off)\n");
+		else
+			printf("kms: MSAA unavailable, rendering without anti-aliasing\n");
+	}
 
 	kms->egl_context = eglCreateContext(kms->egl_display, chosen_config,
 	                                     EGL_NO_CONTEXT, context_attribs);
@@ -989,16 +1013,17 @@ static int kms_init_gbm_egl(struct kms_state *kms)
  * is unaffected and rides through reconnect cycles unchanged.
  * ---------------------------------------------------------------- */
 
-static int renderer_init(struct kms_state *kms, const char *drm_device)
+static int renderer_init(struct kms_state *kms, const char *drm_device, bool want_msaa)
 {
 	kms->drm_fd      = -1;
 	kms->egl_display = EGL_NO_DISPLAY;
 	kms->egl_context = EGL_NO_CONTEXT;
 	kms->egl_surface = EGL_NO_SURFACE;
+	kms->msaa_samples = 0;
 
 	if (kms_init_drm(kms, drm_device) != 0)
 		return -1;
-	if (kms_init_gbm_egl(kms) != 0)
+	if (kms_init_gbm_egl(kms, want_msaa) != 0)
 		return -1;
 	if (display_renderer_init(&kms->dr) != 0)
 		return -1;
@@ -1029,7 +1054,6 @@ static void renderer_destroy(struct kms_state *kms)
 	kms->display_count = 0;
 
 	display_renderer_destroy(&kms->dr);
-	display_renderer_msaa_destroy(&kms->msaa);
 	overlay_text_destroy(&kms->overlay_tex);
 
 	if (kms->egl_display != EGL_NO_DISPLAY) {
@@ -1784,11 +1808,6 @@ static int kms_run(struct kms_state *kms, struct server_runtime *server)
 		return -1;
 	}
 	breezy_driver_control_update(&kms->settings);
-
-	if (!kms->settings.disable_anti_aliasing)
-		display_renderer_msaa_init(&kms->msaa,
-					   (GLsizei)kms->mode.hdisplay,
-					   (GLsizei)kms->mode.vdisplay, 0);
 	/* Prime the overlay texture before the first frame. */
 	{
 		char msg[BS_MSG_MAX];
@@ -1796,9 +1815,7 @@ static int kms_run(struct kms_state *kms, struct server_runtime *server)
 		overlay_text_update(&kms->overlay_tex, msg);
 	}
 	kms_update_display_textures(kms, server);
-	display_renderer_msaa_bind(&kms->msaa);
 	kms_render_frame(kms, server);
-	display_renderer_msaa_resolve_and_unbind(&kms->msaa);
 	if (!eglSwapBuffers(kms->egl_display, kms->egl_surface)) {
 		fprintf(stderr, "kms: initial eglSwapBuffers failed: 0x%x\n", eglGetError());
 		return -1;
@@ -1827,19 +1844,10 @@ static int kms_run(struct kms_state *kms, struct server_runtime *server)
 		struct drm_fb *next_fb;
 		int ret;
 
-		bool prev_disable_aa = kms->settings.disable_anti_aliasing;
 		bool settings_dirty =
 		    breezy_settings_consume_if_changed(kms->settings_handle, &kms->settings);
-		if (settings_dirty) {
+		if (settings_dirty)
 			breezy_driver_control_update(&kms->settings);
-			if (kms->settings.disable_anti_aliasing != prev_disable_aa) {
-				display_renderer_msaa_destroy(&kms->msaa);
-				if (!kms->settings.disable_anti_aliasing)
-					display_renderer_msaa_init(&kms->msaa,
-								   (GLsizei)kms->mode.hdisplay,
-								   (GLsizei)kms->mode.vdisplay, 0);
-			}
-		}
 		kms_poll_device_config(kms, server, settings_dirty);
 
 		/* Honour framerate_cap: skip this iteration if not enough time has passed. */
@@ -1852,9 +1860,7 @@ static int kms_run(struct kms_state *kms, struct server_runtime *server)
 		}
 
 		kms_update_display_textures(kms, server);
-		display_renderer_msaa_bind(&kms->msaa);
 		kms_render_frame(kms, server);
-		display_renderer_msaa_resolve_and_unbind(&kms->msaa);
 		if (!eglSwapBuffers(kms->egl_display, kms->egl_surface)) {
 			fprintf(stderr, "kms: eglSwapBuffers failed: 0x%x\n", eglGetError());
 			break;
@@ -2147,7 +2153,7 @@ int main(int argc, char **argv)
 	 * is torn down and rebuilt on each reconnect.
 	 */
 	while (!stop_requested) {
-		if (renderer_init(&kms, drm_device) != 0) {
+		if (renderer_init(&kms, drm_device, !kms.settings.disable_anti_aliasing) != 0) {
 			fprintf(stderr, "kms: renderer init failed, retrying in 1 s\n");
 			nanosleep(&(struct timespec){1, 0}, NULL);
 			continue;

@@ -2,6 +2,7 @@
 
 #include <stdbool.h>
 #include <GLES2/gl2.h>
+#include <EGL/egl.h>
 
 /*
  * Column-major 4×4 matrix: m[col][row].
@@ -109,62 +110,26 @@ int  display_renderer_init(struct display_renderer *r);
 void display_renderer_destroy(struct display_renderer *r);
 
 /* ----------------------------------------------------------------
- * MSAA framebuffer — renderer-agnostic, usable by any rendering backend.
+ * EGL MSAA config selection — renderer-agnostic helper.
  *
- * When EGL is configured with EGL_SAMPLES > 1 (e.g. via the KMS config
- * selection path), the driver resolves MSAA transparently during
- * eglSwapBuffers and this struct is not needed.  When EGL_SAMPLES is
- * unavailable or disabled (anti-aliasing off), callers skip this entirely.
+ * Probes the EGL display for a config that matches the requested attributes
+ * plus EGL_SAMPLES at the given level, working down from max_samples to 2.
+ * Returns the chosen sample count (≥2) on success, or 0 if none was found.
  *
- * Usage:
- *   display_renderer_msaa_init()  — call after EGL context is current;
- *                                    binds the MSAA FBO on success.
- *   display_renderer_msaa_bind()  — bind before rendering each frame.
- *   display_renderer_msaa_resolve_and_unbind() — resolve + blit to the
- *                                    default framebuffer; call before swap.
- *   display_renderer_msaa_destroy() — release GL objects before context teardown.
+ * Usage: call before eglCreateContext/eglCreateWindowSurface.  Pass the
+ * returned EGLConfig to both.  When the return value is 0, fall back to the
+ * no-MSAA config that eglChooseConfig would have returned.
  *
- * This path uses EXT_multisampled_render_to_texture (or the IMG variant)
- * when EGL_SAMPLES was not available in the config.  Falls back to no-op
- * (initialized=false) when neither extension is present.
+ *   display     — the EGLDisplay (must already be initialised)
+ *   base_attribs — EGL_NONE-terminated attribute list without EGL_SAMPLES /
+ *                  EGL_SAMPLE_BUFFERS; those are appended internally
+ *   max_samples  — highest sample count to try (e.g. 8); clamped to 2 minimum
+ *   config_out   — receives the chosen EGLConfig on success
  * ---------------------------------------------------------------- */
-
-struct display_renderer_msaa {
-    GLuint fbo;
-    GLuint color_rbo;
-    GLuint depth_rbo;
-    GLsizei width;
-    GLsizei height;
-    GLsizei samples;
-    bool initialized;
-
-    /* Extension function pointers, resolved at init. */
-    void (*glRenderbufferStorageMultisampleEXT)(GLenum, GLsizei, GLenum, GLsizei, GLsizei);
-    void (*glFramebufferTexture2DMultisampleEXT)(GLenum, GLenum, GLenum, GLuint, GLint, GLsizei);
-};
-
-/*
- * Initialise the MSAA framebuffer.
- *   width / height  — framebuffer dimensions (match the EGL surface)
- *   max_samples     — cap on sample count; pass 0 to use the highest supported
- * Returns true if MSAA was successfully set up; false if unavailable (safe to
- * ignore — rendering continues on the default framebuffer without MSAA).
- */
-bool display_renderer_msaa_init(struct display_renderer_msaa *m,
-                                GLsizei width, GLsizei height,
-                                GLsizei max_samples);
-
-/* Bind the MSAA FBO.  No-op when !m->initialized. */
-void display_renderer_msaa_bind(const struct display_renderer_msaa *m);
-
-/*
- * Blit the MSAA color buffer to the default framebuffer and unbind.
- * Must be called before eglSwapBuffers.  No-op when !m->initialized.
- */
-void display_renderer_msaa_resolve_and_unbind(const struct display_renderer_msaa *m);
-
-/* Release GL objects.  Safe to call when !m->initialized. */
-void display_renderer_msaa_destroy(struct display_renderer_msaa *m);
+int display_renderer_msaa_choose_config(EGLDisplay display,
+                                        const EGLint *base_attribs,
+                                        int max_samples,
+                                        EGLConfig *config_out);
 
 /*
  * Draw one textured quad centred at the model-space origin.
