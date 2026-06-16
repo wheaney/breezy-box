@@ -6,6 +6,10 @@
 #include <string.h>
 #include <stdbool.h>
 
+/* GLES 2.0 extension headers needed for MSAA */
+#include <GLES2/gl2ext.h>
+#include <EGL/egl.h>
+
 #define DR_PLACEHOLDER_SIZE 64u
 #define DR_PI 3.14159265358979323846f
 
@@ -513,4 +517,135 @@ void display_renderer_draw_mesh(const struct display_renderer *r,
     glDisableVertexAttribArray((GLuint)r->attr_uv);
 
     glBindTexture(GL_TEXTURE_2D, 0);
+}
+
+/* ----------------------------------------------------------------
+ * MSAA framebuffer (renderer-agnostic)
+ *
+ * Uses GL_EXT_multisampled_render_to_texture (or the IMG variant).
+ * Both expose glRenderbufferStorageMultisampleEXT with identical
+ * signatures and GL_MAX_SAMPLES_EXT.  The resolve happens implicitly
+ * when the FBO is unbound, writing anti-aliased pixels to the default
+ * (GBM) framebuffer that eglSwapBuffers then flips to the display.
+ * ---------------------------------------------------------------- */
+
+static bool dr_has_ext(const char *ext)
+{
+    const char *list = (const char *)glGetString(GL_EXTENSIONS);
+    if (!list || !ext)
+        return false;
+    size_t len = strlen(ext);
+    while (list) {
+        const char *p = strstr(list, ext);
+        if (!p)
+            return false;
+        if (p[len] == ' ' || p[len] == '\0')
+            return true;
+        list = p + len;
+    }
+    return false;
+}
+
+bool display_renderer_msaa_init(struct display_renderer_msaa *m,
+                                GLsizei width, GLsizei height,
+                                GLsizei max_samples)
+{
+    memset(m, 0, sizeof(*m));
+
+    /* Prefer EXT; fall back to IMG (same API, different name string). */
+    bool have_ext = dr_has_ext("GL_EXT_multisampled_render_to_texture") ||
+                    dr_has_ext("GL_IMG_multisampled_render_to_texture");
+    if (!have_ext) {
+        fprintf(stderr, "msaa: GL_EXT_multisampled_render_to_texture unavailable, MSAA disabled\n");
+        return false;
+    }
+
+    m->glRenderbufferStorageMultisampleEXT =
+        (void (*)(GLenum, GLsizei, GLenum, GLsizei, GLsizei))
+        eglGetProcAddress("glRenderbufferStorageMultisampleEXT");
+    if (!m->glRenderbufferStorageMultisampleEXT)
+        m->glRenderbufferStorageMultisampleEXT =
+            (void (*)(GLenum, GLsizei, GLenum, GLsizei, GLsizei))
+            eglGetProcAddress("glRenderbufferStorageMultisampleIMG");
+
+    if (!m->glRenderbufferStorageMultisampleEXT) {
+        fprintf(stderr, "msaa: glRenderbufferStorageMultisampleEXT entry point missing\n");
+        return false;
+    }
+
+    GLint hw_max = 0;
+    glGetIntegerv(GL_MAX_SAMPLES_EXT, &hw_max);
+    if (hw_max < 2) {
+        fprintf(stderr, "msaa: GL_MAX_SAMPLES_EXT=%d, MSAA unavailable\n", hw_max);
+        return false;
+    }
+
+    GLsizei samples = (max_samples > 0 && max_samples < hw_max) ? max_samples : (GLsizei)hw_max;
+    printf("msaa: %dx MSAA (hw_max=%d)\n", (int)samples, hw_max);
+
+    glGenFramebuffers(1, &m->fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, m->fbo);
+
+    glGenRenderbuffers(1, &m->color_rbo);
+    glBindRenderbuffer(GL_RENDERBUFFER, m->color_rbo);
+    m->glRenderbufferStorageMultisampleEXT(GL_RENDERBUFFER, samples,
+                                           GL_RGB565, width, height);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                              GL_RENDERBUFFER, m->color_rbo);
+
+    glGenRenderbuffers(1, &m->depth_rbo);
+    glBindRenderbuffer(GL_RENDERBUFFER, m->depth_rbo);
+    m->glRenderbufferStorageMultisampleEXT(GL_RENDERBUFFER, samples,
+                                           GL_DEPTH_COMPONENT16, width, height);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
+                              GL_RENDERBUFFER, m->depth_rbo);
+
+    GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    if (status != GL_FRAMEBUFFER_COMPLETE) {
+        fprintf(stderr, "msaa: FBO incomplete (status=0x%x), MSAA disabled\n", (unsigned)status);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glDeleteRenderbuffers(1, &m->depth_rbo);
+        glDeleteRenderbuffers(1, &m->color_rbo);
+        glDeleteFramebuffers(1, &m->fbo);
+        memset(m, 0, sizeof(*m));
+        return false;
+    }
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glBindRenderbuffer(GL_RENDERBUFFER, 0);
+
+    m->width       = width;
+    m->height      = height;
+    m->samples     = samples;
+    m->initialized = true;
+    return true;
+}
+
+void display_renderer_msaa_bind(const struct display_renderer_msaa *m)
+{
+    if (!m || !m->initialized)
+        return;
+    glBindFramebuffer(GL_FRAMEBUFFER, m->fbo);
+}
+
+void display_renderer_msaa_resolve_and_unbind(const struct display_renderer_msaa *m)
+{
+    if (!m || !m->initialized)
+        return;
+    /*
+     * EXT_multisampled_render_to_texture resolves implicitly on FBO unbind —
+     * the resolved pixels flow into the default (GBM surface) framebuffer.
+     * No explicit blit is needed.
+     */
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+}
+
+void display_renderer_msaa_destroy(struct display_renderer_msaa *m)
+{
+    if (!m || !m->initialized)
+        return;
+    glDeleteRenderbuffers(1, &m->depth_rbo);
+    glDeleteRenderbuffers(1, &m->color_rbo);
+    glDeleteFramebuffers(1, &m->fbo);
+    memset(m, 0, sizeof(*m));
 }

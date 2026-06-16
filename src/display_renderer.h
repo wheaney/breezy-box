@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stdbool.h>
 #include <GLES2/gl2.h>
 
 /*
@@ -106,6 +107,64 @@ int  display_renderer_init(struct display_renderer *r);
 
 /* Release all GL objects before destroying the EGL context. */
 void display_renderer_destroy(struct display_renderer *r);
+
+/* ----------------------------------------------------------------
+ * MSAA framebuffer — renderer-agnostic, usable by any rendering backend.
+ *
+ * When EGL is configured with EGL_SAMPLES > 1 (e.g. via the KMS config
+ * selection path), the driver resolves MSAA transparently during
+ * eglSwapBuffers and this struct is not needed.  When EGL_SAMPLES is
+ * unavailable or disabled (anti-aliasing off), callers skip this entirely.
+ *
+ * Usage:
+ *   display_renderer_msaa_init()  — call after EGL context is current;
+ *                                    binds the MSAA FBO on success.
+ *   display_renderer_msaa_bind()  — bind before rendering each frame.
+ *   display_renderer_msaa_resolve_and_unbind() — resolve + blit to the
+ *                                    default framebuffer; call before swap.
+ *   display_renderer_msaa_destroy() — release GL objects before context teardown.
+ *
+ * This path uses EXT_multisampled_render_to_texture (or the IMG variant)
+ * when EGL_SAMPLES was not available in the config.  Falls back to no-op
+ * (initialized=false) when neither extension is present.
+ * ---------------------------------------------------------------- */
+
+struct display_renderer_msaa {
+    GLuint fbo;
+    GLuint color_rbo;
+    GLuint depth_rbo;
+    GLsizei width;
+    GLsizei height;
+    GLsizei samples;
+    bool initialized;
+
+    /* Extension function pointers, resolved at init. */
+    void (*glRenderbufferStorageMultisampleEXT)(GLenum, GLsizei, GLenum, GLsizei, GLsizei);
+    void (*glFramebufferTexture2DMultisampleEXT)(GLenum, GLenum, GLenum, GLuint, GLint, GLsizei);
+};
+
+/*
+ * Initialise the MSAA framebuffer.
+ *   width / height  — framebuffer dimensions (match the EGL surface)
+ *   max_samples     — cap on sample count; pass 0 to use the highest supported
+ * Returns true if MSAA was successfully set up; false if unavailable (safe to
+ * ignore — rendering continues on the default framebuffer without MSAA).
+ */
+bool display_renderer_msaa_init(struct display_renderer_msaa *m,
+                                GLsizei width, GLsizei height,
+                                GLsizei max_samples);
+
+/* Bind the MSAA FBO.  No-op when !m->initialized. */
+void display_renderer_msaa_bind(const struct display_renderer_msaa *m);
+
+/*
+ * Blit the MSAA color buffer to the default framebuffer and unbind.
+ * Must be called before eglSwapBuffers.  No-op when !m->initialized.
+ */
+void display_renderer_msaa_resolve_and_unbind(const struct display_renderer_msaa *m);
+
+/* Release GL objects.  Safe to call when !m->initialized. */
+void display_renderer_msaa_destroy(struct display_renderer_msaa *m);
 
 /*
  * Draw one textured quad centred at the model-space origin.

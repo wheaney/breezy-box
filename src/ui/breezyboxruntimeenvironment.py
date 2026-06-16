@@ -74,6 +74,7 @@ class BreezyBoxRuntimeEnvironment(RuntimeEnvironment):
             'remove_virtual_displays_on_disable_switch',
             'virtual_displays_row',
             'launch_display_settings_row',
+            'headset_as_primary_switch',
             'headset_display_as_viewport_center_switch',
         ])
 

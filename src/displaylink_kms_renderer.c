@@ -198,6 +198,9 @@ struct kms_state {
 	/* Overlay: GL texture for connection-status messages; text from breezy_state. */
 	struct overlay_text overlay_tex;
 
+	/* MSAA framebuffer — active when disable_anti_aliasing is false. */
+	struct display_renderer_msaa msaa;
+
 	/* Back-pointer to the long-lived app state (not owned by the renderer). */
 	struct breezy_state *state;
 };
@@ -1026,6 +1029,7 @@ static void renderer_destroy(struct kms_state *kms)
 	kms->display_count = 0;
 
 	display_renderer_destroy(&kms->dr);
+	display_renderer_msaa_destroy(&kms->msaa);
 	overlay_text_destroy(&kms->overlay_tex);
 
 	if (kms->egl_display != EGL_NO_DISPLAY) {
@@ -1780,6 +1784,11 @@ static int kms_run(struct kms_state *kms, struct server_runtime *server)
 		return -1;
 	}
 	breezy_driver_control_update(&kms->settings);
+
+	if (!kms->settings.disable_anti_aliasing)
+		display_renderer_msaa_init(&kms->msaa,
+					   (GLsizei)kms->mode.hdisplay,
+					   (GLsizei)kms->mode.vdisplay, 0);
 	/* Prime the overlay texture before the first frame. */
 	{
 		char msg[BS_MSG_MAX];
@@ -1787,7 +1796,9 @@ static int kms_run(struct kms_state *kms, struct server_runtime *server)
 		overlay_text_update(&kms->overlay_tex, msg);
 	}
 	kms_update_display_textures(kms, server);
+	display_renderer_msaa_bind(&kms->msaa);
 	kms_render_frame(kms, server);
+	display_renderer_msaa_resolve_and_unbind(&kms->msaa);
 	if (!eglSwapBuffers(kms->egl_display, kms->egl_surface)) {
 		fprintf(stderr, "kms: initial eglSwapBuffers failed: 0x%x\n", eglGetError());
 		return -1;
@@ -1816,10 +1827,19 @@ static int kms_run(struct kms_state *kms, struct server_runtime *server)
 		struct drm_fb *next_fb;
 		int ret;
 
+		bool prev_disable_aa = kms->settings.disable_anti_aliasing;
 		bool settings_dirty =
 		    breezy_settings_consume_if_changed(kms->settings_handle, &kms->settings);
-		if (settings_dirty)
+		if (settings_dirty) {
 			breezy_driver_control_update(&kms->settings);
+			if (kms->settings.disable_anti_aliasing != prev_disable_aa) {
+				display_renderer_msaa_destroy(&kms->msaa);
+				if (!kms->settings.disable_anti_aliasing)
+					display_renderer_msaa_init(&kms->msaa,
+								   (GLsizei)kms->mode.hdisplay,
+								   (GLsizei)kms->mode.vdisplay, 0);
+			}
+		}
 		kms_poll_device_config(kms, server, settings_dirty);
 
 		/* Honour framerate_cap: skip this iteration if not enough time has passed. */
@@ -1832,7 +1852,9 @@ static int kms_run(struct kms_state *kms, struct server_runtime *server)
 		}
 
 		kms_update_display_textures(kms, server);
+		display_renderer_msaa_bind(&kms->msaa);
 		kms_render_frame(kms, server);
+		display_renderer_msaa_resolve_and_unbind(&kms->msaa);
 		if (!eglSwapBuffers(kms->egl_display, kms->egl_surface)) {
 			fprintf(stderr, "kms: eglSwapBuffers failed: 0x%x\n", eglGetError());
 			break;
