@@ -272,28 +272,10 @@ static void kms_adjust_monitor_positions(
 	float adj_dev_w = (float)dev_w * dist_adj_size;
 	float adj_dev_h = (float)dev_h * dist_adj_size;
 
-	/* Mirror dp_compute_placements auto-x: if all raw x=0 and n>1, assign
-	 * monitors left-to-right cumulatively so centering and offset operate on
-	 * the correct spread layout rather than stacking all monitors at x=0. */
-	bool all_x_zero = (n > 1u);
-	for (size_t i = 0; i < n && all_x_zero; i++) {
-		if (devs[i].x != 0)
-			all_x_zero = false;
-	}
-	int32_t raw_x[MAX_USBIP_DEVICES];
-	if (all_x_zero) {
-		raw_x[0] = 0;
-		for (size_t i = 1; i < n; i++)
-			raw_x[i] = raw_x[i - 1] + (int32_t)devs[i - 1].width;
-	} else {
-		for (size_t i = 0; i < n; i++)
-			raw_x[i] = devs[i].x;
-	}
-
 	/* Size-adjusted positions. */
 	float ax[MAX_USBIP_DEVICES], ay[MAX_USBIP_DEVICES];
 	for (size_t i = 0; i < n; i++) {
-		ax[i] = (float)raw_x[i] * dist_adj_size + size_ox;
+		ax[i] = (float)devs[i].x * dist_adj_size + size_ox;
 		ay[i] = (float)devs[i].y * dist_adj_size + size_oy;
 	}
 
@@ -323,17 +305,6 @@ static void kms_adjust_monitor_positions(
 		out[i].y      = (int32_t)(ay[i] - vpy + (float)viewport_offset_y * adj_dev_h);
 		out[i].width  = (uint32_t)((float)devs[i].width  * dist_adj_size);
 		out[i].height = (uint32_t)((float)devs[i].height * dist_adj_size);
-	}
-
-	/* In the auto-x case monitors are adjacent by definition.  Enforce cumulative
-	 * x so that out[i].x == out[i-1].x + out[i-1].width exactly — monitorWrap
-	 * relies on this: it caches 'end + spacing' at nextMonitorPixel = beginPx + width,
-	 * and the next monitor's beginPixel must hit that exact key.  Independent
-	 * float→int truncation of each position can leave a 1-pixel gap that causes
-	 * monitorWrap to pick the wrong cache entry and misapply spacing. */
-	if (all_x_zero) {
-		for (size_t i = 1; i < n; i++)
-			out[i].x = out[i - 1].x + (int32_t)out[i - 1].width;
 	}
 }
 

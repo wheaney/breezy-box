@@ -313,8 +313,6 @@ int dp_compute_placements(const struct dp_monitor_info *monitors,
                           float monitor_spacing,
                           struct dp_placement *placements)
 {
-    int32_t auto_x[DP_MAX_MONITORS];
-    bool use_auto_x;
     double gl_scale;
     JSValue fov_obj     = JS_UNDEFINED;
     JSValue monitor_arr = JS_UNDEFINED;
@@ -341,21 +339,6 @@ int dp_compute_placements(const struct dp_monitor_info *monitors,
         return -1;
     }
 
-    /* If all x=0 and multiple monitors, assign x cumulatively left-to-right. */
-    use_auto_x = (n > 1u);
-    for (i = 0u; i < n && use_auto_x; i++) {
-        if (monitors[i].x != 0)
-            use_auto_x = false;
-    }
-    if (use_auto_x) {
-        auto_x[0] = 0;
-        for (i = 1u; i < n; i++)
-            auto_x[i] = auto_x[i - 1] + (int32_t)monitors[i - 1].width;
-    } else {
-        for (i = 0u; i < n; i++)
-            auto_x[i] = monitors[i].x;
-    }
-
     /*
      * Delegate fovDetails construction to the shared buildFovDetails(), then
      * override sizeAdjustedWidth/HeightPixels so monitorsToPlacements uses the
@@ -377,7 +360,7 @@ int dp_compute_placements(const struct dp_monitor_info *monitors,
     monitor_arr = JS_NewArray(g_ctx);
     for (i = 0u; i < n; i++) {
         JSValue mon = JS_NewObject(g_ctx);
-        JS_SetPropertyStr(g_ctx, mon, "x",      JS_NewInt32(g_ctx,  auto_x[i]));
+        JS_SetPropertyStr(g_ctx, mon, "x",      JS_NewInt32(g_ctx,  monitors[i].x));
         JS_SetPropertyStr(g_ctx, mon, "y",      JS_NewInt32(g_ctx,  monitors[i].y));
         JS_SetPropertyStr(g_ctx, mon, "width",  JS_NewUint32(g_ctx, monitors[i].width));
         JS_SetPropertyStr(g_ctx, mon, "height", JS_NewUint32(g_ctx, monitors[i].height));

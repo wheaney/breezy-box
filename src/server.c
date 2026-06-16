@@ -350,6 +350,15 @@ static int validate_server_options(const struct server_options *opts)
 			fprintf(stderr, "device %zu decode dimensions must be non-zero\n", i + 1u);
 			return -1;
 		}
+		if (opts->device_count > 1u && d->x == 0 && d->y == 0 && i > 0u) {
+			fprintf(stderr,
+				"device %zu: x and y must be set when using multiple devices "
+				"(e.g. x=%u for side-by-side or y=%u for stacked)\n",
+				i + 1u,
+				opts->devices[i - 1u].decode_width,
+				opts->devices[i - 1u].decode_height);
+			return -1;
+		}
 		if (d->refresh_hz == 0u || d->refresh_hz > 240u) {
 			fprintf(stderr, "device %zu refresh_hz must be between 1 and 240\n", i + 1u);
 			return -1;
