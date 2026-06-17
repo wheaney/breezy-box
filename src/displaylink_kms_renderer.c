@@ -306,6 +306,21 @@ static void kms_adjust_monitor_positions(
 		out[i].width  = (uint32_t)((float)devs[i].width  * dist_adj_size);
 		out[i].height = (uint32_t)((float)devs[i].height * dist_adj_size);
 	}
+
+	/* monitorWrap chains monitors by caching nextMonitorPixel = beginPixel + length.
+	 * Independent float→int truncation of each position can leave a 1-pixel gap that
+	 * causes the cache lookup to miss and misapply spacing.  For any pair of monitors
+	 * that are exactly adjacent in the raw layout, snap the right/bottom monitor's
+	 * integer position to be exactly adjacent to its left/top neighbour. */
+	for (size_t i = 0; i < n; i++) {
+		for (size_t j = 0; j < n; j++) {
+			if (i == j) continue;
+			if (devs[j].x + (int32_t)devs[j].width == devs[i].x)
+				out[i].x = out[j].x + (int32_t)out[j].width;
+			if (devs[j].y + (int32_t)devs[j].height == devs[i].y)
+				out[i].y = out[j].y + (int32_t)out[j].height;
+		}
+	}
 }
 
 /* Begin a per-monitor distance ease (defined below; used by the poll to retarget
