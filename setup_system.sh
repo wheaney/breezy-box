@@ -362,18 +362,24 @@ else
         echo "  warn: openssl not found — install 'openssl' and re-run to enable HTTPS"
     else
         mkdir -p "$TLS_DIR"
-        chmod 0750 "$TLS_DIR"
-        openssl req -x509 -newkey rsa:2048 -nodes \
-            -keyout "$TLS_KEY" \
+        # Use EC P-256 — mongoose's built-in TLS handles ecdsa_secp256r1_sha256
+        # cleanly. RSA-2048 triggers a CRT-signing bug in the built-in stack when
+        # any prime factor DER-encodes with a leading 0x00 padding byte (reducing
+        # the stripped length below the 128-byte minimum check).
+        openssl ecparam -name prime256v1 -genkey -noout -out "$TLS_KEY" 2>/dev/null
+        openssl req -x509 -new -key "$TLS_KEY" \
             -out "$TLS_CERT" \
             -days 3650 \
             -subj "/CN=breezy.local" \
             -addext "subjectAltName=DNS:breezy.local,DNS:localhost,IP:192.168.8.2" \
             2>/dev/null
         chmod 0640 "$TLS_KEY" "$TLS_CERT"
-        # Key must be readable by the app user but not world-readable.
+        # The app user (unprivileged) must be able to traverse the directory and
+        # read the cert/key, but they must not be world-readable. Group-own both
+        # the dir and the files by the app user with 0750/0640.
+        chmod 0750 "$TLS_DIR"
         if id "$APP_USER" &>/dev/null; then
-            chown "root:$APP_USER" "$TLS_KEY" "$TLS_CERT"
+            chown "root:$APP_USER" "$TLS_DIR" "$TLS_KEY" "$TLS_CERT"
         fi
         done_msg "generated self-signed cert: $TLS_CERT (10-year, CN=breezy.local)"
     fi

@@ -19,16 +19,28 @@
       position: fixed;
       inset: 0;
       display: flex;
+      flex-direction: column;
       align-items: center;
       justify-content: center;
       background: #0a0a0a;
       font-size: 1.2rem;
       color: #888;
+      cursor: pointer;
+      user-select: none;
+    }
+
+    #loading .hint {
+      margin-top: 1rem;
+      font-size: 0.85rem;
+      color: #555;
     }
   </style>
 </head>
 <body>
-  <div id="loading">Connecting to Breezy Box…</div>
+  <div id="loading">
+    <span id="loading-msg">Connecting to Breezy Box…</span>
+    <span class="hint" id="loading-hint"></span>
+  </div>
   <iframe id="vnc-frame" src="" title="Breezy Desktop"></iframe>
 
   <script>
@@ -42,19 +54,105 @@
 
       var frame = document.getElementById('vnc-frame');
       var loading = document.getElementById('loading');
+      var loadingMsg = document.getElementById('loading-msg');
+      var loadingHint = document.getElementById('loading-hint');
+      var frameReady = false;
+      var permDone = false;
+
+      function maybeHideLoading() {
+        if (frameReady && permDone) loading.style.display = 'none';
+      }
 
       frame.src = novncUrl;
       frame.addEventListener('load', function () {
-        loading.style.display = 'none';
+        frameReady = true;
+        maybeHideLoading();
       });
 
-      /* Resize callback: keeps the iframe filling the viewport. */
+      function putWindowManagementAvailable(available) {
+        fetch('/settings/breezy-box-host-window-management-available', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ value: available ? 'true' : 'false' }),
+        }).catch(function () {});
+      }
+
+      function postMonitors(screenDetails) {
+        var monitors = screenDetails.screens.map(function (s) {
+          return {
+            label:  s.label,
+            width:  s.width,
+            height: s.height,
+            x:      s.left,
+            y:      s.top,
+          };
+        });
+        fetch('/monitors', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(monitors),
+        }).catch(function () {});
+      }
+
+      function attachScreenChangeListener(screenDetails) {
+        screenDetails.addEventListener('screenschange', function () {
+          postMonitors(screenDetails);
+        });
+      }
+
+      /* Request window-management permission using the loading overlay as the
+       * user-gesture surface. The overlay is already covering the full viewport
+       * while noVNC connects, so the first click the user makes naturally lands
+       * here and satisfies the gesture requirement without extra UI friction. */
+      function requestWindowManagement() {
+        if (!window.getScreenDetails) {
+          putWindowManagementAvailable(false);
+          permDone = true;
+          maybeHideLoading();
+          return;
+        }
+        navigator.permissions.query({ name: 'window-management' }).then(function (status) {
+          if (status.state === 'granted') {
+            window.getScreenDetails().then(function (screenDetails) {
+              putWindowManagementAvailable(true);
+              postMonitors(screenDetails);
+              attachScreenChangeListener(screenDetails);
+            }).catch(function () {
+              putWindowManagementAvailable(false);
+            });
+            permDone = true;
+            maybeHideLoading();
+            return;
+          }
+          /* Permission not yet granted — wait for a click on the overlay. */
+          loadingMsg.textContent = 'Click to connect';
+          loadingHint.textContent = 'Allows multi-display window placement';
+          loading.addEventListener('click', function onFirstClick() {
+            loading.removeEventListener('click', onFirstClick);
+            window.getScreenDetails().then(function (screenDetails) {
+              putWindowManagementAvailable(true);
+              postMonitors(screenDetails);
+              attachScreenChangeListener(screenDetails);
+              permDone = true;
+              maybeHideLoading();
+            }).catch(function () {
+              /* User denied — report unavailable and proceed. */
+              putWindowManagementAvailable(false);
+              permDone = true;
+              maybeHideLoading();
+            });
+          }, { once: true });
+        }).catch(function () {
+          putWindowManagementAvailable(false);
+          permDone = true;
+          maybeHideLoading();
+        });
+      }
+
+      requestWindowManagement();
+
       function onResize() {
         frame.style.height = window.innerHeight + 'px';
-
-        /* TODO: notify the server of the new dimensions so noVNC / the
-           remote session can resize to match. POST /status or a dedicated
-           /resize endpoint. */
       }
 
       window.addEventListener('resize', onResize);
