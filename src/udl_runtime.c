@@ -383,9 +383,19 @@ void udl_runtime_destroy(struct udl_runtime *runtime)
 	if (!runtime)
 		return;
 
+	/*
+	 * Tell our own threads to stop.  This must be set unconditionally — not
+	 * only in the gadget branch below — because the decode thread's exit
+	 * condition is (global stop_requested || this flag).  At process shutdown
+	 * the global flag is already 1, but when destroy() is called mid-run (e.g.
+	 * a hot-reload dimension change reinit), the global flag is still 0, so
+	 * without this the broadcast below would wake the decode thread, it would
+	 * re-check both flags as false, and pthread_join would block forever.
+	 */
+	atomic_store(&runtime->stop_requested, true);
+
 	/* Signal gadget reader to stop and close the fd to unblock poll(). */
 	if (runtime->gadget_thread_created) {
-		atomic_store(&runtime->stop_requested, true);
 		if (runtime->gadget_fd >= 0) {
 			close(runtime->gadget_fd);
 			runtime->gadget_fd = -1;
