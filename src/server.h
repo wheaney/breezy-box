@@ -9,6 +9,7 @@
 #include <stdbool.h>
 #include <stdatomic.h>
 #include <pthread.h>
+#include <linux/limits.h>
 
 /* Default server configuration values */
 #define DEFAULT_LISTEN_HOST          "0.0.0.0"
@@ -74,6 +75,21 @@ struct server_runtime {
 	atomic_bool viewer_stop_requested;
 	bool viewer_thread_created;
 	int listen_fd; /* -1 until run_server opens it; shutdown() to unblock accept() */
+
+	/* Config file watcher — started after device init, stopped before destroy. */
+	int    config_inotify_fd;
+	pthread_t config_watcher_thread;
+	bool   config_watcher_created;
+	char   config_path[PATH_MAX];
+	char   config_filename[NAME_MAX + 1]; /* basename of config_path */
+
+	/* Signals from watcher to consumers (KMS renderer).
+	 * config_positions_changed: set when only x/y changed on any device;
+	 *   consumer should re-run placement logic immediately (bypass 1 s throttle).
+	 * config_textures_dirty[i]: set when device i's decode dimensions changed;
+	 *   consumer must destroy and reinitialise the udl_runtime and GL texture. */
+	atomic_bool config_positions_changed;
+	atomic_bool config_textures_dirty[MAX_USBIP_DEVICES];
 };
 
 /* Per-connection context passed to connection threads */
@@ -115,3 +131,17 @@ void options_from_configured_device(const struct configured_device *src,
 				    struct options *dst);
 int server_runtime_init_devices(struct server_runtime *server);
 void server_runtime_destroy(struct server_runtime *server);
+
+/*
+ * Start an inotify watcher on config_path.  When the file is modified the
+ * watcher diffs the "devices" array against the live server_options and:
+ *   - x/y-only change   → updates server->opts in-place, sets config_positions_changed
+ *   - EDID field change → disconnects active client, rebuilds EDID/descriptors;
+ *     if decode dimensions changed, also sets config_textures_dirty[i] so the
+ *     KMS renderer can reinitialise the udl_runtime and GL texture.
+ *
+ * Must be called after server_runtime_init_devices.
+ * Returns 0 on success, -1 on error (non-fatal: server continues without hot-reload).
+ */
+int  server_start_config_watcher(struct server_runtime *server, const char *config_path);
+void server_stop_config_watcher(struct server_runtime *server);

@@ -191,6 +191,7 @@ struct device_runtime {
 	pthread_mutex_t import_mutex;
 	bool import_mutex_initialized;
 	bool imported;
+	int import_fd;    /* fd of active import session (-1 when none); protected by import_mutex */
 	bool usbip_cadence_logging_enabled;
 	bool key_loaded;
 	bool vendor_14_seen;

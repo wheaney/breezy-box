@@ -14,6 +14,9 @@
 #include <string.h>
 #include <unistd.h>
 #include <limits.h>
+#include <sys/inotify.h>
+#include <sys/select.h>
+#include <linux/limits.h>
 
 void usage(const char *argv0)
 {
@@ -559,11 +562,18 @@ int handle_import_request(struct server_runtime *server, int fd)
 
 	if (runtime->opts.verbose)
 		fprintf(stderr, "USB/IP import attached for busid %s\n", runtime->usbip_device.busid);
+
+	/* Record the fd so the config watcher can shut down this session on EDID change. */
+	pthread_mutex_lock(&runtime->import_mutex);
+	runtime->import_fd = fd;
+	pthread_mutex_unlock(&runtime->import_mutex);
+
 	if (run_import_session(runtime, fd) != 0 && runtime->opts.verbose)
 		fprintf(stderr, "USB/IP import session ended\n");
 	if (claimed) {
 		pthread_mutex_lock(&runtime->import_mutex);
 		runtime->imported = false;
+		runtime->import_fd = -1;
 		pthread_mutex_unlock(&runtime->import_mutex);
 	}
 	runtime->current_configuration = 0u;
@@ -748,6 +758,12 @@ int server_runtime_init_devices(struct server_runtime *server)
 	if (!server)
 		return -1;
 
+	atomic_init(&server->config_positions_changed, false);
+	for (i = 0u; i < MAX_USBIP_DEVICES; ++i)
+		atomic_init(&server->config_textures_dirty[i], false);
+	server->config_inotify_fd    = -1;
+	server->config_watcher_created = false;
+
 	for (i = 0u; i < server->opts.device_count; ++i) {
 		struct device_runtime *runtime = &server->devices[i];
 
@@ -755,6 +771,7 @@ int server_runtime_init_devices(struct server_runtime *server)
 		options_from_configured_device(&server->opts.devices[i], &server->opts, &runtime->opts);
 		runtime->current_configuration = 0u;
 		runtime->imported = false;
+		runtime->import_fd = -1;
 		runtime->usbip_cadence_logging_enabled = runtime->opts.verbose ||
 			env_flag_enabled("BREEZY_USBIP_CADENCE_STATS");
 		udl_control_ram_seed(runtime);
@@ -808,5 +825,300 @@ void server_runtime_destroy(struct server_runtime *server)
 			pthread_mutex_destroy(&server->devices[i].import_mutex);
 			server->devices[i].import_mutex_initialized = false;
 		}
+	}
+}
+
+/* ================================================================
+ * Config file watcher
+ * ================================================================ */
+
+/*
+ * Return true when the EDID-relevant fields differ between two configured_device
+ * entries.  These are the fields that are baked into the EDID block served to
+ * USB/IP clients: monitor name, decode resolution, and refresh rate.
+ */
+static bool cfg_edid_changed(const struct configured_device *a,
+			      const struct configured_device *b)
+{
+	return strcmp(a->monitor_name, b->monitor_name) != 0
+	    || a->decode_width  != b->decode_width
+	    || a->decode_height != b->decode_height
+	    || a->refresh_hz    != b->refresh_hz;
+}
+
+/*
+ * Disconnect the active USB/IP client for device slot i, then wait (up to
+ * ~1 s) for the import session thread to exit so subsequent descriptor /
+ * framebuffer updates are not racing with a live session.
+ */
+static void kick_and_wait_for_session(struct server_runtime *server, size_t i)
+{
+	struct device_runtime *runtime = &server->devices[i];
+	int kick_fd;
+	int retries;
+
+	pthread_mutex_lock(&runtime->import_mutex);
+	kick_fd = runtime->import_fd;
+	pthread_mutex_unlock(&runtime->import_mutex);
+
+	if (kick_fd >= 0) {
+		fprintf(stderr,
+			"config watcher: disconnecting USB/IP client on device %zu for EDID update\n",
+			i);
+		shutdown(kick_fd, SHUT_RDWR);
+	}
+
+	/* Wait for the session thread to clear runtime->imported (max 100 × 10 ms = 1 s). */
+	for (retries = 0; retries < 100; retries++) {
+		bool still_imported;
+
+		pthread_mutex_lock(&runtime->import_mutex);
+		still_imported = runtime->imported;
+		pthread_mutex_unlock(&runtime->import_mutex);
+		if (!still_imported)
+			break;
+		nanosleep(&(struct timespec){0, 10000000L}, NULL); /* 10 ms */
+	}
+}
+
+/*
+ * Apply a validated set of new options to the live server runtime.
+ *
+ * Per-device diff rules:
+ *   - x/y changed only       → update in-place, set config_positions_changed
+ *   - EDID fields changed     → disconnect client, rebuild EDID/descriptors;
+ *                               if decode dimensions changed, also set
+ *                               config_textures_dirty[i] so the KMS renderer
+ *                               reinitialises the udl_runtime + GL texture
+ *
+ * Structural changes (device count, busid) are ignored with a log message;
+ * those require a restart.
+ */
+static void apply_config_change(struct server_runtime *server,
+				const struct server_options *new_opts)
+{
+	size_t i;
+	bool any_positions_changed = false;
+
+	if (new_opts->device_count != server->opts.device_count) {
+		fprintf(stderr,
+			"config watcher: device count changed (%zu → %zu); restart required\n",
+			server->opts.device_count, new_opts->device_count);
+		return;
+	}
+
+	for (i = 0u; i < server->opts.device_count; ++i) {
+		struct configured_device       *cur = &server->opts.devices[i];
+		const struct configured_device *nxt = &new_opts->devices[i];
+		struct device_runtime          *runtime = &server->devices[i];
+
+		bool edid_changed = cfg_edid_changed(cur, nxt);
+		bool dim_changed  = (cur->decode_width  != nxt->decode_width ||
+				     cur->decode_height != nxt->decode_height);
+		bool xy_changed   = (cur->x != nxt->x || cur->y != nxt->y);
+
+		if (!edid_changed && !xy_changed)
+			continue;
+
+		/* Always apply position updates — they are safe to write in-place because
+		 * the KMS renderer reads them at most once per second under no lock, and
+		 * the race window for an int32_t write on any supported platform is benign. */
+		if (xy_changed) {
+			cur->x = nxt->x;
+			cur->y = nxt->y;
+			any_positions_changed = true;
+			fprintf(stderr,
+				"config watcher: device %zu position → (%d, %d)\n",
+				i, cur->x, cur->y);
+		}
+
+		if (!edid_changed)
+			continue;
+
+		/* EDID change: disconnect the current client and wait for it to exit. */
+		kick_and_wait_for_session(server, i);
+
+		/* Update the persistent configured_device and the per-device options copy. */
+		(void)snprintf(cur->monitor_name, sizeof(cur->monitor_name),
+			       "%s", nxt->monitor_name);
+		cur->decode_width  = nxt->decode_width;
+		cur->decode_height = nxt->decode_height;
+		cur->refresh_hz    = nxt->refresh_hz;
+
+		/* runtime->opts.monitor_name is a pointer into cur->monitor_name so it
+		 * already sees the update above.  The integer fields need explicit sync. */
+		runtime->opts.decode_width  = nxt->decode_width;
+		runtime->opts.decode_height = nxt->decode_height;
+		runtime->opts.refresh_hz    = nxt->refresh_hz;
+
+		/* Rebuild EDID and USB descriptors for the next enumeration. */
+		build_default_edid(runtime->edid,
+				   runtime->opts.monitor_name,
+				   runtime->opts.decode_width,
+				   runtime->opts.decode_height,
+				   runtime->opts.refresh_hz,
+				   runtime->opts.strict_native_mode,
+				   runtime->opts.allow_30hz_fallback);
+		build_vendor_descriptor(runtime);
+		build_device_descriptor(runtime);
+		build_device_qualifier(runtime);
+		build_bos_descriptor(runtime);
+		fill_usbip_device(runtime);
+
+		fprintf(stderr,
+			"config watcher: device %zu EDID updated → %ux%u@%u \"%s\"%s\n",
+			i,
+			nxt->decode_width, nxt->decode_height,
+			nxt->refresh_hz, nxt->monitor_name,
+			dim_changed ? " (dimensions changed — GL texture reinit signalled)" : "");
+
+		if (dim_changed)
+			atomic_store(&server->config_textures_dirty[i], true);
+	}
+
+	if (any_positions_changed)
+		atomic_store(&server->config_positions_changed, true);
+}
+
+static void *config_watcher_thread_main(void *arg)
+{
+	struct server_runtime *server = arg;
+	/* inotify events are variable-length; 4 KiB holds several at once. */
+	char buf[4096] __attribute__((aligned(__alignof__(struct inotify_event))));
+
+	while (!stop_requested) {
+		fd_set rfds;
+		struct timeval tv;
+		int ret;
+
+		FD_ZERO(&rfds);
+		FD_SET(server->config_inotify_fd, &rfds);
+		tv.tv_sec  = 1;
+		tv.tv_usec = 0;
+		ret = select(server->config_inotify_fd + 1, &rfds, NULL, NULL, &tv);
+		if (ret < 0) {
+			if (errno == EINTR)
+				continue;
+			break; /* inotify fd closed by server_stop_config_watcher */
+		}
+		if (ret == 0)
+			continue; /* timeout — recheck stop_requested */
+
+		ssize_t len = read(server->config_inotify_fd, buf, sizeof(buf));
+		if (len < 0) {
+			if (errno == EINTR)
+				continue;
+			break;
+		}
+
+		/* Scan events; act only when our config file is the subject. */
+		bool relevant = false;
+		const char *ptr = buf;
+		while (ptr < buf + len) {
+			const struct inotify_event *ev =
+				(const struct inotify_event *)ptr;
+			if (ev->len > 0 &&
+			    strcmp(ev->name, server->config_filename) == 0)
+				relevant = true;
+			ptr += (ssize_t)(sizeof(struct inotify_event) + ev->len);
+		}
+
+		if (!relevant)
+			continue;
+
+		/* Brief pause so editors that write via rename (vim, emacs, etc.)
+		 * have time to complete their file-replacement sequence. */
+		nanosleep(&(struct timespec){0, 50000000L}, NULL); /* 50 ms */
+
+		struct server_options new_opts;
+		struct runtime_cli_args dummy_cli;
+
+		memset(&dummy_cli, 0, sizeof(dummy_cli));
+		if (load_server_options_from_config(server->config_path,
+						    &dummy_cli, &new_opts) == 0)
+			apply_config_change(server, &new_opts);
+		else
+			fprintf(stderr,
+				"config watcher: failed to parse %s — ignoring\n",
+				server->config_path);
+	}
+
+	return NULL;
+}
+
+int server_start_config_watcher(struct server_runtime *server,
+				const char *config_path)
+{
+	char dir_path[PATH_MAX];
+	const char *slash;
+	int wd;
+
+	if (!server || !config_path)
+		return -1;
+
+	(void)snprintf(server->config_path, sizeof(server->config_path),
+		       "%s", config_path);
+
+	/* Split into directory and filename parts. */
+	slash = strrchr(config_path, '/');
+	if (slash) {
+		size_t dir_len = (size_t)(slash - config_path);
+		if (dir_len >= sizeof(dir_path))
+			dir_len = sizeof(dir_path) - 1u;
+		memcpy(dir_path, config_path, dir_len);
+		dir_path[dir_len] = '\0';
+		(void)snprintf(server->config_filename,
+			       sizeof(server->config_filename),
+			       "%s", slash + 1);
+	} else {
+		(void)snprintf(dir_path, sizeof(dir_path), ".");
+		(void)snprintf(server->config_filename,
+			       sizeof(server->config_filename),
+			       "%s", config_path);
+	}
+
+	server->config_inotify_fd = inotify_init1(IN_CLOEXEC | IN_NONBLOCK);
+	if (server->config_inotify_fd < 0) {
+		perror("inotify_init1");
+		return -1;
+	}
+
+	/* Watch the containing directory so we catch both direct writes
+	 * (IN_CLOSE_WRITE) and atomic renames used by many editors (IN_MOVED_TO). */
+	wd = inotify_add_watch(server->config_inotify_fd, dir_path,
+			       IN_CLOSE_WRITE | IN_MOVED_TO);
+	if (wd < 0) {
+		perror("inotify_add_watch");
+		close(server->config_inotify_fd);
+		server->config_inotify_fd = -1;
+		return -1;
+	}
+
+	if (pthread_create(&server->config_watcher_thread, NULL,
+			   config_watcher_thread_main, server) != 0) {
+		perror("pthread_create config watcher");
+		close(server->config_inotify_fd);
+		server->config_inotify_fd = -1;
+		return -1;
+	}
+	server->config_watcher_created = true;
+
+	printf("config watcher: watching %s for hot-reload\n", config_path);
+	return 0;
+}
+
+void server_stop_config_watcher(struct server_runtime *server)
+{
+	if (!server)
+		return;
+
+	/* Closing the inotify fd unblocks the select() in the thread. */
+	if (server->config_inotify_fd >= 0) {
+		close(server->config_inotify_fd);
+		server->config_inotify_fd = -1;
+	}
+	if (server->config_watcher_created) {
+		pthread_join(server->config_watcher_thread, NULL);
+		server->config_watcher_created = false;
 	}
 }

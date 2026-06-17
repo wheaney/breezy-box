@@ -1468,6 +1468,80 @@ static void kms_step_zoom_eases(struct kms_state *kms, uint64_t now_ms)
 }
 
 /* ----------------------------------------------------------------
+ * Hot-reload: dimension change — reinitialise udl_runtime + GL texture
+ * ---------------------------------------------------------------- */
+
+/*
+ * When the config watcher detects a decode-dimension change for device i it
+ * sets server->config_textures_dirty[i].  This must be consumed on the GL
+ * thread (here, in the KMS render loop) because the GL texture objects are
+ * not accessible from server.c.
+ *
+ * The watcher has already:
+ *   1. disconnected the USB/IP client and waited for the session to exit
+ *   2. updated server->opts.devices[i] and runtime->opts with the new dims
+ *   3. rebuilt the EDID / USB descriptors
+ *
+ * We complete the reinit here: destroy the old udl decode runtime + GL
+ * resources, then reinitialise both with the new dimensions.  The client
+ * will reconnect and enumerate the updated EDID automatically.
+ */
+static void kms_apply_texture_reinits(struct kms_state *kms,
+				      struct server_runtime *server)
+{
+	size_t i;
+
+	for (i = 0u; i < kms->display_count; ++i) {
+		struct kms_display_tex *disp;
+
+		if (i >= MAX_USBIP_DEVICES)
+			break;
+		if (!atomic_exchange(&server->config_textures_dirty[i], false))
+			continue;
+
+		disp = &kms->displays[i];
+
+		/* Tear down old GL resources for this slot. */
+		if (disp->gl_tex) {
+			glDeleteTextures(1, &disp->gl_tex);
+			disp->gl_tex = 0;
+		}
+		if (disp->egl_image != EGL_NO_IMAGE_KHR && kms->eglDestroyImageKHR)
+			kms->eglDestroyImageKHR(kms->egl_display, disp->egl_image);
+		if (disp->bo) {
+			gbm_bo_destroy(disp->bo);
+			disp->bo = NULL;
+		}
+		if (disp->fallback_tex) {
+			glDeleteTextures(1, &disp->fallback_tex);
+			disp->fallback_tex = 0;
+		}
+		memset(disp, 0, sizeof(*disp));
+
+		/* Reinitialise the UDL decode runtime with the new dimensions.
+		 * The watcher already updated server->devices[i].opts; we just
+		 * destroy the old runtime and start a fresh one. */
+		udl_runtime_destroy(&server->devices[i].udl);
+		if (udl_runtime_init(&server->devices[i].udl,
+				     &server->devices[i].opts) != 0) {
+			fprintf(stderr,
+				"kms: failed to reinit udl for device %zu after dimension change\n",
+				i);
+		}
+
+		/* Rebuild the GL texture/DMA-buf for the new dimensions. */
+		kms_init_display_tex(kms, i, &server->devices[i].udl,
+				     server->opts.verbose);
+
+		fprintf(stderr,
+			"kms: device %zu texture reinitialised → %ux%u\n",
+			i,
+			server->devices[i].opts.decode_width,
+			server->devices[i].opts.decode_height);
+	}
+}
+
+/* ----------------------------------------------------------------
  * Frame rendering
  * ---------------------------------------------------------------- */
 
@@ -1844,7 +1918,9 @@ static int kms_run(struct kms_state *kms, struct server_runtime *server)
 		    breezy_settings_consume_if_changed(kms->settings_handle, &kms->settings);
 		if (settings_dirty)
 			breezy_driver_control_update(&kms->settings);
-		kms_poll_device_config(kms, server, settings_dirty);
+		bool positions_changed =
+		    atomic_exchange(&server->config_positions_changed, false);
+		kms_poll_device_config(kms, server, settings_dirty || positions_changed);
 
 		/* Honour framerate_cap: skip this iteration if not enough time has passed. */
 		if (kms->settings.framerate_cap > 0.0) {
@@ -1855,6 +1931,7 @@ static int kms_run(struct kms_state *kms, struct server_runtime *server)
 			last_frame_ms = now_ms;
 		}
 
+		kms_apply_texture_reinits(kms, server);
 		kms_update_display_textures(kms, server);
 		kms_render_frame(kms, server);
 		if (!eglSwapBuffers(kms->egl_display, kms->egl_surface)) {
@@ -2123,6 +2200,9 @@ int main(int argc, char **argv)
 	}
 	atomic_init(&server.viewer_stop_requested, false);
 
+	if (server_start_config_watcher(&server, cli.config_path) != 0)
+		fprintf(stderr, "Warning: config hot-reload unavailable\n");
+
 	/*
 	 * Populate address state once — these fields survive renderer reconnect
 	 * cycles and are never wiped by renderer_destroy().
@@ -2176,6 +2256,7 @@ int main(int argc, char **argv)
 
 	out:
 	stop_requested = 1;
+	server_stop_config_watcher(&server);
 	if (srv_thread_created) {
 		if (server.listen_fd >= 0)
 			shutdown(server.listen_fd, SHUT_RDWR);
