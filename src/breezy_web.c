@@ -44,7 +44,6 @@
 #define GSETTINGS_OUT_MAX      1024
 
 #define GSETTINGS_SCHEMA "com.xronlinux.BreezyDesktop"
-#define GSETTINGS_PATH   "/com/xronlinux/BreezyDesktop/"
 
 static volatile int g_stop = 0;
 static char g_web_root[MAX_WEB_ROOT] = DEFAULT_WEB_ROOT;
@@ -82,14 +81,9 @@ static int gsettings_get(const char *key, char *buf, size_t bufsz)
 		close(pipefd[0]);
 		dup2(pipefd[1], STDOUT_FILENO);
 		close(pipefd[1]);
-		int devnull = open("/dev/null", O_WRONLY);
-		if (devnull >= 0) {
-			dup2(devnull, STDERR_FILENO);
-			close(devnull);
-		}
 		ensure_dbus_session_env();
 		execlp("gsettings", "gsettings", "get",
-		       GSETTINGS_SCHEMA ":" GSETTINGS_PATH, key, (char *)NULL);
+		       GSETTINGS_SCHEMA, key, (char *)NULL);
 		_exit(127);
 	}
 
@@ -118,15 +112,9 @@ static int gsettings_set(const char *key, const char *value)
 	if (pid < 0)
 		return -1;
 	if (pid == 0) {
-		int devnull = open("/dev/null", O_WRONLY);
-		if (devnull >= 0) {
-			dup2(devnull, STDOUT_FILENO);
-			dup2(devnull, STDERR_FILENO);
-			close(devnull);
-		}
 		ensure_dbus_session_env();
 		execlp("gsettings", "gsettings", "set",
-		       GSETTINGS_SCHEMA ":" GSETTINGS_PATH, key, value, (char *)NULL);
+		       GSETTINGS_SCHEMA, key, value, (char *)NULL);
 		_exit(127);
 	}
 	int status;
@@ -158,12 +146,6 @@ static int restart_user_service(const char *service)
 	if (pid < 0)
 		return -1;
 	if (pid == 0) {
-		int devnull = open("/dev/null", O_WRONLY);
-		if (devnull >= 0) {
-			dup2(devnull, STDOUT_FILENO);
-			dup2(devnull, STDERR_FILENO);
-			close(devnull);
-		}
 		execlp("systemctl", "systemctl", "--user", "restart", service,
 		       (char *)NULL);
 		_exit(127);
