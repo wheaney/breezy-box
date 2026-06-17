@@ -34,6 +34,7 @@
 #include <unistd.h>
 
 #include <json-c/json.h>
+#include <sys/types.h>
 
 #define DEFAULT_LISTEN_ADDR    "http://0.0.0.0:80"
 #define DEFAULT_WEB_ROOT       "web"
@@ -52,6 +53,17 @@ static void on_signal(int sig)
 {
 	(void)sig;
 	g_stop = 1;
+}
+
+/* If DBUS_SESSION_BUS_ADDRESS isn't inherited (e.g. breezy-web started before
+ * the session bus was ready), fall back to the well-known XDG runtime socket. */
+static void ensure_dbus_session_env(void)
+{
+	if (getenv("DBUS_SESSION_BUS_ADDRESS"))
+		return;
+	char path[128];
+	snprintf(path, sizeof(path), "unix:path=/run/user/%d/bus", (int)getuid());
+	setenv("DBUS_SESSION_BUS_ADDRESS", path, 0);
 }
 
 static int gsettings_get(const char *key, char *buf, size_t bufsz)
@@ -75,6 +87,7 @@ static int gsettings_get(const char *key, char *buf, size_t bufsz)
 			dup2(devnull, STDERR_FILENO);
 			close(devnull);
 		}
+		ensure_dbus_session_env();
 		execlp("gsettings", "gsettings", "get",
 		       GSETTINGS_SCHEMA ":" GSETTINGS_PATH, key, (char *)NULL);
 		_exit(127);
@@ -111,6 +124,7 @@ static int gsettings_set(const char *key, const char *value)
 			dup2(devnull, STDERR_FILENO);
 			close(devnull);
 		}
+		ensure_dbus_session_env();
 		execlp("gsettings", "gsettings", "set",
 		       GSETTINGS_SCHEMA ":" GSETTINGS_PATH, key, value, (char *)NULL);
 		_exit(127);
