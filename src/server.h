@@ -145,3 +145,11 @@ void server_runtime_destroy(struct server_runtime *server);
  */
 int  server_start_config_watcher(struct server_runtime *server, const char *config_path);
 void server_stop_config_watcher(struct server_runtime *server);
+
+/*
+ * Clear the per-device reconfiguring guard after the KMS renderer has completed
+ * a dimension-change reinit (udl_runtime + GL texture).  Until this is called the
+ * device refuses USB/IP imports.  Called from the render thread; no-op for an
+ * out-of-range index.
+ */
+void server_finish_device_reconfigure(struct server_runtime *server, size_t i);

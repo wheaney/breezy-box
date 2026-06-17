@@ -42,10 +42,12 @@
 #define DEFAULT_HTTPS_LISTEN   "https://0.0.0.0:443"
 #define DEFAULT_WEB_ROOT       "web"
 #define DEFAULT_CONFIG_RELPATH "breezy-box/config.json"
+#define CONTROL_SIGNALS_PATH   "/dev/shm/xr_driver_control"
 #define MAX_WEB_ROOT           256
 #define MAX_PATH_ARG           4096
 #define MAX_GSETTINGS_KEY      128
 #define GSETTINGS_OUT_MAX      1024
+#define MAX_CONTROL_SIGNAL_NAME 128
 
 #define GSETTINGS_SCHEMA "com.xronlinux.BreezyDesktop"
 
@@ -132,6 +134,26 @@ static int gsettings_set(const char *key, const char *value)
 	int status;
 	waitpid(pid, &status, 0);
 	return (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 0 : -1;
+}
+
+static int control_signal_write(const char *signal, const char *value)
+{
+	int fd = open(CONTROL_SIGNALS_PATH, O_WRONLY | O_CLOEXEC);
+	if (fd < 0)
+		return -1;
+	char buf[256];
+	int n = snprintf(buf, sizeof(buf), "%s=%s\n", signal, value);
+	ssize_t written = 0;
+	while (written < n) {
+		ssize_t w = write(fd, buf + written, (size_t)n - (size_t)written);
+		if (w < 0) {
+			close(fd);
+			return -1;
+		}
+		written += w;
+	}
+	close(fd);
+	return 0;
 }
 
 static const char *const RESTARTABLE_SERVICES[] = {
@@ -314,6 +336,49 @@ static void handle_settings_put(struct mg_connection *c, struct mg_http_message 
 	              MG_ESC(key));
 }
 
+static void handle_control_signal_put(struct mg_connection *c, struct mg_http_message *hm)
+{
+	const char *prefix = "/controls/";
+	size_t prefix_len = strlen(prefix);
+
+	if (hm->uri.len <= prefix_len) {
+		mg_http_reply(c, 400, "", "Missing key\n");
+		return;
+	}
+
+	char key[MAX_CONTROL_SIGNAL_NAME] = {0};
+	size_t key_len = hm->uri.len - prefix_len;
+	if (key_len >= sizeof(key)) {
+		mg_http_reply(c, 400, "", "Key too long\n");
+		return;
+	}
+	memcpy(key, hm->uri.buf + prefix_len, key_len);
+
+	char *value = mg_json_get_str(hm->body, "$.value");
+	if (!value) {
+		mg_http_reply(c, 400,
+		              "Content-Type: application/json\r\n",
+		              "{\"error\":\"body must be JSON with a \\\"value\\\" field\"}\n");
+		return;
+	}
+
+	int rc = control_signal_write(key, value);
+	free(value);
+
+	if (rc != 0) {
+		mg_http_reply(c, 500,
+		              "Content-Type: application/json\r\n",
+		              "{\"error\":\"control signal write failed\",\"key\":%m}\n",
+		              MG_ESC(key));
+		return;
+	}
+
+	mg_http_reply(c, 200,
+	              "Content-Type: application/json\r\n",
+	              "{\"key\":%m,\"status\":\"ok\"}\n",
+	              MG_ESC(key));
+}
+
 static void resolve_config_path(char *out, size_t outsz)
 {
 	const char *xdg  = getenv("XDG_CONFIG_HOME");
@@ -459,6 +524,9 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data)
 	} else if (mg_match(hm->uri, mg_str("/monitors"), NULL) &&
 	           mg_match(hm->method, mg_str("POST"), NULL)) {
 		handle_monitors_post(c, hm);
+	} else if (mg_match(hm->uri, mg_str("/controls/*"), NULL) &&
+			   mg_match(hm->method, mg_str("PUT"), NULL)) {
+		handle_control_signal_put(c, hm);
 	} else {
 		mg_http_reply(c, 404, "", "Not found\n");
 	}

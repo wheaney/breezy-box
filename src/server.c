@@ -543,7 +543,9 @@ int handle_import_request(struct server_runtime *server, int fd)
 		status = ST_NODEV;
 	else {
 		pthread_mutex_lock(&runtime->import_mutex);
-		if (runtime->imported) {
+		if (runtime->reconfiguring || runtime->imported) {
+			/* Busy while an EDID/dimension hot-reload is in flight; the
+			 * client retries and lands on the freshly rebuilt device. */
 			status = ST_DEV_BUSY;
 		} else {
 			runtime->imported = true;
@@ -772,6 +774,7 @@ int server_runtime_init_devices(struct server_runtime *server)
 		runtime->current_configuration = 0u;
 		runtime->imported = false;
 		runtime->import_fd = -1;
+		runtime->reconfiguring = false;
 		runtime->usbip_cadence_logging_enabled = runtime->opts.verbose ||
 			env_flag_enabled("BREEZY_USBIP_CADENCE_STATS");
 		udl_control_ram_seed(runtime);
@@ -847,17 +850,25 @@ static bool cfg_edid_changed(const struct configured_device *a,
 }
 
 /*
- * Disconnect the active USB/IP client for device slot i, then wait (up to
- * ~1 s) for the import session thread to exit so subsequent descriptor /
- * framebuffer updates are not racing with a live session.
+ * Begin reconfiguring device slot i: mark it reconfiguring (so handle_import_request
+ * refuses new sessions), disconnect any active USB/IP client, then wait (up to ~1 s)
+ * for the import session thread to exit.  On return no session is feeding the
+ * device's udl_runtime and none can start until reconfiguring is cleared, so the
+ * caller can safely rebuild descriptors and (for dimension changes) the udl_runtime
+ * + GL texture without racing the decode/connection threads.
+ *
+ * Setting reconfiguring under import_mutex before reading import_fd is what closes
+ * the race: any session that claimed the device did so before this point (we kick
+ * and drain it here); any session attempting to claim after this is rejected.
  */
-static void kick_and_wait_for_session(struct server_runtime *server, size_t i)
+static void begin_reconfigure_device(struct server_runtime *server, size_t i)
 {
 	struct device_runtime *runtime = &server->devices[i];
 	int kick_fd;
 	int retries;
 
 	pthread_mutex_lock(&runtime->import_mutex);
+	runtime->reconfiguring = true;
 	kick_fd = runtime->import_fd;
 	pthread_mutex_unlock(&runtime->import_mutex);
 
@@ -879,6 +890,23 @@ static void kick_and_wait_for_session(struct server_runtime *server, size_t i)
 			break;
 		nanosleep(&(struct timespec){0, 10000000L}, NULL); /* 10 ms */
 	}
+}
+
+/* Clear the reconfiguring guard, re-allowing USB/IP imports for device slot i. */
+static void end_reconfigure_device(struct server_runtime *server, size_t i)
+{
+	struct device_runtime *runtime = &server->devices[i];
+
+	pthread_mutex_lock(&runtime->import_mutex);
+	runtime->reconfiguring = false;
+	pthread_mutex_unlock(&runtime->import_mutex);
+}
+
+void server_finish_device_reconfigure(struct server_runtime *server, size_t i)
+{
+	if (!server || i >= server->opts.device_count)
+		return;
+	end_reconfigure_device(server, i);
 }
 
 /*
@@ -935,8 +963,12 @@ static void apply_config_change(struct server_runtime *server,
 		if (!edid_changed)
 			continue;
 
-		/* EDID change: disconnect the current client and wait for it to exit. */
-		kick_and_wait_for_session(server, i);
+		/* EDID change: block new imports, disconnect the current client, and
+		 * wait for its session to exit.  After this returns the device's
+		 * udl_runtime has no feeder and none can start until reconfiguring is
+		 * cleared, so the descriptor (and, for dimension changes, udl + GL)
+		 * rebuild below cannot race the decode/connection threads. */
+		begin_reconfigure_device(server, i);
 
 		/* Update the persistent configured_device and the per-device options copy. */
 		(void)snprintf(cur->monitor_name, sizeof(cur->monitor_name),
@@ -972,8 +1004,19 @@ static void apply_config_change(struct server_runtime *server,
 			nxt->refresh_hz, nxt->monitor_name,
 			dim_changed ? " (dimensions changed — GL texture reinit signalled)" : "");
 
-		if (dim_changed)
+		if (dim_changed) {
+			/* Hand off to the render thread, which performs the udl_runtime +
+			 * GL texture reinit (it owns the framebuffer reads and GL context)
+			 * and clears reconfiguring via server_finish_device_reconfigure()
+			 * once done.  reconfiguring stays set until then, keeping the
+			 * device unavailable for the duration of the rebuild. */
 			atomic_store(&server->config_textures_dirty[i], true);
+		} else {
+			/* Descriptor-only change (monitor name / refresh): nothing for the
+			 * render thread to do, so re-allow imports immediately.  The client
+			 * reconnects and enumerates the rebuilt EDID. */
+			end_reconfigure_device(server, i);
+		}
 	}
 
 	if (any_positions_changed)

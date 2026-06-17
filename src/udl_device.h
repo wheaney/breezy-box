@@ -192,6 +192,10 @@ struct device_runtime {
 	bool import_mutex_initialized;
 	bool imported;
 	int import_fd;    /* fd of active import session (-1 when none); protected by import_mutex */
+	bool reconfiguring; /* EDID/dimension hot-reload in progress; blocks new imports.
+			     * Set by the config watcher, cleared once the reinit (descriptors,
+			     * and for dimension changes the udl_runtime + GL texture) is done.
+			     * Protected by import_mutex. */
 	bool usbip_cadence_logging_enabled;
 	bool key_loaded;
 	bool vendor_14_seen;

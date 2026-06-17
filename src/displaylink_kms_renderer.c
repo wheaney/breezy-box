@@ -1477,14 +1477,17 @@ static void kms_step_zoom_eases(struct kms_state *kms, uint64_t now_ms)
  * thread (here, in the KMS render loop) because the GL texture objects are
  * not accessible from server.c.
  *
- * The watcher has already:
- *   1. disconnected the USB/IP client and waited for the session to exit
- *   2. updated server->opts.devices[i] and runtime->opts with the new dims
- *   3. rebuilt the EDID / USB descriptors
+ * The watcher has already, under the per-device reconfiguring guard:
+ *   1. blocked new USB/IP imports (handle_import_request returns ST_DEV_BUSY)
+ *   2. disconnected the active client and waited for its session to exit
+ *   3. updated server->opts.devices[i] and runtime->opts with the new dims
+ *   4. rebuilt the EDID / USB descriptors
  *
- * We complete the reinit here: destroy the old udl decode runtime + GL
- * resources, then reinitialise both with the new dimensions.  The client
- * will reconnect and enumerate the updated EDID automatically.
+ * Because reconfiguring is still set, no connection thread can be feeding this
+ * device's udl_runtime, and the framebuffer reads happen on this same render
+ * thread — so the destroy/reinit below races nothing.  We complete the reinit
+ * here, then clear the guard via server_finish_device_reconfigure() so the
+ * client can reconnect and enumerate the updated EDID.
  */
 static void kms_apply_texture_reinits(struct kms_state *kms,
 				      struct server_runtime *server)
@@ -1532,6 +1535,9 @@ static void kms_apply_texture_reinits(struct kms_state *kms,
 		/* Rebuild the GL texture/DMA-buf for the new dimensions. */
 		kms_init_display_tex(kms, i, &server->devices[i].udl,
 				     server->opts.verbose);
+
+		/* Reinit complete — re-allow USB/IP imports for this device. */
+		server_finish_device_reconfigure(server, i);
 
 		fprintf(stderr,
 			"kms: device %zu texture reinitialised → %ux%u\n",
