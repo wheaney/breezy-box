@@ -94,10 +94,29 @@
         }).catch(function () {});
       }
 
+      function screensSnapshot(screenDetails) {
+        return screenDetails.screens.map(function (s) {
+          return s.label + ':' + s.width + 'x' + s.height + '+' + s.left + '+' + s.top;
+        }).join('|');
+      }
+
       function attachScreenChangeListener(screenDetails) {
+        var lastSnapshot = screensSnapshot(screenDetails);
+
         screenDetails.addEventListener('screenschange', function () {
+          lastSnapshot = screensSnapshot(screenDetails);
           postMonitors(screenDetails);
         });
+
+        /* Poll for coordinate-only changes (add/remove fires screenschange, but
+         * geometry changes on existing screens do not). */
+        setInterval(function () {
+          var snap = screensSnapshot(screenDetails);
+          if (snap !== lastSnapshot) {
+            lastSnapshot = snap;
+            postMonitors(screenDetails);
+          }
+        }, 5000);
       }
 
       /* Request window-management permission using the loading overlay as the
