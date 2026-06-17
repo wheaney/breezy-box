@@ -549,6 +549,13 @@ int handle_import_request(struct server_runtime *server, int fd)
 			status = ST_DEV_BUSY;
 		} else {
 			runtime->imported = true;
+			/* Record the fd in the same critical section that claims the
+			 * device.  This closes the window the config watcher relies on:
+			 * begin_reconfigure_device() reads import_fd under this lock, so
+			 * any session marked imported is guaranteed to have a kickable fd
+			 * — there is no point at which imported is true but import_fd is
+			 * still -1. */
+			runtime->import_fd = fd;
 			claimed = true;
 		}
 		pthread_mutex_unlock(&runtime->import_mutex);
@@ -564,11 +571,6 @@ int handle_import_request(struct server_runtime *server, int fd)
 
 	if (runtime->opts.verbose)
 		fprintf(stderr, "USB/IP import attached for busid %s\n", runtime->usbip_device.busid);
-
-	/* Record the fd so the config watcher can shut down this session on EDID change. */
-	pthread_mutex_lock(&runtime->import_mutex);
-	runtime->import_fd = fd;
-	pthread_mutex_unlock(&runtime->import_mutex);
 
 	if (run_import_session(runtime, fd) != 0 && runtime->opts.verbose)
 		fprintf(stderr, "USB/IP import session ended\n");
@@ -858,14 +860,17 @@ static bool cfg_edid_changed(const struct configured_device *a,
  * + GL texture without racing the decode/connection threads.
  *
  * Setting reconfiguring under import_mutex before reading import_fd is what closes
- * the race: any session that claimed the device did so before this point (we kick
- * and drain it here); any session attempting to claim after this is rejected.
+ * the race: any session that claimed the device did so before this point, and it
+ * recorded import_fd in the same critical section that set imported, so we have a
+ * kickable fd for it (we kick and drain it here); any session attempting to claim
+ * after this is rejected.
  */
 static void begin_reconfigure_device(struct server_runtime *server, size_t i)
 {
 	struct device_runtime *runtime = &server->devices[i];
 	int kick_fd;
 	int retries;
+	bool still_imported = false;
 
 	pthread_mutex_lock(&runtime->import_mutex);
 	runtime->reconfiguring = true;
@@ -881,8 +886,6 @@ static void begin_reconfigure_device(struct server_runtime *server, size_t i)
 
 	/* Wait for the session thread to clear runtime->imported (max 100 × 10 ms = 1 s). */
 	for (retries = 0; retries < 100; retries++) {
-		bool still_imported;
-
 		pthread_mutex_lock(&runtime->import_mutex);
 		still_imported = runtime->imported;
 		pthread_mutex_unlock(&runtime->import_mutex);
@@ -890,6 +893,15 @@ static void begin_reconfigure_device(struct server_runtime *server, size_t i)
 			break;
 		nanosleep(&(struct timespec){0, 10000000L}, NULL); /* 10 ms */
 	}
+
+	/* Should not happen now that imported and import_fd are set atomically, but
+	 * surface it loudly if a session ever refuses to exit within the budget: the
+	 * descriptor/udl rebuild below would then race a live session. */
+	if (still_imported)
+		fprintf(stderr,
+			"config watcher: WARNING device %zu session did not exit within 1 s; "
+			"proceeding with reconfigure (possible race)\n",
+			i);
 }
 
 /* Clear the reconfiguring guard, re-allowing USB/IP imports for device slot i. */
