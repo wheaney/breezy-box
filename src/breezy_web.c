@@ -138,7 +138,7 @@ static int gsettings_set(const char *key, const char *value)
 
 static int control_signal_write(const char *signal, const char *value)
 {
-	int fd = open(CONTROL_SIGNALS_PATH, O_WRONLY | O_CLOEXEC);
+	int fd = open(CONTROL_SIGNALS_PATH, O_WRONLY | O_CREAT | O_CLOEXEC, 0666);
 	if (fd < 0)
 		return -1;
 	char buf[256];
