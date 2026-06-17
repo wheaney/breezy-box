@@ -4,19 +4,27 @@
  * Listens on :80 (requires CAP_NET_BIND_SERVICE).
  *
  * Routes:
- *   GET  /             → serve web/index.html
- *   GET  /status       → JSON: VNC reachability + renderer state
- *   POST /restart/:svc → restart a named user service via systemctl
+ *   GET  /                  → serve web/index.html
+ *   GET  /status            → JSON: VNC reachability + renderer state
+ *   POST /restart/:svc      → restart a named user service via systemctl
+ *   GET  /settings/:key     → retrieve a GSettings key value (raw gsettings output)
+ *   PUT  /settings/:key     → store a value; body: {"value":"..."}
+ *   POST /monitors          → accept window-management monitor layout from browser;
+ *                             body: array of {id, label, width, height, x, y};
+ *                             updates x/y of matching devices in the config file
  *
  * Build: see Makefile (breezy_web target).
- * Run:   breezy_web [--port 80] [--web-root /path/to/web/]
+ * Run:   breezy_web [--port 80] [--web-root DIR]
  */
 
 #define MG_ENABLE_PACKED_FS 0
 
 #include "vendor/mongoose.h"
 
+#include <errno.h>
+#include <fcntl.h>
 #include <getopt.h>
+#include <limits.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -25,11 +33,17 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#define DEFAULT_LISTEN_ADDR  "http://0.0.0.0:80"
-#define DEFAULT_WEB_ROOT     "web"
-#define MAX_WEB_ROOT         256
+#include <json-c/json.h>
 
-/* ------------------------------------------------------------------ */
+#define DEFAULT_LISTEN_ADDR    "http://0.0.0.0:80"
+#define DEFAULT_WEB_ROOT       "web"
+#define DEFAULT_CONFIG_RELPATH "breezy-box/config.json"
+#define MAX_WEB_ROOT           256
+#define MAX_GSETTINGS_KEY      128
+#define GSETTINGS_OUT_MAX      1024
+
+#define GSETTINGS_SCHEMA "com.xronlinux.BreezyDesktop"
+#define GSETTINGS_PATH   "/com/xronlinux/BreezyDesktop/"
 
 static volatile int g_stop = 0;
 static char g_web_root[MAX_WEB_ROOT] = DEFAULT_WEB_ROOT;
@@ -40,14 +54,72 @@ static void on_signal(int sig)
 	g_stop = 1;
 }
 
-/* ------------------------------------------------------------------ */
-/* Helpers                                                              */
-/* ------------------------------------------------------------------ */
+static int gsettings_get(const char *key, char *buf, size_t bufsz)
+{
+	int pipefd[2];
+	if (pipe(pipefd) != 0)
+		return -1;
 
-/*
- * Allowed service names for the /restart route.
- * Prevents arbitrary systemctl calls from an open endpoint.
- */
+	pid_t pid = fork();
+	if (pid < 0) {
+		close(pipefd[0]);
+		close(pipefd[1]);
+		return -1;
+	}
+	if (pid == 0) {
+		close(pipefd[0]);
+		dup2(pipefd[1], STDOUT_FILENO);
+		close(pipefd[1]);
+		int devnull = open("/dev/null", O_WRONLY);
+		if (devnull >= 0) {
+			dup2(devnull, STDERR_FILENO);
+			close(devnull);
+		}
+		execlp("gsettings", "gsettings", "get",
+		       GSETTINGS_SCHEMA ":" GSETTINGS_PATH, key, (char *)NULL);
+		_exit(127);
+	}
+
+	close(pipefd[1]);
+
+	size_t total = 0;
+	ssize_t n;
+	while (total + 1 < bufsz &&
+	       (n = read(pipefd[0], buf + total, bufsz - 1 - total)) > 0)
+		total += (size_t)n;
+	close(pipefd[0]);
+
+	int status;
+	waitpid(pid, &status, 0);
+
+	while (total > 0 && (buf[total - 1] == '\n' || buf[total - 1] == '\r'))
+		total--;
+	buf[total] = '\0';
+
+	return (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 0 : -1;
+}
+
+static int gsettings_set(const char *key, const char *value)
+{
+	pid_t pid = fork();
+	if (pid < 0)
+		return -1;
+	if (pid == 0) {
+		int devnull = open("/dev/null", O_WRONLY);
+		if (devnull >= 0) {
+			dup2(devnull, STDOUT_FILENO);
+			dup2(devnull, STDERR_FILENO);
+			close(devnull);
+		}
+		execlp("gsettings", "gsettings", "set",
+		       GSETTINGS_SCHEMA ":" GSETTINGS_PATH, key, value, (char *)NULL);
+		_exit(127);
+	}
+	int status;
+	waitpid(pid, &status, 0);
+	return (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 0 : -1;
+}
+
 static const char *const RESTARTABLE_SERVICES[] = {
 	"xr-driver",
 	"breezy-renderer",
@@ -72,7 +144,6 @@ static int restart_user_service(const char *service)
 	if (pid < 0)
 		return -1;
 	if (pid == 0) {
-		/* Suppress output in the child. */
 		int devnull = open("/dev/null", O_WRONLY);
 		if (devnull >= 0) {
 			dup2(devnull, STDOUT_FILENO);
@@ -87,10 +158,6 @@ static int restart_user_service(const char *service)
 	waitpid(pid, &status, 0);
 	return (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 0 : -1;
 }
-
-/* ------------------------------------------------------------------ */
-/* Route handlers                                                       */
-/* ------------------------------------------------------------------ */
 
 static void handle_index(struct mg_connection *c)
 {
@@ -122,11 +189,6 @@ static void handle_index(struct mg_connection *c)
 
 static void handle_status(struct mg_connection *c)
 {
-	/*
-	 * TODO: query real renderer state (e.g. via a Unix socket or shared
-	 * state file written by displaylink_kms_renderer).  For now, report
-	 * static VNC reachability.
-	 */
 	mg_http_reply(c, 200,
 	              "Content-Type: application/json\r\n",
 	              "{\"vnc_port\":5900,\"novnc_port\":8080,\"status\":\"ok\"}\n");
@@ -134,7 +196,6 @@ static void handle_status(struct mg_connection *c)
 
 static void handle_restart(struct mg_connection *c, struct mg_http_message *hm)
 {
-	/* Extract the service name from the URI: /restart/<name> */
 	struct mg_str uri = hm->uri;
 	const char *prefix = "/restart/";
 	size_t prefix_len = strlen(prefix);
@@ -169,9 +230,203 @@ static void handle_restart(struct mg_connection *c, struct mg_http_message *hm)
 	}
 }
 
-/* ------------------------------------------------------------------ */
-/* Mongoose event handler                                               */
-/* ------------------------------------------------------------------ */
+static void handle_settings_get(struct mg_connection *c, struct mg_http_message *hm)
+{
+	const char *prefix = "/settings/";
+	size_t prefix_len = strlen(prefix);
+
+	if (hm->uri.len <= prefix_len) {
+		mg_http_reply(c, 400, "", "Missing key\n");
+		return;
+	}
+
+	char key[MAX_GSETTINGS_KEY] = {0};
+	size_t key_len = hm->uri.len - prefix_len;
+	if (key_len >= sizeof(key)) {
+		mg_http_reply(c, 400, "", "Key too long\n");
+		return;
+	}
+	memcpy(key, hm->uri.buf + prefix_len, key_len);
+
+	char out[GSETTINGS_OUT_MAX];
+	if (gsettings_get(key, out, sizeof(out)) != 0) {
+		mg_http_reply(c, 500,
+		              "Content-Type: application/json\r\n",
+		              "{\"error\":\"gsettings get failed\",\"key\":%m}\n",
+		              MG_ESC(key));
+		return;
+	}
+
+	mg_http_reply(c, 200,
+	              "Content-Type: application/json\r\n",
+	              "{\"key\":%m,\"value\":%m}\n",
+	              MG_ESC(key), MG_ESC(out));
+}
+
+static void handle_settings_put(struct mg_connection *c, struct mg_http_message *hm)
+{
+	const char *prefix = "/settings/";
+	size_t prefix_len = strlen(prefix);
+
+	if (hm->uri.len <= prefix_len) {
+		mg_http_reply(c, 400, "", "Missing key\n");
+		return;
+	}
+
+	char key[MAX_GSETTINGS_KEY] = {0};
+	size_t key_len = hm->uri.len - prefix_len;
+	if (key_len >= sizeof(key)) {
+		mg_http_reply(c, 400, "", "Key too long\n");
+		return;
+	}
+	memcpy(key, hm->uri.buf + prefix_len, key_len);
+
+	char *value = mg_json_get_str(hm->body, "$.value");
+	if (!value) {
+		mg_http_reply(c, 400,
+		              "Content-Type: application/json\r\n",
+		              "{\"error\":\"body must be JSON with a \\\"value\\\" field\"}\n");
+		return;
+	}
+
+	int rc = gsettings_set(key, value);
+	free(value);
+
+	if (rc != 0) {
+		mg_http_reply(c, 500,
+		              "Content-Type: application/json\r\n",
+		              "{\"error\":\"gsettings set failed\",\"key\":%m}\n",
+		              MG_ESC(key));
+		return;
+	}
+
+	mg_http_reply(c, 200,
+	              "Content-Type: application/json\r\n",
+	              "{\"key\":%m,\"status\":\"ok\"}\n",
+	              MG_ESC(key));
+}
+
+static void resolve_config_path(char *out, size_t outsz)
+{
+	const char *xdg  = getenv("XDG_CONFIG_HOME");
+	const char *home = getenv("HOME");
+	if (xdg && xdg[0])
+		snprintf(out, outsz, "%s/%s", xdg, DEFAULT_CONFIG_RELPATH);
+	else if (home && home[0])
+		snprintf(out, outsz, "%s/.config/%s", home, DEFAULT_CONFIG_RELPATH);
+	else
+		snprintf(out, outsz, "%s", DEFAULT_CONFIG_RELPATH);
+}
+
+static void handle_monitors_post(struct mg_connection *c, struct mg_http_message *hm)
+{
+	if (hm->body.len == 0) {
+		mg_http_reply(c, 400, "Content-Type: application/json\r\n",
+		              "{\"error\":\"empty body\"}\n");
+		return;
+	}
+
+	struct mg_str body = hm->body;
+
+	size_t i = 0;
+	while (i < body.len && (body.buf[i] == ' ' || body.buf[i] == '\t' ||
+	                         body.buf[i] == '\r' || body.buf[i] == '\n'))
+		i++;
+	if (i >= body.len || body.buf[i] != '[') {
+		mg_http_reply(c, 400, "Content-Type: application/json\r\n",
+		              "{\"error\":\"body must be a JSON array\"}\n");
+		return;
+	}
+
+	size_t ofs = 0;
+	int count = 0;
+	struct mg_str mkey, mval;
+	while ((ofs = mg_json_next(body, ofs, &mkey, &mval)) > 0) {
+		static const char *required[] = { "$.label", "$.width", "$.height", "$.x", "$.y" };
+		for (size_t r = 0; r < sizeof(required) / sizeof(required[0]); r++) {
+			int toklen;
+			if (mg_json_get(mval, required[r], &toklen) < 0) {
+				mg_http_reply(c, 400, "Content-Type: application/json\r\n",
+				              "{\"error\":\"monitor entry missing field\","
+				              "\"field\":\"%s\"}\n", required[r] + 2);
+				return;
+			}
+		}
+		count++;
+	}
+
+	if (count == 0) {
+		mg_http_reply(c, 400, "Content-Type: application/json\r\n",
+		              "{\"error\":\"array must not be empty\"}\n");
+		return;
+	}
+
+	char config_path[PATH_MAX];
+	resolve_config_path(config_path, sizeof(config_path));
+
+	struct json_object *root = json_object_from_file(config_path);
+	if (!root) {
+		mg_http_reply(c, 500, "Content-Type: application/json\r\n",
+		              "{\"error\":\"failed to load config file\"}\n");
+		return;
+	}
+
+	struct json_object *devices;
+	if (!json_object_object_get_ex(root, "devices", &devices) ||
+	    !json_object_is_type(devices, json_type_array)) {
+		json_object_put(root);
+		mg_http_reply(c, 500, "Content-Type: application/json\r\n",
+		              "{\"error\":\"config has no devices array\"}\n");
+		return;
+	}
+
+	int updated = 0;
+	ofs = 0;
+	while ((ofs = mg_json_next(body, ofs, &mkey, &mval)) > 0) {
+		char *label = mg_json_get_str(mval, "$.label");
+		if (!label)
+			continue;
+		long mx = mg_json_get_long(mval, "$.x", 0);
+		long my = mg_json_get_long(mval, "$.y", 0);
+
+		int n = json_object_array_length(devices);
+		for (int d = 0; d < n; d++) {
+			struct json_object *dev = json_object_array_get_idx(devices, d);
+			struct json_object *name_obj;
+			if (!json_object_object_get_ex(dev, "monitor_name", &name_obj))
+				continue;
+			const char *monitor_name = json_object_get_string(name_obj);
+			if (!monitor_name || strcmp(monitor_name, label) != 0)
+				continue;
+			json_object_object_add(dev, "x", json_object_new_int((int)mx));
+			json_object_object_add(dev, "y", json_object_new_int((int)my));
+			updated++;
+		}
+		free(label);
+	}
+
+	char tmp[PATH_MAX + 8];
+	snprintf(tmp, sizeof(tmp), "%s.tmp", config_path);
+
+	if (json_object_to_file_ext(tmp, root,
+	                            JSON_C_TO_STRING_PRETTY |
+	                            JSON_C_TO_STRING_SPACED) != 0) {
+		json_object_put(root);
+		mg_http_reply(c, 500, "Content-Type: application/json\r\n",
+		              "{\"error\":\"failed to write config\"}\n");
+		return;
+	}
+	json_object_put(root);
+
+	if (rename(tmp, config_path) != 0) {
+		mg_http_reply(c, 500, "Content-Type: application/json\r\n",
+		              "{\"error\":\"failed to replace config file\"}\n");
+		return;
+	}
+
+	mg_http_reply(c, 200, "Content-Type: application/json\r\n",
+	              "{\"status\":\"ok\",\"matched\":%d}\n", updated);
+}
 
 static void ev_handler(struct mg_connection *c, int ev, void *ev_data)
 {
@@ -187,14 +442,19 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data)
 	} else if (mg_match(hm->uri, mg_str("/restart/*"), NULL) &&
 	           mg_match(hm->method, mg_str("POST"), NULL)) {
 		handle_restart(c, hm);
+	} else if (mg_match(hm->uri, mg_str("/settings/*"), NULL) &&
+	           mg_match(hm->method, mg_str("GET"), NULL)) {
+		handle_settings_get(c, hm);
+	} else if (mg_match(hm->uri, mg_str("/settings/*"), NULL) &&
+	           mg_match(hm->method, mg_str("PUT"), NULL)) {
+		handle_settings_put(c, hm);
+	} else if (mg_match(hm->uri, mg_str("/monitors"), NULL) &&
+	           mg_match(hm->method, mg_str("POST"), NULL)) {
+		handle_monitors_post(c, hm);
 	} else {
 		mg_http_reply(c, 404, "", "Not found\n");
 	}
 }
-
-/* ------------------------------------------------------------------ */
-/* main                                                                 */
-/* ------------------------------------------------------------------ */
 
 static void usage(const char *prog)
 {
