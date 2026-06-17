@@ -349,45 +349,86 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-section "Port 80 -> 8081 redirect (breezy-web)"
+section "TLS certificate for breezy-web (HTTPS)"
 
-# breezy-web runs unprivileged on 8081; redirect incoming :80 to it via nftables.
-# We persist the rule in /etc/nftables.conf if nftables is available, otherwise
-# fall back to iptables-legacy via a systemd oneshot unit.
-NFT_RULE_MARKER="# breezy-box: redirect port 80 to 8081"
+TLS_DIR="/etc/breezy-box/tls"
+TLS_CERT="$TLS_DIR/server.crt"
+TLS_KEY="$TLS_DIR/server.key"
+
+if [[ -f "$TLS_CERT" && -f "$TLS_KEY" ]]; then
+    skip_msg "TLS cert already exists at $TLS_CERT"
+else
+    if ! command -v openssl &>/dev/null; then
+        echo "  warn: openssl not found — install 'openssl' and re-run to enable HTTPS"
+    else
+        mkdir -p "$TLS_DIR"
+        chmod 0750 "$TLS_DIR"
+        openssl req -x509 -newkey rsa:2048 -nodes \
+            -keyout "$TLS_KEY" \
+            -out "$TLS_CERT" \
+            -days 3650 \
+            -subj "/CN=breezy.local" \
+            -addext "subjectAltName=DNS:breezy.local,DNS:localhost,IP:192.168.8.2" \
+            2>/dev/null
+        chmod 0640 "$TLS_KEY" "$TLS_CERT"
+        # Key must be readable by the app user but not world-readable.
+        if id "$APP_USER" &>/dev/null; then
+            chown "root:$APP_USER" "$TLS_KEY" "$TLS_CERT"
+        fi
+        done_msg "generated self-signed cert: $TLS_CERT (10-year, CN=breezy.local)"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+section "Port 80 -> 8081 and 443 -> 8443 redirects (breezy-web)"
+
+# breezy-web runs unprivileged on 8081 (HTTP) and 8443 (HTTPS);
+# redirect incoming :80/:443 via nftables or iptables.
+NFT_RULE_MARKER="# breezy-box: redirect ports 80->8081 and 443->8443"
 if command -v nft &>/dev/null; then
     NFT_CONF="/etc/nftables.conf"
+    # Remove old single-port rule if present (upgrade path).
+    if grep -qF "# breezy-box: redirect port 80 to 8081" "$NFT_CONF" 2>/dev/null; then
+        sed -i '/# breezy-box: redirect port 80 to 8081/,/^}/d' "$NFT_CONF"
+        done_msg "removed old single-port nftables rule from $NFT_CONF"
+    fi
     if grep -qF "$NFT_RULE_MARKER" "$NFT_CONF" 2>/dev/null; then
-        skip_msg "nftables redirect rule already in $NFT_CONF"
+        skip_msg "nftables redirect rules already in $NFT_CONF"
     else
-        # Append a nat table with the prerouting redirect.
         cat >> "$NFT_CONF" <<EOF
 
 $NFT_RULE_MARKER
 table ip nat {
     chain prerouting {
         type nat hook prerouting priority dstnat;
-        tcp dport 80 redirect to :8081
+        tcp dport 80  redirect to :8081
+        tcp dport 443 redirect to :8443
     }
 }
 EOF
-        done_msg "added port 80 -> 8081 redirect to $NFT_CONF"
-        # Apply immediately.
+        done_msg "added port 80->8081 and 443->8443 redirects to $NFT_CONF"
         nft -f "$NFT_CONF" 2>/dev/null && done_msg "applied nftables rules" \
             || echo "  warn: nft -f failed — rules will apply on next boot"
     fi
 elif command -v iptables &>/dev/null; then
+    # HTTP redirect
     if iptables -t nat -C PREROUTING -p tcp --dport 80 -j REDIRECT --to-port 8081 &>/dev/null; then
-        skip_msg "iptables redirect rule already active"
+        skip_msg "iptables HTTP redirect rule already active"
     else
         iptables -t nat -A PREROUTING -p tcp --dport 80 -j REDIRECT --to-port 8081
         done_msg "added iptables port 80 -> 8081 redirect"
-        # Persist via iptables-persistent if available.
-        if command -v netfilter-persistent &>/dev/null; then
-            netfilter-persistent save 2>/dev/null && done_msg "saved iptables rules" || true
-        else
-            echo "  warn: install 'iptables-persistent' to persist this rule across reboots"
-        fi
+    fi
+    # HTTPS redirect
+    if iptables -t nat -C PREROUTING -p tcp --dport 443 -j REDIRECT --to-port 8443 &>/dev/null; then
+        skip_msg "iptables HTTPS redirect rule already active"
+    else
+        iptables -t nat -A PREROUTING -p tcp --dport 443 -j REDIRECT --to-port 8443
+        done_msg "added iptables port 443 -> 8443 redirect"
+    fi
+    if command -v netfilter-persistent &>/dev/null; then
+        netfilter-persistent save 2>/dev/null && done_msg "saved iptables rules" || true
+    else
+        echo "  warn: install 'iptables-persistent' to persist these rules across reboots"
     fi
 else
     echo "  warn: neither nft nor iptables found — install nftables and re-run"
@@ -405,6 +446,10 @@ echo "     loginctl disable-linger $APP_USER"
 echo "  3. Fetch vendored deps and build (run as $APP_USER):"
 echo "     cd /home/$APP_USER/breezy-box && make deps && make"
 echo "     cp displaylink_kms_renderer breezy_web ~/.local/bin/"
-echo "  4. Reboot — getty autologin on tty1 will start the user session and breezy.target."
+echo "  4. Trust the self-signed cert on each client:"
+echo "     scp root@breezy.local:/etc/breezy-box/tls/server.crt ."
+echo "     Then import server.crt into your browser / OS trust store."
+echo "     The UI is served at https://breezy.local"
+echo "  5. Reboot — getty autologin on tty1 will start the user session and breezy.target."
 echo "     breezy-gadget.service runs as root at boot and sets up the OTG gadget;"
 echo "     the renderer then runs unprivileged and adopts it."

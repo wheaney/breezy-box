@@ -1,9 +1,13 @@
 [Unit]
-Description=Breezy Box landing page server (:80)
+Description=Breezy Box landing page server (:443 HTTPS)
 PartOf=breezy.target
 
 [Service]
-ExecStart=%h/.local/bin/breezy_web --port 8081 --web-root %h/breezy-box/web
+ExecStart=%h/.local/bin/breezy_web \
+    --port 8443 \
+    --web-root %h/breezy-box/web \
+    --cert /etc/breezy-box/tls/server.crt \
+    --key  /etc/breezy-box/tls/server.key
 Restart=on-failure
 RestartSec=2
 

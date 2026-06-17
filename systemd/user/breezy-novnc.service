@@ -1,5 +1,5 @@
 [Unit]
-Description=Breezy Box noVNC proxy (5900 -> 8080)
+Description=Breezy Box noVNC proxy (5900 -> 8080, WSS)
 Requires=breezy-x11vnc.service
 After=breezy-x11vnc.service
 PartOf=breezy.target
@@ -7,7 +7,9 @@ PartOf=breezy.target
 [Service]
 ExecStart=/usr/share/novnc/utils/novnc_proxy \
     --vnc localhost:5900 \
-    --listen 8080
+    --listen 8080 \
+    --cert /etc/breezy-box/tls/server.crt \
+    --key  /etc/breezy-box/tls/server.key
 Restart=on-failure
 RestartSec=2
 

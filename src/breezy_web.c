@@ -1,7 +1,9 @@
 /*
  * breezy_web — landing page server for Breezy Box.
  *
- * Listens on :80 (requires CAP_NET_BIND_SERVICE).
+ * Listens on :443 (HTTPS) or :80 (HTTP fallback when no cert is provided).
+ * Requires CAP_NET_BIND_SERVICE, or run on an unprivileged port with an
+ * nftables DNAT redirect (see setup_system.sh).
  *
  * Routes:
  *   GET  /                  → serve web/index.html
@@ -14,7 +16,7 @@
  *                             updates x/y of matching devices in the config file
  *
  * Build: see Makefile (breezy_web target).
- * Run:   breezy_web [--port 80] [--web-root DIR]
+ * Run:   breezy_web [--port 443] [--web-root DIR] [--cert FILE] [--key FILE]
  */
 
 #define MG_ENABLE_PACKED_FS 0
@@ -36,10 +38,12 @@
 #include <json-c/json.h>
 #include <sys/types.h>
 
-#define DEFAULT_LISTEN_ADDR    "http://0.0.0.0:80"
+#define DEFAULT_HTTP_LISTEN    "http://0.0.0.0:80"
+#define DEFAULT_HTTPS_LISTEN   "https://0.0.0.0:443"
 #define DEFAULT_WEB_ROOT       "web"
 #define DEFAULT_CONFIG_RELPATH "breezy-box/config.json"
 #define MAX_WEB_ROOT           256
+#define MAX_PATH_ARG           4096
 #define MAX_GSETTINGS_KEY      128
 #define GSETTINGS_OUT_MAX      1024
 
@@ -47,6 +51,8 @@
 
 static volatile int g_stop = 0;
 static char g_web_root[MAX_WEB_ROOT] = DEFAULT_WEB_ROOT;
+static char g_tls_cert[MAX_PATH_ARG] = "";
+static char g_tls_key[MAX_PATH_ARG]  = "";
 
 static void on_signal(int sig)
 {
@@ -455,33 +461,53 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data)
 static void usage(const char *prog)
 {
 	fprintf(stderr,
-	        "Usage: %s [--port PORT] [--web-root DIR]\n"
-	        "  --port PORT      TCP port to listen on (default: 80)\n"
-	        "  --web-root DIR   Directory containing index.html (default: web)\n",
+	        "Usage: %s [--port PORT] [--web-root DIR] [--cert FILE] [--key FILE]\n"
+	        "  --port PORT      TCP port to listen on (default: 443 with cert, 80 without)\n"
+	        "  --web-root DIR   Directory containing index.html (default: web)\n"
+	        "  --cert FILE      PEM certificate file for HTTPS\n"
+	        "  --key  FILE      PEM private key file for HTTPS\n",
 	        prog);
+}
+
+static void tls_ev_handler(struct mg_connection *c, int ev, void *ev_data)
+{
+	if (ev == MG_EV_ACCEPT) {
+		struct mg_tls_opts opts = {
+			.cert = mg_str(g_tls_cert),
+			.key  = mg_str(g_tls_key),
+		};
+		mg_tls_init(c, &opts);
+	}
+	ev_handler(c, ev, ev_data);
 }
 
 int main(int argc, char *argv[])
 {
-	char listen_addr[64];
-	snprintf(listen_addr, sizeof(listen_addr), "%s", DEFAULT_LISTEN_ADDR);
-
 	static const struct option longopts[] = {
 		{"port",     required_argument, NULL, 'p'},
 		{"web-root", required_argument, NULL, 'w'},
+		{"cert",     required_argument, NULL, 'c'},
+		{"key",      required_argument, NULL, 'k'},
 		{"help",     no_argument,       NULL, 'h'},
 		{NULL, 0, NULL, 0},
 	};
 
+	char port_override[16] = "";
+
 	int opt;
-	while ((opt = getopt_long(argc, argv, "p:w:h", longopts, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "p:w:c:k:h", longopts, NULL)) != -1) {
 		switch (opt) {
 		case 'p':
-			snprintf(listen_addr, sizeof(listen_addr),
-			         "http://0.0.0.0:%s", optarg);
+			snprintf(port_override, sizeof(port_override), "%s", optarg);
 			break;
 		case 'w':
 			snprintf(g_web_root, sizeof(g_web_root), "%s", optarg);
+			break;
+		case 'c':
+			snprintf(g_tls_cert, sizeof(g_tls_cert), "%s", optarg);
+			break;
+		case 'k':
+			snprintf(g_tls_key, sizeof(g_tls_key), "%s", optarg);
 			break;
 		case 'h':
 			usage(argv[0]);
@@ -492,20 +518,34 @@ int main(int argc, char *argv[])
 		}
 	}
 
+	bool use_tls = (g_tls_cert[0] != '\0' && g_tls_key[0] != '\0');
+
+	char listen_addr[64];
+	if (port_override[0]) {
+		snprintf(listen_addr, sizeof(listen_addr),
+		         "%s://0.0.0.0:%s",
+		         use_tls ? "https" : "http", port_override);
+	} else {
+		snprintf(listen_addr, sizeof(listen_addr), "%s",
+		         use_tls ? DEFAULT_HTTPS_LISTEN : DEFAULT_HTTP_LISTEN);
+	}
+
 	signal(SIGINT,  on_signal);
 	signal(SIGTERM, on_signal);
 
 	struct mg_mgr mgr;
 	mg_mgr_init(&mgr);
 
-	struct mg_connection *c = mg_http_listen(&mgr, listen_addr, ev_handler, NULL);
+	mg_event_handler_t handler = use_tls ? tls_ev_handler : ev_handler;
+	struct mg_connection *c = mg_http_listen(&mgr, listen_addr, handler, NULL);
 	if (!c) {
 		fprintf(stderr, "breezy_web: failed to listen on %s\n", listen_addr);
 		mg_mgr_free(&mgr);
 		return 1;
 	}
 
-	printf("breezy_web: listening on %s, web root: %s\n", listen_addr, g_web_root);
+	printf("breezy_web: listening on %s (%s), web root: %s\n",
+	       listen_addr, use_tls ? "HTTPS" : "HTTP", g_web_root);
 
 	while (!g_stop)
 		mg_mgr_poll(&mgr, 100);
