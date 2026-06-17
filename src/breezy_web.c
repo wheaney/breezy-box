@@ -51,8 +51,14 @@
 
 static volatile int g_stop = 0;
 static char g_web_root[MAX_WEB_ROOT] = DEFAULT_WEB_ROOT;
-static char g_tls_cert[MAX_PATH_ARG] = "";
-static char g_tls_key[MAX_PATH_ARG]  = "";
+static char g_tls_cert_path[MAX_PATH_ARG] = "";
+static char g_tls_key_path[MAX_PATH_ARG]  = "";
+
+/* PEM contents loaded from the cert/key files at startup. Mongoose's built-in
+ * TLS expects the certificate/key *data* in mg_tls_opts, not a file path, so we
+ * read the files into these buffers once and reuse them for every connection. */
+static struct mg_str g_tls_cert = {NULL, 0};
+static struct mg_str g_tls_key  = {NULL, 0};
 
 static void on_signal(int sig)
 {
@@ -473,8 +479,8 @@ static void tls_ev_handler(struct mg_connection *c, int ev, void *ev_data)
 {
 	if (ev == MG_EV_ACCEPT) {
 		struct mg_tls_opts opts = {
-			.cert = mg_str(g_tls_cert),
-			.key  = mg_str(g_tls_key),
+			.cert = g_tls_cert,
+			.key  = g_tls_key,
 		};
 		mg_tls_init(c, &opts);
 	}
@@ -504,10 +510,10 @@ int main(int argc, char *argv[])
 			snprintf(g_web_root, sizeof(g_web_root), "%s", optarg);
 			break;
 		case 'c':
-			snprintf(g_tls_cert, sizeof(g_tls_cert), "%s", optarg);
+			snprintf(g_tls_cert_path, sizeof(g_tls_cert_path), "%s", optarg);
 			break;
 		case 'k':
-			snprintf(g_tls_key, sizeof(g_tls_key), "%s", optarg);
+			snprintf(g_tls_key_path, sizeof(g_tls_key_path), "%s", optarg);
 			break;
 		case 'h':
 			usage(argv[0]);
@@ -518,7 +524,18 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	bool use_tls = (g_tls_cert[0] != '\0' && g_tls_key[0] != '\0');
+	bool use_tls = (g_tls_cert_path[0] != '\0' && g_tls_key_path[0] != '\0');
+
+	if (use_tls) {
+		g_tls_cert = mg_file_read(&mg_fs_posix, g_tls_cert_path);
+		g_tls_key  = mg_file_read(&mg_fs_posix, g_tls_key_path);
+		if (g_tls_cert.buf == NULL || g_tls_key.buf == NULL) {
+			fprintf(stderr,
+			        "breezy_web: failed to read TLS cert/key (%s, %s)\n",
+			        g_tls_cert_path, g_tls_key_path);
+			return 1;
+		}
+	}
 
 	char listen_addr[64];
 	if (port_override[0]) {
@@ -551,5 +568,7 @@ int main(int argc, char *argv[])
 		mg_mgr_poll(&mgr, 100);
 
 	mg_mgr_free(&mgr);
+	mg_free((void *) g_tls_cert.buf);
+	mg_free((void *) g_tls_key.buf);
 	return 0;
 }
