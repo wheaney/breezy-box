@@ -315,7 +315,7 @@ static int parse_config_devices_array(struct json_object *arr,
 		opts->device_count += 1u;
 	}
 
-	return opts->device_count == 0u ? -1 : 0;
+	return 0;
 }
 
 static int validate_server_options(const struct server_options *opts)
@@ -325,10 +325,6 @@ static int validate_server_options(const struct server_options *opts)
 
 	if (!opts)
 		return -1;
-	if (opts->device_count == 0u) {
-		fprintf(stderr, "config must define at least one device\n");
-		return -1;
-	}
 	if (opts->window_scale == 0u) {
 		fprintf(stderr, "window_scale must be at least 1\n");
 		return -1;
@@ -445,13 +441,11 @@ int load_server_options_from_config(const char *config_path,
 		}
 	}
 
-	if (!json_object_object_get_ex(root, "devices", &v)) {
-		fprintf(stderr, "config is missing a 'devices' array\n");
-		goto done;
-	}
-	if (parse_config_devices_array(v, &defaults, opts) != 0) {
-		fprintf(stderr, "failed to parse devices array in config\n");
-		goto done;
+	if (json_object_object_get_ex(root, "devices", &v)) {
+		if (parse_config_devices_array(v, &defaults, opts) != 0) {
+			fprintf(stderr, "failed to parse devices array in config\n");
+			goto done;
+		}
 	}
 
 	if (cli && cli->force_verbose)
