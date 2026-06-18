@@ -362,11 +362,15 @@ static void kms_poll_device_config(struct kms_state *kms,
 	/* Count active display slots for the overlay regardless of glasses state. */
 	{
 		size_t active_slots = 0u;
-		for (size_t i = 0u; i < server->opts.device_count; i++) {
+		for (size_t i = 0u; i < MAX_USBIP_DEVICES; i++) {
 			const struct device_runtime *dev = &server->devices[i];
-			bool slot_active = dev->is_gadget_device
-					       ? (dev->udl.gadget_fd >= 0)
-					       : dev->imported;
+			bool slot_active;
+
+			if (!server_slot_is_active(server, i))
+				continue;
+			slot_active = dev->is_gadget_device
+					  ? (dev->udl.gadget_fd >= 0)
+					  : dev->imported;
 			if (slot_active)
 				active_slots++;
 		}
@@ -405,11 +409,15 @@ static void kms_poll_device_config(struct kms_state *kms,
 	struct dp_monitor_info conn_devs[MAX_USBIP_DEVICES];
 	size_t conn_slot[MAX_USBIP_DEVICES];  /* conn_slot[compact_i] = opts slot index */
 	size_t conn_count = 0u;
-	for (size_t i = 0u; i < opts->device_count; i++) {
+	for (size_t i = 0u; i < MAX_USBIP_DEVICES; i++) {
 		const struct device_runtime *dev = &server->devices[i];
-		bool connected = dev->is_gadget_device
-		                     ? (dev->udl.gadget_fd >= 0)
-		                     : dev->imported;
+		bool connected;
+
+		if (!server_slot_is_active(server, i))
+			continue;
+		connected = dev->is_gadget_device
+		                ? (dev->udl.gadget_fd >= 0)
+		                : dev->imported;
 		if (!connected)
 			continue;
 		conn_devs[conn_count].x      = opts->devices[i].x;
@@ -1166,12 +1174,12 @@ static int kms_init_display_textures(struct kms_state *kms, struct server_runtim
 {
 	size_t i;
 
-	kms->display_count = server->opts.device_count;
-	if (kms->display_count == 0)
-		kms->display_count = 1u;
+	/* Slots are stable and gated by server_slot_is_active(); scan the whole array
+	 * so that slots added later (currently inactive) have a placeholder entry. */
+	kms->display_count = MAX_USBIP_DEVICES;
 
-	for (i = 0u; i < kms->display_count && i < MAX_USBIP_DEVICES; i++) {
-		if (i < server->opts.device_count && server->devices[i].udl.enabled) {
+	for (i = 0u; i < kms->display_count; i++) {
+		if (server_slot_is_active(server, i) && server->devices[i].udl.enabled) {
 			if (kms_init_display_tex(kms, i, &server->devices[i].udl,
 						 server->opts.verbose) != 0)
 				return -1;
@@ -1202,7 +1210,7 @@ static void kms_update_display_textures(struct kms_state *kms,
 		uint32_t dirty_width;
 		uint32_t dirty_height;
 
-		if (i >= server->opts.device_count)
+		if (!server_slot_is_active(server, i))
 			continue;
 		udl = &server->devices[i].udl;
 
@@ -1489,37 +1497,42 @@ static void kms_step_zoom_eases(struct kms_state *kms, uint64_t now_ms)
  * here, then clear the guard via server_finish_device_reconfigure() so the
  * client can reconnect and enumerate the updated EDID.
  */
+/* Release all GL/GBM resources backing display slot idx and zero its tex record.
+ * Must run on the GL render thread. */
+static void kms_teardown_display_tex(struct kms_state *kms, size_t idx)
+{
+	struct kms_display_tex *disp = &kms->displays[idx];
+
+	if (disp->gl_tex) {
+		glDeleteTextures(1, &disp->gl_tex);
+		disp->gl_tex = 0;
+	}
+	if (disp->egl_image != EGL_NO_IMAGE_KHR && kms->eglDestroyImageKHR)
+		kms->eglDestroyImageKHR(kms->egl_display, disp->egl_image);
+	if (disp->bo) {
+		gbm_bo_destroy(disp->bo);
+		disp->bo = NULL;
+	}
+	if (disp->fallback_tex) {
+		glDeleteTextures(1, &disp->fallback_tex);
+		disp->fallback_tex = 0;
+	}
+	memset(disp, 0, sizeof(*disp));
+}
+
 static void kms_apply_texture_reinits(struct kms_state *kms,
 				      struct server_runtime *server)
 {
 	size_t i;
 
 	for (i = 0u; i < kms->display_count; ++i) {
-		struct kms_display_tex *disp;
-
 		if (i >= MAX_USBIP_DEVICES)
 			break;
 		if (!atomic_exchange(&server->config_textures_dirty[i], false))
 			continue;
 
-		disp = &kms->displays[i];
-
 		/* Tear down old GL resources for this slot. */
-		if (disp->gl_tex) {
-			glDeleteTextures(1, &disp->gl_tex);
-			disp->gl_tex = 0;
-		}
-		if (disp->egl_image != EGL_NO_IMAGE_KHR && kms->eglDestroyImageKHR)
-			kms->eglDestroyImageKHR(kms->egl_display, disp->egl_image);
-		if (disp->bo) {
-			gbm_bo_destroy(disp->bo);
-			disp->bo = NULL;
-		}
-		if (disp->fallback_tex) {
-			glDeleteTextures(1, &disp->fallback_tex);
-			disp->fallback_tex = 0;
-		}
-		memset(disp, 0, sizeof(*disp));
+		kms_teardown_display_tex(kms, i);
 
 		/* Reinitialise the UDL decode runtime with the new dimensions.
 		 * The watcher already updated server->devices[i].opts; we just
@@ -1544,6 +1557,56 @@ static void kms_apply_texture_reinits(struct kms_state *kms,
 			i,
 			server->devices[i].opts.decode_width,
 			server->devices[i].opts.decode_height);
+	}
+}
+
+/*
+ * Hot-reload: whole-slot spin-up / tear-down.  The config watcher signals slot
+ * lifecycle changes via config_slot_add_pending / config_slot_remove_pending and
+ * leaves the GL work to this thread (the sole owner of the GL context + textures).
+ *
+ *   add-pending[i]:    the watcher has already built slot i's server-side resources
+ *                      (udl_runtime, descriptors) but left the slot inactive.  We
+ *                      build its GL texture, then activate the slot — only after
+ *                      that publish do USB/IP imports and rendering see it.
+ *   remove-pending[i]: the watcher has already disconnected the client, drained the
+ *                      session, and deactivated the slot.  No reader touches it, so
+ *                      we can tear down the GL texture and then free the server-side
+ *                      resources (udl_runtime, bulk buffer).
+ *
+ * Must run on the GL render thread.
+ */
+static void kms_apply_slot_changes(struct kms_state *kms,
+				   struct server_runtime *server)
+{
+	size_t i;
+
+	for (i = 0u; i < MAX_USBIP_DEVICES; ++i) {
+		if (atomic_exchange(&server->config_slot_remove_pending[i], false)) {
+			/* Slot already inactive + quiesced by the watcher. */
+			kms_teardown_display_tex(kms, i);
+			server_device_destroy_slot(server, i);
+			/* Leave a benign placeholder so the update/render loops can
+			 * keep indexing kms->displays[i] until the slot is reused. */
+			kms->displays[i].initialized = true;
+			fprintf(stderr, "kms: device %zu torn down\n", i);
+		}
+
+		if (atomic_exchange(&server->config_slot_add_pending[i], false)) {
+			/* Build GL resources, then publish the slot as active. */
+			kms_teardown_display_tex(kms, i); /* clear any stale placeholder */
+			if (server->devices[i].udl.enabled)
+				kms_init_display_tex(kms, i, &server->devices[i].udl,
+						     server->opts.verbose);
+			else
+				kms->displays[i].initialized = true;
+			server_activate_slot(server, i);
+			fprintf(stderr,
+				"kms: device %zu spun up → %ux%u\n",
+				i,
+				server->devices[i].opts.decode_width,
+				server->devices[i].opts.decode_height);
+		}
 	}
 }
 
@@ -1652,7 +1715,7 @@ static void kms_render_frame(struct kms_state *kms,
 	size_t visible_idx[MAX_USBIP_DEVICES];
 	size_t visible_count = 0u;
 	for (size_t i = 0u; i < kms->display_count; i++) {
-		if (i >= server->opts.device_count)
+		if (!server_slot_is_active(server, i))
 			continue;
 		const struct device_runtime *dev = &server->devices[i];
 		bool active_slot = dev->is_gadget_device
@@ -1937,6 +2000,7 @@ static int kms_run(struct kms_state *kms, struct server_runtime *server)
 			last_frame_ms = now_ms;
 		}
 
+		kms_apply_slot_changes(kms, server);
 		kms_apply_texture_reinits(kms, server);
 		kms_update_display_textures(kms, server);
 		kms_render_frame(kms, server);

@@ -482,18 +482,21 @@ int send_devlist_reply(const struct server_runtime *server, int fd)
 	{
 		uint32_t ndev = 0u;
 
-		for (i = 0u; i < server->opts.device_count; ++i)
-			if (!server->devices[i].is_gadget_device)
+		for (i = 0u; i < MAX_USBIP_DEVICES; ++i)
+			if (server_slot_is_active(server, i) &&
+			    !server->devices[i].is_gadget_device)
 				ndev++;
 		reply.ndev = pack_u32(1, ndev);
 	}
 	if (send_op_common_with_payload(fd, OP_REP_DEVLIST, ST_OK, &reply, sizeof(reply)) != 0)
 		return -1;
 
-	for (i = 0u; i < server->opts.device_count; ++i) {
+	for (i = 0u; i < MAX_USBIP_DEVICES; ++i) {
 		struct usbip_usb_device packed_device;
 		struct iovec iov[2];
 
+		if (!server_slot_is_active(server, i))
+			continue;
 		if (server->devices[i].is_gadget_device)
 			continue;
 		packed_device = server->devices[i].usbip_device;
@@ -516,7 +519,9 @@ struct device_runtime *find_device_by_busid(struct server_runtime *server, const
 	if (!server || !busid)
 		return NULL;
 
-	for (i = 0u; i < server->opts.device_count; ++i) {
+	for (i = 0u; i < MAX_USBIP_DEVICES; ++i) {
+		if (!server_slot_is_active(server, i))
+			continue;
 		if (server->devices[i].is_gadget_device)
 			continue;
 		if (strncmp(busid, server->devices[i].usbip_device.busid, SYSFS_BUS_ID_SIZE) == 0)
@@ -673,9 +678,11 @@ int run_server(struct server_runtime *server)
 	printf("DisplayLink USB/IP server listening on %s:%u\n",
 	       server->opts.listen_host,
 	       server->opts.listen_port);
-	for (i = 0u; i < server->opts.device_count; ++i) {
+	for (i = 0u; i < MAX_USBIP_DEVICES; ++i) {
 		const struct device_runtime *runtime = &server->devices[i];
 
+		if (!server_slot_is_active(server, i))
+			continue;
 		printf("  [%zu] busid=%s speed=%s decode=%s %ux%u@%uhz",
 		       i,
 		       runtime->usbip_device.busid,
@@ -755,6 +762,150 @@ void options_from_configured_device(const struct configured_device *src,
 	dst->window_scale = server_opts ? server_opts->window_scale : 1u;
 }
 
+int server_device_init_slot(struct server_runtime *server, size_t i)
+{
+	struct device_runtime *runtime;
+	pthread_mutex_t saved_mutex;
+	bool saved_mutex_initialized;
+
+	if (!server || i >= MAX_USBIP_DEVICES)
+		return -1;
+	runtime = &server->devices[i];
+
+	/* Preserve the per-slot import_mutex across the fresh-slot reset.  The mutex
+	 * is initialised once at startup and lives for the whole process so that a
+	 * connection thread sitting between find_device_by_busid() and
+	 * pthread_mutex_lock() can never touch a freed mutex.  Saving and restoring it
+	 * by value is safe here: the slot is inactive and quiesced (no session, no
+	 * connection thread references it), the mutex is unlocked, and on Linux glibc/
+	 * musl a pthread_mutex_t is a position-independent POD. */
+	saved_mutex             = runtime->import_mutex;
+	saved_mutex_initialized = runtime->import_mutex_initialized;
+
+	memset(runtime, 0, sizeof(*runtime));
+
+	runtime->import_mutex             = saved_mutex;
+	runtime->import_mutex_initialized = saved_mutex_initialized;
+
+	options_from_configured_device(&server->opts.devices[i], &server->opts, &runtime->opts);
+	runtime->current_configuration = 0u;
+	runtime->imported = false;
+	runtime->import_fd = -1;
+	runtime->reconfiguring = false;
+	runtime->usbip_cadence_logging_enabled = runtime->opts.verbose ||
+		env_flag_enabled("BREEZY_USBIP_CADENCE_STATS");
+	udl_control_ram_seed(runtime);
+	build_default_edid(runtime->edid,
+			  runtime->opts.monitor_name,
+			  runtime->opts.decode_width,
+			  runtime->opts.decode_height,
+			  runtime->opts.refresh_hz,
+			  runtime->opts.strict_native_mode,
+			  runtime->opts.allow_30hz_fallback);
+	if (runtime->opts.edid_path && load_edid_file(runtime->opts.edid_path, runtime->edid) != 0)
+		return -1;
+	build_vendor_descriptor(runtime);
+	build_device_descriptor(runtime);
+	build_device_qualifier(runtime);
+	build_bos_descriptor(runtime);
+	fill_usbip_device(runtime);
+	runtime->bulk_recv_buf = malloc(MAX_TRANSFER_BUFFER_SIZE);
+	if (!runtime->bulk_recv_buf) {
+		fprintf(stderr, "Unable to allocate bulk receive buffer for busid '%s'\n",
+			runtime->opts.busid);
+		return -1;
+	}
+	runtime->bulk_recv_buf_size = MAX_TRANSFER_BUFFER_SIZE;
+	if (udl_runtime_init(&runtime->udl, &runtime->opts) != 0) {
+		fprintf(stderr,
+			"Unable to initialize UDL decode runtime for busid '%s'\n",
+			runtime->opts.busid);
+		free(runtime->bulk_recv_buf);
+		runtime->bulk_recv_buf = NULL;
+		runtime->bulk_recv_buf_size = 0u;
+		return -1;
+	}
+
+	return 0;
+}
+
+void server_device_destroy_slot(struct server_runtime *server, size_t i)
+{
+	struct device_runtime *runtime;
+
+	if (!server || i >= MAX_USBIP_DEVICES)
+		return;
+	runtime = &server->devices[i];
+
+	/* Heavy resources only — the import_mutex deliberately survives (see
+	 * server_device_init_slot).  Caller must have deactivated and quiesced the slot. */
+	free(runtime->bulk_recv_buf);
+	runtime->bulk_recv_buf = NULL;
+	runtime->bulk_recv_buf_size = 0u;
+	udl_runtime_destroy(&runtime->udl);
+	runtime->imported = false;
+	runtime->import_fd = -1;
+}
+
+void server_activate_slot(struct server_runtime *server, size_t i)
+{
+	if (!server || i >= MAX_USBIP_DEVICES)
+		return;
+	/* Release: any reader that subsequently acquire-loads true sees a fully-built slot. */
+	atomic_store_explicit(&server->slot_active[i], true, memory_order_release);
+}
+
+void server_deactivate_slot(struct server_runtime *server, size_t i)
+{
+	if (!server || i >= MAX_USBIP_DEVICES)
+		return;
+	atomic_store_explicit(&server->slot_active[i], false, memory_order_release);
+}
+
+bool server_slot_is_active(const struct server_runtime *server, size_t i)
+{
+	if (!server || i >= MAX_USBIP_DEVICES)
+		return false;
+	return atomic_load_explicit(&server->slot_active[i], memory_order_acquire);
+}
+
+size_t server_find_free_slot(const struct server_runtime *server)
+{
+	size_t i;
+
+	if (!server)
+		return SIZE_MAX;
+	for (i = 0u; i < MAX_USBIP_DEVICES; ++i) {
+		if (server_slot_is_active(server, i))
+			continue;
+		/* Skip slots whose build is already in flight on the render thread. */
+		if (atomic_load_explicit(&server->config_slot_add_pending[i],
+					 memory_order_acquire))
+			continue;
+		if (atomic_load_explicit(&server->config_slot_remove_pending[i],
+					 memory_order_acquire))
+			continue;
+		return i;
+	}
+	return SIZE_MAX;
+}
+
+size_t server_find_active_slot_by_busid(const struct server_runtime *server,
+					const char *busid)
+{
+	size_t i;
+
+	if (!server || !busid)
+		return SIZE_MAX;
+	for (i = 0u; i < MAX_USBIP_DEVICES; ++i) {
+		if (!server_slot_is_active(server, i))
+			continue;
+		if (strncmp(busid, server->opts.devices[i].busid, SYSFS_BUS_ID_SIZE) == 0)
+			return i;
+	}
+	return SIZE_MAX;
+}
+
 int server_runtime_init_devices(struct server_runtime *server)
 {
 	size_t i;
@@ -763,53 +914,29 @@ int server_runtime_init_devices(struct server_runtime *server)
 		return -1;
 
 	atomic_init(&server->config_positions_changed, false);
-	for (i = 0u; i < MAX_USBIP_DEVICES; ++i)
+	for (i = 0u; i < MAX_USBIP_DEVICES; ++i) {
 		atomic_init(&server->config_textures_dirty[i], false);
+		atomic_init(&server->config_slot_add_pending[i], false);
+		atomic_init(&server->config_slot_remove_pending[i], false);
+		atomic_init(&server->slot_active[i], false);
+	}
 	server->config_inotify_fd    = -1;
 	server->config_watcher_created = false;
 
-	for (i = 0u; i < server->opts.device_count; ++i) {
-		struct device_runtime *runtime = &server->devices[i];
+	/* Initialise every slot's import_mutex once, up front.  These are never
+	 * destroyed until shutdown so the find/lock window in connection threads is
+	 * always operating on a valid mutex, even for slots that are torn down and
+	 * later reused. */
+	for (i = 0u; i < MAX_USBIP_DEVICES; ++i) {
+		if (pthread_mutex_init(&server->devices[i].import_mutex, NULL) != 0)
+			return -1;
+		server->devices[i].import_mutex_initialized = true;
+	}
 
-		memset(runtime, 0, sizeof(*runtime));
-		options_from_configured_device(&server->opts.devices[i], &server->opts, &runtime->opts);
-		runtime->current_configuration = 0u;
-		runtime->imported = false;
-		runtime->import_fd = -1;
-		runtime->reconfiguring = false;
-		runtime->usbip_cadence_logging_enabled = runtime->opts.verbose ||
-			env_flag_enabled("BREEZY_USBIP_CADENCE_STATS");
-		udl_control_ram_seed(runtime);
-		build_default_edid(runtime->edid,
-				  runtime->opts.monitor_name,
-				  runtime->opts.decode_width,
-				  runtime->opts.decode_height,
-				  runtime->opts.refresh_hz,
-				  runtime->opts.strict_native_mode,
-				  runtime->opts.allow_30hz_fallback);
-		if (runtime->opts.edid_path && load_edid_file(runtime->opts.edid_path, runtime->edid) != 0)
+	for (i = 0u; i < server->opts.device_count; ++i) {
+		if (server_device_init_slot(server, i) != 0)
 			return -1;
-		build_vendor_descriptor(runtime);
-		build_device_descriptor(runtime);
-		build_device_qualifier(runtime);
-		build_bos_descriptor(runtime);
-		fill_usbip_device(runtime);
-		if (pthread_mutex_init(&runtime->import_mutex, NULL) != 0)
-			return -1;
-		runtime->import_mutex_initialized = true;
-		runtime->bulk_recv_buf = malloc(MAX_TRANSFER_BUFFER_SIZE);
-		if (!runtime->bulk_recv_buf) {
-			fprintf(stderr, "Unable to allocate bulk receive buffer for busid '%s'\n",
-				runtime->opts.busid);
-			return -1;
-		}
-		runtime->bulk_recv_buf_size = MAX_TRANSFER_BUFFER_SIZE;
-		if (udl_runtime_init(&runtime->udl, &runtime->opts) != 0) {
-			fprintf(stderr,
-				"Unable to initialize UDL decode runtime for busid '%s'\n",
-				runtime->opts.busid);
-			return -1;
-		}
+		server_activate_slot(server, i);
 	}
 
 	return 0;
@@ -822,10 +949,12 @@ void server_runtime_destroy(struct server_runtime *server)
 	if (!server)
 		return;
 
-	for (i = 0u; i < server->opts.device_count; ++i) {
-		free(server->devices[i].bulk_recv_buf);
-		server->devices[i].bulk_recv_buf = NULL;
-		udl_runtime_destroy(&server->devices[i].udl);
+	for (i = 0u; i < MAX_USBIP_DEVICES; ++i) {
+		if (server_slot_is_active(server, i) ||
+		    server->devices[i].bulk_recv_buf) {
+			server_deactivate_slot(server, i);
+			server_device_destroy_slot(server, i);
+		}
 		if (server->devices[i].import_mutex_initialized) {
 			pthread_mutex_destroy(&server->devices[i].import_mutex);
 			server->devices[i].import_mutex_initialized = false;
@@ -916,46 +1045,128 @@ static void end_reconfigure_device(struct server_runtime *server, size_t i)
 
 void server_finish_device_reconfigure(struct server_runtime *server, size_t i)
 {
-	if (!server || i >= server->opts.device_count)
+	if (!server || i >= MAX_USBIP_DEVICES)
 		return;
 	end_reconfigure_device(server, i);
 }
 
 /*
+ * Count the configured devices in new_opts that carry a given busid.  Used by the
+ * removal pass to decide whether a live slot's busid still exists in the new config.
+ */
+static bool busid_in_options(const struct server_options *opts, const char *busid)
+{
+	size_t k;
+
+	for (k = 0u; k < opts->device_count; ++k)
+		if (strncmp(busid, opts->devices[k].busid, SYSFS_BUS_ID_SIZE) == 0)
+			return true;
+	return false;
+}
+
+/* Number of currently-active (configured) slots — the overlay's "displays
+ * configured" figure.  Maintained in server->opts.device_count after each reload. */
+static size_t count_active_slots(const struct server_runtime *server)
+{
+	size_t i, n = 0u;
+
+	for (i = 0u; i < MAX_USBIP_DEVICES; ++i)
+		if (server_slot_is_active(server, i))
+			n++;
+	return n;
+}
+
+/*
  * Apply a validated set of new options to the live server runtime.
  *
- * Per-device diff rules:
- *   - x/y changed only       → update in-place, set config_positions_changed
- *   - EDID fields changed     → disconnect client, rebuild EDID/descriptors;
- *                               if decode dimensions changed, also set
- *                               config_textures_dirty[i] so the KMS renderer
- *                               reinitialises the udl_runtime + GL texture
+ * Devices are matched between the live runtime and the new config by busid (the
+ * unique, dup-checked USB/IP key), so reordering the config array never churns
+ * devices.  Three cases per busid:
  *
- * Structural changes (device count, busid) are ignored with a log message;
- * those require a restart.
+ *   - busid present in both          → diff fields:
+ *       · x/y changed only           → update in-place, set config_positions_changed
+ *       · EDID fields changed        → disconnect client, rebuild EDID/descriptors;
+ *                                       if decode dimensions changed, also set
+ *                                       config_textures_dirty[i] so the KMS renderer
+ *                                       reinitialises the udl_runtime + GL texture
+ *   - busid only in new config       → spin up: init a free slot's resources (inactive),
+ *                                       set config_slot_add_pending[i]; the render thread
+ *                                       builds the GL texture and activates the slot
+ *   - busid only in live runtime     → tear down: quiesce + disconnect the client,
+ *                                       deactivate the slot, set config_slot_remove_pending[i];
+ *                                       the render thread destroys GL + server resources
+ *
+ * The gadget slot (is_gadget_device) is never torn down by config reload.
  */
 static void apply_config_change(struct server_runtime *server,
 				const struct server_options *new_opts)
 {
-	size_t i;
+	size_t i, k;
 	bool any_positions_changed = false;
 
-	if (new_opts->device_count != server->opts.device_count) {
+	/* --- Removals: live active slots whose busid vanished from the new config. --- */
+	for (i = 0u; i < MAX_USBIP_DEVICES; ++i) {
+		if (!server_slot_is_active(server, i))
+			continue;
+		if (server->devices[i].is_gadget_device)
+			continue;
+		if (busid_in_options(new_opts, server->opts.devices[i].busid))
+			continue;
+
 		fprintf(stderr,
-			"config watcher: device count changed (%zu → %zu); restart required\n",
-			server->opts.device_count, new_opts->device_count);
-		return;
+			"config watcher: tearing down device %zu (busid %s)\n",
+			i, server->opts.devices[i].busid);
+
+		/* Kick + drain any active client and block new imports.  After this
+		 * returns no session feeds the slot and none can start. */
+		begin_reconfigure_device(server, i);
+		/* Stop lockless readers (devlist/find/render) from using the slot. */
+		server_deactivate_slot(server, i);
+		/* Hand the GL-texture + heavy-resource teardown to the render thread. */
+		atomic_store(&server->config_slot_remove_pending[i], true);
 	}
 
-	for (i = 0u; i < server->opts.device_count; ++i) {
-		struct configured_device       *cur = &server->opts.devices[i];
-		const struct configured_device *nxt = &new_opts->devices[i];
-		struct device_runtime          *runtime = &server->devices[i];
+	/* --- Additions + matched-device updates, keyed by busid. --- */
+	for (k = 0u; k < new_opts->device_count; ++k) {
+		const struct configured_device *nxt = &new_opts->devices[k];
+		struct configured_device       *cur;
+		struct device_runtime          *runtime;
+		bool edid_changed, dim_changed, xy_changed;
 
-		bool edid_changed = cfg_edid_changed(cur, nxt);
-		bool dim_changed  = (cur->decode_width  != nxt->decode_width ||
-				     cur->decode_height != nxt->decode_height);
-		bool xy_changed   = (cur->x != nxt->x || cur->y != nxt->y);
+		i = server_find_active_slot_by_busid(server, nxt->busid);
+		if (i == SIZE_MAX) {
+			/* New busid — spin up a fresh slot. */
+			size_t slot = server_find_free_slot(server);
+
+			if (slot == SIZE_MAX) {
+				fprintf(stderr,
+					"config watcher: no free slot to spin up device "
+					"(busid %s); ignoring\n", nxt->busid);
+				continue;
+			}
+			server->opts.devices[slot] = *nxt;
+			if (server_device_init_slot(server, slot) != 0) {
+				fprintf(stderr,
+					"config watcher: failed to init device (busid %s) "
+					"in slot %zu; ignoring\n", nxt->busid, slot);
+				continue;
+			}
+			fprintf(stderr,
+				"config watcher: spinning up device %zu (busid %s) → %ux%u@%u\n",
+				slot, nxt->busid, nxt->decode_width,
+				nxt->decode_height, nxt->refresh_hz);
+			/* Render thread builds the GL texture then activates the slot. */
+			atomic_store(&server->config_slot_add_pending[slot], true);
+			continue;
+		}
+
+		cur     = &server->opts.devices[i];
+		runtime = &server->devices[i];
+
+		edid_changed = cfg_edid_changed(cur, nxt);
+		dim_changed  = (cur->decode_width  != nxt->decode_width ||
+				cur->decode_height != nxt->decode_height);
+		xy_changed   = (cur->x != nxt->x || cur->y != nxt->y);
 
 		if (!edid_changed && !xy_changed)
 			continue;
@@ -1033,6 +1244,20 @@ static void apply_config_change(struct server_runtime *server,
 
 	if (any_positions_changed)
 		atomic_store(&server->config_positions_changed, true);
+
+	/* Keep device_count as the "displays configured" figure for the overlay,
+	 * counting active slots plus those whose spin-up the render thread has not yet
+	 * completed.  Removals already deactivated their slots above. */
+	{
+		size_t n = count_active_slots(server);
+
+		for (i = 0u; i < MAX_USBIP_DEVICES; ++i)
+			if (!server_slot_is_active(server, i) &&
+			    atomic_load_explicit(&server->config_slot_add_pending[i],
+						 memory_order_acquire))
+				n++;
+		server->opts.device_count = n;
+	}
 }
 
 static void *config_watcher_thread_main(void *arg)

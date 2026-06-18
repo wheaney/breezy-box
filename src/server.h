@@ -83,13 +83,28 @@ struct server_runtime {
 	char   config_path[PATH_MAX];
 	char   config_filename[NAME_MAX + 1]; /* basename of config_path */
 
+	/* Per-slot liveness.  Replaces the old "contiguous 0..device_count" model:
+	 * slots are stable, holes are allowed and reusable, and every lockless reader
+	 * scans 0..MAX_USBIP_DEVICES gating on this flag (acquire load).  A slot's heavy
+	 * resources (udl_runtime, bulk_recv_buf, descriptors, GL texture) exist iff the
+	 * slot is active; set true only after the slot is fully built (release), cleared
+	 * before any teardown.  The per-slot import_mutex, by contrast, is initialised
+	 * once at startup and lives for the whole process. */
+	atomic_bool slot_active[MAX_USBIP_DEVICES];
+
 	/* Signals from watcher to consumers (KMS renderer).
 	 * config_positions_changed: set when only x/y changed on any device;
 	 *   consumer should re-run placement logic immediately (bypass 1 s throttle).
 	 * config_textures_dirty[i]: set when device i's decode dimensions changed;
-	 *   consumer must destroy and reinitialise the udl_runtime and GL texture. */
+	 *   consumer must destroy and reinitialise the udl_runtime and GL texture.
+	 * config_slot_add_pending[i]: watcher has built slot i's server-side resources
+	 *   (still inactive); render thread must build its GL texture then activate it.
+	 * config_slot_remove_pending[i]: watcher has quiesced + deactivated slot i;
+	 *   render thread must tear down its GL texture then destroy server resources. */
 	atomic_bool config_positions_changed;
 	atomic_bool config_textures_dirty[MAX_USBIP_DEVICES];
+	atomic_bool config_slot_add_pending[MAX_USBIP_DEVICES];
+	atomic_bool config_slot_remove_pending[MAX_USBIP_DEVICES];
 };
 
 /* Per-connection context passed to connection threads */
@@ -131,6 +146,31 @@ void options_from_configured_device(const struct configured_device *src,
 				    struct options *dst);
 int server_runtime_init_devices(struct server_runtime *server);
 void server_runtime_destroy(struct server_runtime *server);
+
+/*
+ * Per-slot lifecycle primitives (slot index in [0, MAX_USBIP_DEVICES)).
+ *
+ * server_device_init_slot   builds a slot's heavy resources (udl_runtime, bulk
+ *                           buffer, EDID/USB descriptors) from server->opts.devices[i].
+ *                           Does NOT touch import_mutex (initialised once at startup)
+ *                           and leaves the slot inactive.  Returns 0 / -1.
+ * server_device_destroy_slot frees those heavy resources.  Does NOT destroy the
+ *                           import_mutex.  The slot must already be inactive and
+ *                           quiesced (no feeding session).
+ * server_activate_slot      publish a fully-built slot (release): readers may now use it.
+ * server_deactivate_slot    retract a slot (release) so lockless readers stop using it.
+ * server_slot_is_active     acquire load of the slot's liveness flag.
+ * server_find_free_slot     first inactive, non-add-pending slot index, or SIZE_MAX.
+ * server_find_active_slot_by_busid  index of the active slot serving busid, or SIZE_MAX.
+ */
+int    server_device_init_slot(struct server_runtime *server, size_t i);
+void   server_device_destroy_slot(struct server_runtime *server, size_t i);
+void   server_activate_slot(struct server_runtime *server, size_t i);
+void   server_deactivate_slot(struct server_runtime *server, size_t i);
+bool   server_slot_is_active(const struct server_runtime *server, size_t i);
+size_t server_find_free_slot(const struct server_runtime *server);
+size_t server_find_active_slot_by_busid(const struct server_runtime *server,
+					const char *busid);
 
 /*
  * Start an inotify watcher on config_path.  When the file is modified the
