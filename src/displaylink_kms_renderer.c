@@ -957,16 +957,20 @@ static int kms_init_gbm_egl(struct kms_state *kms, bool want_msaa)
 	}
 
 	if (!chosen_config) {
-		/* No-MSAA fallback: first config matching GBM_FORMAT_XRGB8888,
-		 * defaulting to configs[0] if none carries the expected visual. */
+		/* No-MSAA fallback: prefer a config matching GBM_FORMAT_XRGB8888 with
+		 * EGL_SAMPLES == 0; fall back to any visual match, then configs[0].
+		 * The explicit samples check is required because eglChooseConfig may
+		 * return MSAA configs first even when none were requested. */
 		if (matched > 0)
 			chosen_config = configs[0];
 		for (i = 0; i < matched; i++) {
-			EGLint visual;
+			EGLint visual, samples;
 			eglGetConfigAttrib(kms->egl_display, configs[i], EGL_NATIVE_VISUAL_ID, &visual);
+			eglGetConfigAttrib(kms->egl_display, configs[i], EGL_SAMPLES, &samples);
 			if ((uint32_t)visual == GBM_FORMAT_XRGB8888) {
 				chosen_config = configs[i];
-				break;
+				if (samples == 0)
+					break;
 			}
 		}
 	}
@@ -1983,10 +1987,16 @@ static int kms_run(struct kms_state *kms, struct server_runtime *server)
 		struct drm_fb *next_fb;
 		int ret;
 
+		bool prev_aa = kms->settings.disable_anti_aliasing;
 		bool settings_dirty =
 		    breezy_settings_consume_if_changed(kms->settings_handle, &kms->settings);
-		if (settings_dirty)
+		if (settings_dirty) {
 			breezy_driver_control_update(&kms->settings);
+			if (kms->settings.disable_anti_aliasing != prev_aa) {
+				printf("kms: anti-aliasing setting changed, reinitializing renderer\n");
+				break;
+			}
+		}
 		bool positions_changed =
 		    atomic_exchange(&server->config_positions_changed, false);
 		kms_poll_device_config(kms, server, settings_dirty || positions_changed);
