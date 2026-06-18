@@ -845,7 +845,7 @@ static bool kms_has_ext(const char *list, const char *ext)
 	return false;
 }
 
-static int kms_init_gbm_egl(struct kms_state *kms, bool want_msaa)
+static int kms_init_gbm_egl(struct kms_state *kms)
 {
 	EGLint major, minor;
 	const char *client_exts, *dpy_exts, *gl_exts;
@@ -923,55 +923,19 @@ static int kms_init_gbm_egl(struct kms_state *kms, bool want_msaa)
 		return -1;
 	}
 
-	/*
-	 * Config selection: enumerate all matching configs so we can filter by
-	 * EGL_NATIVE_VISUAL_ID == GBM_FORMAT_XRGB8888, which is required for
-	 * eglCreateWindowSurface against a GBM surface.  When MSAA is requested,
-	 * prefer the highest-sample config that also passes the visual-ID check;
-	 * fall back to a no-MSAA config if none do.
-	 */
 	eglGetConfigs(kms->egl_display, NULL, 0, &count);
 	configs = calloc((size_t)count, sizeof(*configs));
 	if (!configs)
 		return -1;
 	eglChooseConfig(kms->egl_display, config_attribs, configs, count, &matched);
 
-	if (want_msaa) {
-		static const int try_samples[] = { 4, 2 };
-		for (size_t ti = 0; ti < sizeof(try_samples)/sizeof(try_samples[0]) && !chosen_config; ti++) {
-			EGLint want_samples = (EGLint)try_samples[ti];
-			for (i = 0; i < matched && !chosen_config; i++) {
-				EGLint visual, samples;
-				eglGetConfigAttrib(kms->egl_display, configs[i], EGL_NATIVE_VISUAL_ID, &visual);
-				eglGetConfigAttrib(kms->egl_display, configs[i], EGL_SAMPLES, &samples);
-				if ((uint32_t)visual == GBM_FORMAT_XRGB8888 && samples == want_samples) {
-					chosen_config = configs[i];
-					printf("kms: MSAA %dx enabled via EGL_SAMPLES\n", (int)samples);
-				}
-			}
-		}
-		if (!chosen_config)
-			printf("kms: MSAA unavailable, rendering without anti-aliasing\n");
-	} else {
-		printf("kms: MSAA disabled (anti-aliasing off)\n");
-	}
-
-	if (!chosen_config) {
-		/* No-MSAA fallback: prefer a config matching GBM_FORMAT_XRGB8888 with
-		 * EGL_SAMPLES == 0; fall back to any visual match, then configs[0].
-		 * The explicit samples check is required because eglChooseConfig may
-		 * return MSAA configs first even when none were requested. */
-		if (matched > 0)
-			chosen_config = configs[0];
-		for (i = 0; i < matched; i++) {
-			EGLint visual, samples;
-			eglGetConfigAttrib(kms->egl_display, configs[i], EGL_NATIVE_VISUAL_ID, &visual);
-			eglGetConfigAttrib(kms->egl_display, configs[i], EGL_SAMPLES, &samples);
-			if ((uint32_t)visual == GBM_FORMAT_XRGB8888) {
-				chosen_config = configs[i];
-				if (samples == 0)
-					break;
-			}
+	chosen_config = configs[0];
+	for (i = 0; i < matched; i++) {
+		EGLint visual;
+		eglGetConfigAttrib(kms->egl_display, configs[i], EGL_NATIVE_VISUAL_ID, &visual);
+		if ((uint32_t)visual == GBM_FORMAT_XRGB8888) {
+			chosen_config = configs[i];
+			break;
 		}
 	}
 
@@ -1018,7 +982,7 @@ static int kms_init_gbm_egl(struct kms_state *kms, bool want_msaa)
  * is unaffected and rides through reconnect cycles unchanged.
  * ---------------------------------------------------------------- */
 
-static int renderer_init(struct kms_state *kms, const char *drm_device, bool want_msaa)
+static int renderer_init(struct kms_state *kms, const char *drm_device)
 {
 	kms->drm_fd      = -1;
 	kms->egl_display = EGL_NO_DISPLAY;
@@ -1027,7 +991,7 @@ static int renderer_init(struct kms_state *kms, const char *drm_device, bool wan
 
 	if (kms_init_drm(kms, drm_device) != 0)
 		return -1;
-	if (kms_init_gbm_egl(kms, want_msaa) != 0)
+	if (kms_init_gbm_egl(kms) != 0)
 		return -1;
 	if (display_renderer_init(&kms->dr) != 0)
 		return -1;
@@ -1987,16 +1951,10 @@ static int kms_run(struct kms_state *kms, struct server_runtime *server)
 		struct drm_fb *next_fb;
 		int ret;
 
-		bool prev_aa = kms->settings.disable_anti_aliasing;
 		bool settings_dirty =
 		    breezy_settings_consume_if_changed(kms->settings_handle, &kms->settings);
-		if (settings_dirty) {
+		if (settings_dirty)
 			breezy_driver_control_update(&kms->settings);
-			if (kms->settings.disable_anti_aliasing != prev_aa) {
-				printf("kms: anti-aliasing setting changed, reinitializing renderer\n");
-				break;
-			}
-		}
 		bool positions_changed =
 		    atomic_exchange(&server->config_positions_changed, false);
 		kms_poll_device_config(kms, server, settings_dirty || positions_changed);
@@ -2309,7 +2267,7 @@ int main(int argc, char **argv)
 	 * is torn down and rebuilt on each reconnect.
 	 */
 	while (!stop_requested) {
-		if (renderer_init(&kms, drm_device, !kms.settings.disable_anti_aliasing) != 0) {
+		if (renderer_init(&kms, drm_device) != 0) {
 			fprintf(stderr, "kms: renderer init failed, retrying in 1 s\n");
 			nanosleep(&(struct timespec){1, 0}, NULL);
 			continue;
