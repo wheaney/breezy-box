@@ -28,7 +28,7 @@ MAX_DISPLAY_HEIGHT = 1080
 
 # Monitor labels follow this format; the integer is the lowest free slot,
 # reused when a lower-numbered display is removed.
-MONITOR_LABEL_FORMAT = _("Breezy Display %d")
+MONITOR_LABEL_FORMAT = _("Breezy Box %d")
 
 # DisplayLink device defaults mirrored from the box server's built-in defaults
 # (see configured_device_default in src/server.c). The UI owns the full device
