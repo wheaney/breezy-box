@@ -30,6 +30,14 @@ static void read_into(GSettings *gs, struct breezy_display_settings *s)
         g_free(scheme);
     }
 
+    gchar *custom_product = g_settings_get_string(gs, "custom-monitor-product");
+    if (custom_product) {
+        strncpy(s->custom_monitor_product, custom_product,
+                sizeof(s->custom_monitor_product) - 1);
+        s->custom_monitor_product[sizeof(s->custom_monitor_product) - 1] = '\0';
+        g_free(custom_product);
+    }
+
     s->monitor_spacing                    = g_settings_get_int    (gs, "monitor-spacing");
     s->curved_display                     = g_settings_get_boolean(gs, "curved-display");
     s->headset_display_as_viewport_center = g_settings_get_boolean(gs, "headset-display-as-viewport-center");
@@ -150,6 +158,25 @@ void breezy_settings_stop(breezy_settings_handle *h)
     g_main_loop_unref(h->loop);
     pthread_mutex_destroy(&h->mu);
     free(h);
+}
+
+void breezy_settings_read_custom_monitor_product(char *out, size_t out_sz)
+{
+    if (!out || out_sz == 0)
+        return;
+    out[0] = '\0';
+
+    GSettings *gs = g_settings_new_with_path(BREEZY_GSETTINGS_SCHEMA, BREEZY_GSETTINGS_PATH);
+    if (!gs)
+        return;
+
+    gchar *product = g_settings_get_string(gs, "custom-monitor-product");
+    if (product) {
+        strncpy(out, product, out_sz - 1);
+        out[out_sz - 1] = '\0';
+        g_free(product);
+    }
+    g_object_unref(gs);
 }
 
 /* ---- pure helpers (unchanged) ---- */

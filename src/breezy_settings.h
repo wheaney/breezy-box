@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #define BREEZY_GSETTINGS_SCHEMA "com.xronlinux.BreezyDesktop"
@@ -12,6 +13,11 @@
  * monitor management, etc.) are omitted.
  */
 struct breezy_display_settings {
+    /* Monitor selection: extra product name that also counts as XR glasses
+     * when picking which connected display to render to (mirrors the GNOME
+     * extension's custom-monitor-product key). Empty string = unset. */
+    char    custom_monitor_product[64];
+
     /* Monitor placement */
     char    monitor_wrapping_scheme[32]; /* "automatic"|"horizontal"|"vertical"|"flat" */
     int     monitor_spacing;             /* 0-100; visual units of 0.001 * viewport width */
@@ -68,6 +74,15 @@ bool breezy_settings_consume_if_changed(breezy_settings_handle *h,
  * Safe to call with NULL.
  */
 void breezy_settings_stop(breezy_settings_handle *h);
+
+/*
+ * One-shot read of the custom-monitor-product key, without starting the
+ * watcher thread.  Used during DRM init (which runs before the settings
+ * watcher is started) to honor the user's custom glasses product override
+ * when selecting which display to render to.  Writes an empty string if the
+ * key is unset or the schema is unavailable.
+ */
+void breezy_settings_read_custom_monitor_product(char *out, size_t out_sz);
 
 /* max(display_distance, toggle_distance_start, toggle_distance_end) */
 double breezy_settings_display_distance_default(const struct breezy_display_settings *s);

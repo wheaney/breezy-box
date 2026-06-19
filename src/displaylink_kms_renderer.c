@@ -10,6 +10,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
+#include <ctype.h>
 #include <time.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -695,33 +697,179 @@ static void kms_page_flip_handler(int fd, unsigned int frame,
  * DRM initialisation
  * ---------------------------------------------------------------- */
 
-static int kms_find_drm_device(drmModeRes **resources_out)
+/*
+ * XR-glasses display product names, mirroring SUPPORTED_MONITOR_PRODUCTS in
+ * breezy-desktop/gnome/src/monitormanager.js.  Keep this list in sync with the
+ * GNOME extension when new devices are added.  Matched (case-insensitively,
+ * see connector_is_glasses) against the EDID Display Product Name descriptor.
+ */
+static const char *const SUPPORTED_MONITOR_PRODUCTS[] = {
+	"VITURE",
+	"nreal air",
+	"Air",
+	"Air 2",
+	"Air 2 Pro",
+	"Air 2 Ultra",
+	"One",
+	"One Pro",
+	"XREAL One",
+	"XREAL One Pro",
+	"XREAL 1S",
+	"SmartGlasses", /* TCL/RayNeo */
+	"Rokid Max",
+	"Rokid Max 2",
+	"Rokid Air",
+};
+
+/*
+ * Extract the Display Product Name (descriptor tag 0xFC) from a 128-byte EDID
+ * base block into out (NUL-terminated, trailing whitespace trimmed).  EDID pads
+ * the 13-byte name field with 0x0A then 0x20; we stop at 0x0A and strip the
+ * trailing spaces so an exact compare against the list works.  Returns 1 on
+ * success, 0 if no name descriptor is present.
+ */
+static int edid_product_name(const uint8_t *edid, size_t len, char *out, size_t out_sz)
+{
+	if (len < 128u || out_sz == 0u)
+		return 0;
+	/* The four 18-byte descriptors start at offset 54. */
+	for (int d = 0; d < 4; d++) {
+		const uint8_t *desc = edid + 54 + d * 18;
+		/* A monitor-descriptor block has bytes 0-1 == 0 and byte 3 == tag. */
+		if (desc[0] == 0 && desc[1] == 0 && desc[3] == 0xFC) {
+			size_t n = 0;
+			for (int j = 0; j < 13 && n + 1 < out_sz; j++) {
+				uint8_t c = desc[5 + j];
+				if (c == 0x0A) /* line-feed terminator */
+					break;
+				out[n++] = (char)c;
+			}
+			while (n > 0 && isspace((unsigned char)out[n - 1]))
+				n--; /* trim trailing pad spaces */
+			out[n] = '\0';
+			return n > 0;
+		}
+	}
+	return 0;
+}
+
+/* Read connector property "EDID" into edid (256 bytes); returns blob length or 0. */
+static size_t connector_read_edid(int fd, drmModeConnector *conn, uint8_t *edid, size_t edid_sz)
+{
+	size_t len = 0;
+	for (int i = 0; i < conn->count_props; i++) {
+		drmModePropertyPtr p = drmModeGetProperty(fd, conn->props[i]);
+		if (!p)
+			continue;
+		if (strcmp(p->name, "EDID") == 0) {
+			drmModePropertyBlobPtr blob = drmModeGetPropertyBlob(fd, conn->prop_values[i]);
+			if (blob && blob->data) {
+				len = blob->length < edid_sz ? blob->length : edid_sz;
+				memcpy(edid, blob->data, len);
+			}
+			drmModeFreePropertyBlob(blob);
+			drmModeFreeProperty(p);
+			break;
+		}
+		drmModeFreeProperty(p);
+	}
+	return len;
+}
+
+/*
+ * True if the connector's EDID product name matches a known XR-glasses device
+ * (the supported list or the user's custom-monitor-product override).  Matching
+ * is exact, case-insensitive, mirroring the GNOME extension's product compare.
+ */
+static int connector_is_glasses(int fd, drmModeConnector *conn, const char *custom_product)
+{
+	uint8_t edid[256];
+	char name[64];
+	size_t len = connector_read_edid(fd, conn, edid, sizeof(edid));
+	if (len == 0 || !edid_product_name(edid, len, name, sizeof(name)))
+		return 0;
+
+	for (size_t i = 0; i < sizeof(SUPPORTED_MONITOR_PRODUCTS) / sizeof(*SUPPORTED_MONITOR_PRODUCTS); i++) {
+		if (strcasecmp(name, SUPPORTED_MONITOR_PRODUCTS[i]) == 0)
+			return 1;
+	}
+	if (custom_product && *custom_product && strcasecmp(name, custom_product) == 0)
+		return 1;
+	return 0;
+}
+
+/*
+ * Locate the DRM device + connector to render to, across all KMS cards.
+ * Selection priority (Steam-Deck-like: only ever drive one display):
+ *   2 - a connected connector whose EDID names XR glasses  (always wins)
+ *   1 - any other connected connector with modes           (fallback)
+ * The best connector determines which card we open, since on multi-card SoCs
+ * (e.g. Allwinner A733) the glasses may not be on card0.  Returns the fd and
+ * sets *resources_out / *connector_id_out; returns -1 if nothing is connected.
+ */
+static int kms_find_drm_device(drmModeRes **resources_out, uint32_t *connector_id_out,
+                               const char *custom_product)
 {
 	drmDevicePtr devices[MAX_DRM_DEVICES] = {NULL};
 	int num_devices = drmGetDevices2(0, devices, MAX_DRM_DEVICES);
-	int fd = -1;
+	int best_fd = -1, best_score = 0;
+	drmModeRes *best_res = NULL;
+	uint32_t best_conn = 0;
 
 	if (num_devices < 0) {
 		fprintf(stderr, "drmGetDevices2 failed: %s\n", strerror(-num_devices));
 		return -1;
 	}
 
-	for (int i = 0; i < num_devices && fd < 0; i++) {
+	for (int i = 0; i < num_devices; i++) {
 		if (!(devices[i]->available_nodes & (1 << DRM_NODE_PRIMARY)))
 			continue;
-		fd = open(devices[i]->nodes[DRM_NODE_PRIMARY], O_RDWR);
-		if (fd < 0)
+		int cand = open(devices[i]->nodes[DRM_NODE_PRIMARY], O_RDWR);
+		if (cand < 0)
 			continue;
-		*resources_out = drmModeGetResources(fd);
-		if (!*resources_out) {
-			close(fd);
-			fd = -1;
+		drmModeRes *res = drmModeGetResources(cand);
+		if (!res) {
+			close(cand);
+			continue;
+		}
+
+		int card_best_score = 0;
+		uint32_t card_best_conn = 0;
+		for (int c = 0; c < res->count_connectors; c++) {
+			drmModeConnector *conn = drmModeGetConnector(cand, res->connectors[c]);
+			if (conn && conn->connection == DRM_MODE_CONNECTED && conn->count_modes > 0) {
+				int score = connector_is_glasses(cand, conn, custom_product) ? 2 : 1;
+				if (score > card_best_score) {
+					card_best_score = score;
+					card_best_conn = conn->connector_id;
+				}
+			}
+			drmModeFreeConnector(conn);
+		}
+
+		if (card_best_score > best_score) {
+			if (best_fd >= 0) {
+				drmModeFreeResources(best_res);
+				close(best_fd);
+			}
+			best_fd = cand;
+			best_res = res;
+			best_conn = card_best_conn;
+			best_score = card_best_score;
+		} else {
+			drmModeFreeResources(res);
+			close(cand);
 		}
 	}
+
 	drmFreeDevices(devices, num_devices);
-	if (fd < 0)
-		fprintf(stderr, "No KMS-capable DRM device found\n");
-	return fd;
+	if (best_fd < 0) {
+		fprintf(stderr, "No KMS-capable DRM device with a connected display found\n");
+		return -1;
+	}
+	*resources_out = best_res;
+	*connector_id_out = best_conn;
+	return best_fd;
 }
 
 static int kms_init_drm(struct kms_state *kms, const char *device)
@@ -729,14 +877,37 @@ static int kms_init_drm(struct kms_state *kms, const char *device)
 	drmModeRes *resources = NULL;
 	drmModeConnector *connector = NULL;
 	drmModeEncoder *encoder = NULL;
+	uint32_t connector_id = 0;
+	/* The settings watcher thread is not started until kms_run(), after DRM
+	 * init, so read the custom glasses product override one-shot here. */
+	char custom_product_buf[64];
+	const char *custom_product = custom_product_buf;
 	int i;
 
+	breezy_settings_read_custom_monitor_product(custom_product_buf, sizeof(custom_product_buf));
+
 	if (device) {
+		/* Explicit device override: open it and pick the best connector on it,
+		 * still preferring an XR-glasses display if more than one is connected. */
 		kms->drm_fd = open(device, O_RDWR);
 		if (kms->drm_fd >= 0)
 			resources = drmModeGetResources(kms->drm_fd);
+		if (kms->drm_fd >= 0 && resources) {
+			int best_score = 0;
+			for (i = 0; i < resources->count_connectors; i++) {
+				drmModeConnector *c = drmModeGetConnector(kms->drm_fd, resources->connectors[i]);
+				if (c && c->connection == DRM_MODE_CONNECTED && c->count_modes > 0) {
+					int score = connector_is_glasses(kms->drm_fd, c, custom_product) ? 2 : 1;
+					if (score > best_score) {
+						best_score = score;
+						connector_id = c->connector_id;
+					}
+				}
+				drmModeFreeConnector(c);
+			}
+		}
 	} else {
-		kms->drm_fd = kms_find_drm_device(&resources);
+		kms->drm_fd = kms_find_drm_device(&resources, &connector_id, custom_product);
 	}
 
 	if (kms->drm_fd < 0 || !resources) {
@@ -744,14 +915,10 @@ static int kms_init_drm(struct kms_state *kms, const char *device)
 		return -1;
 	}
 
-	for (i = 0; i < resources->count_connectors; i++) {
-		connector = drmModeGetConnector(kms->drm_fd, resources->connectors[i]);
-		if (connector && connector->connection == DRM_MODE_CONNECTED && connector->count_modes > 0)
-			break;
+	if (connector_id)
+		connector = drmModeGetConnector(kms->drm_fd, connector_id);
+	if (!connector || connector->connection != DRM_MODE_CONNECTED || connector->count_modes == 0) {
 		drmModeFreeConnector(connector);
-		connector = NULL;
-	}
-	if (!connector) {
 		fprintf(stderr, "No connected DRM connector found\n");
 		drmModeFreeResources(resources);
 		return -1;
@@ -778,9 +945,17 @@ static int kms_init_drm(struct kms_state *kms, const char *device)
 
 	{
 		const char *type_name = drmModeGetConnectorTypeName(connector->connector_type);
-		printf("kms: display connected: %s-%u %ux%u@%uHz\n",
+		uint8_t edid[256];
+		char name[64] = "";
+		size_t len = connector_read_edid(kms->drm_fd, connector, edid, sizeof(edid));
+		int is_glasses = connector_is_glasses(kms->drm_fd, connector, custom_product);
+		if (len)
+			edid_product_name(edid, len, name, sizeof(name));
+		printf("kms: rendering to %s display: %s-%u \"%s\" %ux%u@%uHz\n",
+		       is_glasses ? "XR glasses" : "fallback (no glasses found)",
 		       type_name ? type_name : "Unknown",
 		       connector->connector_type_id,
+		       name[0] ? name : "?",
 		       kms->mode.hdisplay, kms->mode.vdisplay, kms->mode.vrefresh);
 	}
 
