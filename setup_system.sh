@@ -274,9 +274,9 @@ section "breezy-renderer kiosk system service (DRM master on tty1)"
 # The KMS renderer must take DRM master, which only the active session on seat0
 # can do.  We run it as a SYSTEM service bound to tty1 (via PAMName=login +
 # TTYPath) so logind seats it on seat0 — a --user service runs in the seatless
-# user@.service scope and drmSetMaster() is denied there.  This service takes
-# over tty1 from getty (Conflicts=getty@tty1.service), so the old autologin
-# drop-in is removed.
+# user@.service scope and drmSetMaster() is denied there.  The renderer owns
+# tty1; getty@tty1 is MASKED so it can never be (re)spawned there and SIGTERM
+# the renderer (which manifests as the overlay flashing, then a black screen).
 RENDERER_SVC_SRC="$SCRIPT_DIR/systemd/system/breezy-renderer.service"
 RENDERER_SVC_DST="/etc/systemd/system/breezy-renderer.service"
 
@@ -286,6 +286,15 @@ if [[ -f "$OLD_GETTY_DROPIN" ]]; then
     rm -f "$OLD_GETTY_DROPIN"
     rmdir "$(dirname "$OLD_GETTY_DROPIN")" 2>/dev/null || true
     done_msg "removed obsolete getty autologin drop-in"
+fi
+
+# Mask getty@tty1 so nothing re-spawns a login on the renderer's VT.
+if [[ "$(systemctl is-enabled getty@tty1.service 2>/dev/null)" == "masked" ]]; then
+    skip_msg "getty@tty1.service already masked"
+else
+    systemctl stop getty@tty1.service 2>/dev/null || true
+    systemctl mask getty@tty1.service
+    done_msg "masked getty@tty1.service (renderer owns tty1)"
 fi
 
 if [[ ! -f "$RENDERER_SVC_SRC" ]]; then
