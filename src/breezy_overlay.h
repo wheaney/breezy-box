@@ -84,8 +84,8 @@ void breezy_overlay_set_addresses(struct breezy_overlay *ov,
  * No GL context needed; safe to call multiple times (overwrites previous values).
  *
  *   eth_iface   — kernel interface name, e.g. "eth0"
- *   eth_link_ip — SBC's own address on the link, e.g. "192.168.8.2"
- *   eth_host_ip — host's DHCP-assigned address, e.g. "192.168.8.1"
+ *   eth_link_ip — SBC's own address on the link, e.g. "192.168.77.2"
+ *   eth_host_ip — host's DHCP-assigned address, e.g. "192.168.77.1"
  */
 void breezy_overlay_set_eth_link(struct breezy_overlay *ov,
 				  const char *eth_iface,

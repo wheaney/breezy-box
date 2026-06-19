@@ -2223,11 +2223,13 @@ static void *server_thread_main(void *arg)
 
 /* IP addressing for the direct wired Ethernet link.  Different subnet from
  * the OTG link (192.168.7.x) so the two can coexist without routing conflicts.
- * IP assignment and DHCP serving are handled by systemd-networkd (see
- * setup_system.sh); these constants are used for mDNS pinning and overlay
- * display only. */
-#define ETH_LINK_IP_CIDR  "192.168.8.2/30"
-#define ETH_HOST_IP       "192.168.8.1"
+ * 192.168.77.x is deliberately uncommon among consumer routers so the wired
+ * link does not collide with the SBC's own Wi-Fi/LAN uplink (common home LANs
+ * use 192.168.0/1/8.x).  IP assignment and DHCP serving are handled by
+ * systemd-networkd (see setup_system.sh); these constants are used for mDNS
+ * pinning and overlay display only. */
+#define ETH_LINK_IP_CIDR  "192.168.77.2/30"
+#define ETH_HOST_IP       "192.168.77.1"
 
 /*
  * Find the first physical wired Ethernet interface that is not the OTG gadget
@@ -2376,7 +2378,7 @@ int main(int argc, char **argv)
 	 * Start DHCP + mDNS on the wired Ethernet port for hosts that connect
 	 * via a direct cable rather than the OTG USB port.  Auto-detects the
 	 * first physical non-wireless interface that isn't the gadget netdev.
-	 * Assigns the SBC 192.168.8.2/30 and hands the host 192.168.8.1.
+	 * Assigns the SBC 192.168.77.2/30 and hands the host 192.168.77.1.
 	 * breezy.local resolves correctly from either path because mDNS is
 	 * link-local: each host sees the record on its own interface.
 	 */
