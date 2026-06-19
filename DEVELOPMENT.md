@@ -18,8 +18,10 @@ lands there instead — where it has no seat and the renderer can't take DRM mas
 # All breezy services, interleaved:
 journalctl --user -f -u "breezy-*"
 
-# One specific service:
-journalctl --user -f -u breezy-renderer
+# The renderer is a SYSTEM service (kiosk on tty1, needs DRM master):
+journalctl -f -u breezy-renderer
+
+# The headless services are --user services:
 journalctl --user -f -u breezy-web
 ```
 
@@ -29,12 +31,14 @@ journalctl --user -f -u breezy-web
 # Stop everything under the target:
 systemctl --user stop breezy.target
 
-# Or stop one service while leaving the rest running:
-systemctl --user stop breezy-renderer
+# Or stop one service while leaving the rest running.
+# Note: the renderer is a SYSTEM service, so it needs sudo (not --user):
+sudo systemctl stop breezy-renderer
 ```
 
-`breezy.target` uses `PartOf=` so stopping the target cascades to all units;
-stopping an individual unit only takes that one down.
+`breezy.target` uses `PartOf=` so stopping the target cascades to all its
+user units; stopping an individual unit only takes that one down.  The renderer
+is a separate system service and is not part of the user target.
 
 ## Rebuilding
 
@@ -58,23 +62,23 @@ and step through a crash.
 
 ### Renderer
 
-The KMS renderer must run on the **active VT** to become DRM master.  Log in
-on tty1 (the autologin VT) directly, or use `chvt` to switch to it, then:
+The KMS renderer must run on the **active VT** (tty1, on seat0) to become DRM
+master.  In production it's a **system** service bound to tty1
+(`breezy-renderer.service`).  To run it by hand, stop that service so it frees
+tty1, then run from tty1 directly (or after `sudo chvt 1`):
 
 ```sh
-# Stop the systemd-managed renderer first (if it's running):
-systemctl --user stop breezy-renderer
+# Stop the system renderer service first (note: sudo, not --user):
+sudo systemctl stop breezy-renderer
 
 # Run directly from tty1 (or after `sudo chvt 1`):
 ./displaylink_kms_renderer [your usual args]
 ```
 
-If you're SSHed in and want to run it without being on tty1, set
-`DISPLAY` / `WAYLAND_DISPLAY` appropriately *or* simply stop the systemd
-unit and restart it after your change:
+When done, restart the service to hand tty1 back to the kiosk renderer:
 
 ```sh
-systemctl --user start breezy-renderer
+sudo systemctl start breezy-renderer
 ```
 
 ### Web server
@@ -107,10 +111,10 @@ x11vnc -display :1 -nopw -shared -forever -loop \
 systemctl --user start breezy.target
 ```
 
-Or restart just one unit:
+Or restart just one unit (renderer is a system service, so sudo):
 
 ```sh
-systemctl --user restart breezy-renderer
+sudo systemctl restart breezy-renderer
 ```
 
 ## Enabling / disabling on boot

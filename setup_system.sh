@@ -25,13 +25,15 @@ The changes are also applied immediately where possible so a reboot is not
 required for the current session.
 
 Options:
-  --app-user USER    User that will run the KMS app (default: breezybox).
-                     Used only for informational output; no user is created.
+  --app-user USER    User that will run the KMS app (default: the user that
+                     invoked sudo).  No user is created.
   -h, --help         Show this help and exit.
 EOF
 }
 
-APP_USER="wayne" #"breezybox"
+# Default to the user that invoked sudo (the human running this script), not a
+# hardcoded name.  Falls back to logname/USER if SUDO_USER is unset.
+APP_USER="${SUDO_USER:-$(logname 2>/dev/null || echo "${USER:-root}")}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -267,24 +269,52 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-section "Getty autologin for $APP_USER on tty1"
+section "breezy-renderer kiosk system service (DRM master on tty1)"
 
-GETTY_DROPIN_DST="/etc/systemd/system/getty@tty1.service.d/autologin.conf"
-GETTY_DROPIN_SRC="$SCRIPT_DIR/systemd/system/getty@tty1.service.d/autologin.conf"
+# The KMS renderer must take DRM master, which only the active session on seat0
+# can do.  We run it as a SYSTEM service bound to tty1 (via PAMName=login +
+# TTYPath) so logind seats it on seat0 — a --user service runs in the seatless
+# user@.service scope and drmSetMaster() is denied there.  This service takes
+# over tty1 from getty (Conflicts=getty@tty1.service), so the old autologin
+# drop-in is removed.
+RENDERER_SVC_SRC="$SCRIPT_DIR/systemd/system/breezy-renderer.service"
+RENDERER_SVC_DST="/etc/systemd/system/breezy-renderer.service"
 
-# Generate the target content by substituting the placeholder username.
-GETTY_DROPIN_TMP="$(mktemp)"
-sed "s/breezy/$APP_USER/g" "$GETTY_DROPIN_SRC" > "$GETTY_DROPIN_TMP"
-
-if ! cmp -s "$GETTY_DROPIN_TMP" "$GETTY_DROPIN_DST" 2>/dev/null; then
-    mkdir -p "$(dirname "$GETTY_DROPIN_DST")"
-    install -m 0644 "$GETTY_DROPIN_TMP" "$GETTY_DROPIN_DST"
-    systemctl daemon-reload
-    done_msg "installed $GETTY_DROPIN_DST (autologin as $APP_USER)"
-else
-    skip_msg "$GETTY_DROPIN_DST already up to date"
+# Remove the now-obsolete getty autologin drop-in (renderer owns tty1 instead).
+OLD_GETTY_DROPIN="/etc/systemd/system/getty@tty1.service.d/autologin.conf"
+if [[ -f "$OLD_GETTY_DROPIN" ]]; then
+    rm -f "$OLD_GETTY_DROPIN"
+    rmdir "$(dirname "$OLD_GETTY_DROPIN")" 2>/dev/null || true
+    done_msg "removed obsolete getty autologin drop-in"
 fi
-rm -f "$GETTY_DROPIN_TMP"
+
+if [[ ! -f "$RENDERER_SVC_SRC" ]]; then
+    echo "  warn: $RENDERER_SVC_SRC not found, skipping renderer service install"
+else
+    # Substitute the app user into the unit's __APP_USER__ placeholders.
+    RENDERER_SVC_TMP="$(mktemp)"
+    sed "s/__APP_USER__/$APP_USER/g" "$RENDERER_SVC_SRC" > "$RENDERER_SVC_TMP"
+
+    if ! cmp -s "$RENDERER_SVC_TMP" "$RENDERER_SVC_DST" 2>/dev/null; then
+        install -m 0644 "$RENDERER_SVC_TMP" "$RENDERER_SVC_DST"
+        systemctl daemon-reload
+        done_msg "installed $RENDERER_SVC_DST (kiosk on tty1 as $APP_USER)"
+    else
+        skip_msg "$RENDERER_SVC_DST already up to date"
+    fi
+    rm -f "$RENDERER_SVC_TMP"
+
+    if systemctl is-enabled --quiet breezy-renderer.service 2>/dev/null; then
+        skip_msg "breezy-renderer.service already enabled"
+    else
+        systemctl enable breezy-renderer.service
+        done_msg "enabled breezy-renderer.service"
+    fi
+    # Start now (takes over tty1 from getty).
+    systemctl restart breezy-renderer.service 2>/dev/null \
+        && done_msg "started breezy-renderer.service" \
+        || echo "  warn: breezy-renderer.service failed to start — check: journalctl -u breezy-renderer"
+fi
 
 # ---------------------------------------------------------------------------
 section "Breezy user systemd units"
@@ -293,7 +323,7 @@ USER_UNIT_SRC="$SCRIPT_DIR/systemd/user"
 USER_UNIT_DST="/etc/systemd/user"
 UNITS_CHANGED=0
 
-for unit in breezy.target breezy-renderer.service breezy-xvfb.service \
+for unit in breezy.target breezy-xvfb.service \
             breezy-desktop.service breezy-x11vnc.service \
             breezy-novnc.service breezy-web.service; do
     dst="$USER_UNIT_DST/$unit"
@@ -313,41 +343,44 @@ done
 
 systemctl daemon-reload
 
-# Install .bash_profile for the app user to start breezy.target on tty1 login.
-# We use .bash_profile (not .profile) so it only fires for bash login shells,
-# which is what getty gives us.  The tty check ensures it only runs on tty1
-# so SSH and other sessions are unaffected.
+# Start the headless user services (Xvfb, web, VNC, desktop UI) at boot.
 #
-# NOTE: linger must NOT be enabled for this user.  If it is, systemd starts a
-# seat-less user session at boot and breezy.target lands there instead of the
-# tty1 session, where it can't take DRM master.  Disable it with:
-#   loginctl disable-linger $APP_USER
+# These do NOT need a seat or DRM master — only breezy-renderer (a system
+# service on tty1) does.  So we enable LINGER for the app user: systemd then
+# starts the user manager at boot and breezy.target (WantedBy=default.target)
+# pulls in the headless services, with no tty1 login shell required.
+#
+# This is the opposite of the old getty-autologin model, where linger had to be
+# OFF so breezy.target landed on the tty1 seat for DRM master.  The renderer no
+# longer relies on the user session for that, so lingering is now correct.
 if id "$APP_USER" &>/dev/null; then
-    PROFILE_DST="/home/$APP_USER/.bash_profile"
-    PROFILE_MARKER="# breezy-box: start breezy.target on tty1"
-    PROFILE_BLOCK="${PROFILE_MARKER}
-if [ \"\$(tty)\" = \"/dev/tty1\" ]; then
-    systemctl --user start breezy.target
-fi"
-
-    if grep -qF "$PROFILE_MARKER" "$PROFILE_DST" 2>/dev/null; then
-        skip_msg "$PROFILE_DST already has breezy.target launch block"
+    if loginctl show-user "$APP_USER" -p Linger 2>/dev/null | grep -q 'Linger=yes'; then
+        skip_msg "linger already enabled for $APP_USER"
     else
-        echo "" >> "$PROFILE_DST"
-        echo "$PROFILE_BLOCK" >> "$PROFILE_DST"
-        chown "$APP_USER:$APP_USER" "$PROFILE_DST"
-        done_msg "added breezy.target launch block to $PROFILE_DST"
+        loginctl enable-linger "$APP_USER"
+        done_msg "enabled linger for $APP_USER (headless services start at boot)"
     fi
 
-    # Restart changed units if the user session is already running on tty1.
+    # Enable + (re)start breezy.target in the app user's manager.
+    USER_CMD="XDG_RUNTIME_DIR=/run/user/$(id -u "$APP_USER") systemctl --user"
+    su -l "$APP_USER" -s /bin/bash -c "$USER_CMD enable breezy.target" \
+        2>/dev/null && done_msg "enabled breezy.target (user)" || true
     if [[ "$UNITS_CHANGED" -eq 1 ]]; then
-        USER_CMD="XDG_RUNTIME_DIR=/run/user/$(id -u "$APP_USER") systemctl --user"
         su -l "$APP_USER" -s /bin/bash -c \
             "$USER_CMD is-active --quiet breezy.target && $USER_CMD restart breezy.target" \
             2>/dev/null && done_msg "restarted breezy.target (units changed)" || true
     fi
+
+    # Clean up the obsolete tty1 launch block from a previous (getty) install.
+    PROFILE_DST="/home/$APP_USER/.bash_profile"
+    OLD_PROFILE_MARKER="# breezy-box: start breezy.target on tty1"
+    if grep -qF "$OLD_PROFILE_MARKER" "$PROFILE_DST" 2>/dev/null; then
+        # Delete the marker line and the 3-line if-block that follows it.
+        sed -i "/$OLD_PROFILE_MARKER/,/^fi$/d" "$PROFILE_DST"
+        done_msg "removed obsolete tty1 launch block from $PROFILE_DST"
+    fi
 else
-    echo "  warn: user $APP_USER not found; .bash_profile will be configured when the user exists"
+    echo "  warn: user $APP_USER not found; user services will be configured when the user exists"
 fi
 
 # ---------------------------------------------------------------------------
@@ -449,15 +482,15 @@ echo
 echo "Next steps if not done yet:"
 echo "  1. Create the app user:  useradd -m -s /bin/bash -c 'Breezy Box' $APP_USER"
 echo "     Add to groups:        usermod -aG video,render,input $APP_USER"
-echo "  2. Disable linger (if previously enabled — linger breaks DRM master):"
-echo "     loginctl disable-linger $APP_USER"
-echo "  3. Fetch vendored deps and build (run as $APP_USER):"
+echo "  2. Fetch vendored deps and build (run as $APP_USER):"
 echo "     cd /home/$APP_USER/breezy-box && make deps && make"
 echo "     cp displaylink_kms_renderer breezy_web ~/.local/bin/"
-echo "  4. Trust the self-signed cert on each client:"
+echo "  3. Trust the self-signed cert on each client:"
 echo "     scp root@breezy.local:/etc/breezy-box/tls/server.crt ."
 echo "     Then import server.crt into your browser / OS trust store."
 echo "     The UI is served at https://breezy.local"
-echo "  5. Reboot — getty autologin on tty1 will start the user session and breezy.target."
-echo "     breezy-gadget.service runs as root at boot and sets up the OTG gadget;"
-echo "     the renderer then runs unprivileged and adopts it."
+echo "  4. Reboot. On boot:"
+echo "     • breezy-gadget.service (root) sets up the OTG gadget;"
+echo "     • breezy-renderer.service runs as $APP_USER on tty1, takes DRM master,"
+echo "       and adopts the gadget;"
+echo "     • the app user's lingering session starts breezy.target (Xvfb/web/VNC)."

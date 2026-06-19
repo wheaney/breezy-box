@@ -1,0 +1,42 @@
+# Breezy Box KMS renderer — kiosk system service.
+#
+# Runs as the unprivileged app user but is bound to tty1 (the active VT on
+# seat0), so logind registers it as the seat's session and grants it DRM
+# master.  A --user service cannot do this: it lives in the seatless
+# user@.service manager scope and drmSetMaster() is denied there.
+#
+# This unit OWNS tty1 and therefore conflicts with getty@tty1 (autologin is
+# disabled via a drop-in installed by setup_system.sh).  The headless Breezy
+# services (Xvfb, web, VNC, desktop UI) remain --user units in breezy.target;
+# only the renderer needs the seat.
+[Unit]
+Description=Breezy Box KMS renderer (kiosk on tty1)
+Documentation=https://github.com/wheaney/breezy-box
+After=breezy-gadget.service systemd-user-sessions.service
+Wants=breezy-gadget.service
+# Take over tty1 from getty.
+Conflicts=getty@tty1.service
+After=getty@tty1.service
+
+[Service]
+# __APP_USER__ is substituted by setup_system.sh.
+User=__APP_USER__
+PAMName=login
+# Bind to tty1 so logind seats this session on seat0 (required for DRM master).
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+StandardInput=tty
+StandardOutput=journal
+StandardError=journal
+# Groups needed for DRM/GBM, GPU render, and reading input/IMU devices.
+SupplementaryGroups=video render input
+ExecStart=/home/__APP_USER__/.local/bin/displaylink_kms_renderer
+Restart=on-failure
+RestartSec=2
+# Keep the VT on this service; don't let it be killed by VT switches.
+UtmpIdentifier=tty1
+UtmpMode=user
+
+[Install]
+WantedBy=multi-user.target
