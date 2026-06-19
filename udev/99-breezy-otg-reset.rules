@@ -1,12 +1,16 @@
-# Trigger an OTG PHY reset when the RK3399 usb2phy@e450 misclassifies a
-# connected USB host port as a DCP charger (BC1.2 false positive).
-# When DCP=1 the DWC3 UDC stays "not attached" and Windows sees a descriptor
-# failure.  breezy-gadget-reset.service unbinds/rebinds the PHY and DWC3
-# driver to clear the bad state, then rebinds the RNDIS gadget.
+# Trigger an OTG PHY reset when a usb2phy misclassifies a connected USB host
+# port as a DCP charger (BC1.2 false positive).  This is the RK3399 usb2phy
+# quirk: when DCP=1 the DWC3 UDC stays "not attached" and Windows sees a
+# descriptor failure.  breezy-gadget-reset.service unbinds/rebinds the PHY and
+# DWC3 driver to clear the bad state, then rebinds the RNDIS gadget.
 #
-# Match: extcon change event on usb2phy@e450 where USB=1 (VBUS present) and
+# Match any usb2phy extcon (not just the RK3399 ff770000.syscon:usb2phy@e450)
+# so the rule is board-agnostic.  reset_usb0_otg_stack.sh skips cleanly on SoCs
+# without a dwc3+usb2phy stack, so a spurious trigger elsewhere is harmless.
+#
+# Match: extcon change event on a usb2phy where USB=1 (VBUS present) and
 # DCP=1 (charger misclassification). cable.0=USB, cable.4=DCP.
-SUBSYSTEM=="extcon", DEVPATH=="*/ff770000.syscon:usb2phy@e450/extcon/*", \
+SUBSYSTEM=="extcon", DEVPATH=="*usb2phy*/extcon/*", \
     ACTION=="change", \
     ATTR{cable.0/state}=="1", \
     ATTR{cable.4/state}=="1", \

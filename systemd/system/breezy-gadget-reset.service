@@ -1,18 +1,22 @@
 [Unit]
 Description=Breezy Box OTG PHY reset (clear DCP charger detection)
 Documentation=https://github.com/wheaney/breezy-box
-# Triggered by udev (99-breezy-otg-reset.rules) when usb2phy@e450 reports
+# Triggered by udev (99-breezy-otg-reset.rules) when a usb2phy reports
 # DCP=1 — the RK3399 BC1.2 charger detection misclassifying a Windows host
 # port.  Unbinds/rebinds the PHY and DWC3 driver to clear the bad state,
-# then rebinds the RNDIS gadget so Windows can enumerate it.
+# then rebinds the RNDIS gadget so Windows can enumerate it.  On SoCs without
+# the dwc3+usb2phy stack the reset script skips cleanly, so this service is a
+# no-op there.
 After=breezy-gadget.service
 Requires=breezy-gadget.service
 
 [Service]
 Type=oneshot
 # Guard: skip if the UDC is already attached (reset already succeeded or
-# cable was unplugged between the udev event and service start).
-ExecCondition=/bin/sh -c '[ "$(cat /sys/class/udc/fe800000.usb/state 2>/dev/null)" != "configured" ]'
+# cable was unplugged between the udev event and service start).  The UDC name
+# is detected from /sys/class/udc rather than hardcoded so this is board-
+# agnostic; if any UDC is already "configured" there is nothing to recover.
+ExecCondition=/bin/sh -c '! grep -qx configured /sys/class/udc/*/state 2>/dev/null'
 ExecStart=/usr/local/lib/breezy-box/reset_usb0_otg_stack.sh
 ExecStartPost=/usr/local/lib/breezy-box/breezy_gadget_setup.sh
 StandardOutput=journal

@@ -6,16 +6,23 @@ usage() {
     cat <<'EOF'
 Usage: reset_usb0_otg_stack.sh [--udc DEVICE] [--settle SEC] [--dry-run]
 
-Force a deeper recovery of the Rock Pi 4C+ usb0 OTG stack than the raw-gadget
-process can do by itself. The script detects the dwc3 platform device behind the
-selected UDC, finds the matching RK3399 usb2phy OTG PHY provider, unbinds and
-rebinds them in order, then reports the post-reset UDC and extcon state.
+Force a deeper recovery of the usb0 OTG stack than the raw-gadget process can do
+by itself. The script detects the dwc3 platform device behind the selected UDC,
+finds the matching usb2phy OTG PHY provider, unbinds and rebinds them in order,
+then reports the post-reset UDC and extcon state.
+
+This recovery path targets the RK3399 dwc3 + usb2phy stack (the BC1.2 DCP
+misclassification quirk). On other SoCs the dwc3/usb2phy nodes it relies on may
+not exist; in that case it reports what it found and exits cleanly without
+touching anything.
+
+When --udc is not given the single bound UDC under /sys/class/udc is used.
 
 This is intended for the bad state where:
-  - /sys/class/udc/fe800000.usb still exists
+  - the UDC still exists
   - the controller remains in device mode but not attached
   - current_speed stays UNKNOWN
-  - the usb2phy@e450 OTG extcon reports DCP=1 instead of CDP=1
+  - the usb2phy OTG extcon reports DCP=1 instead of CDP=1
 
 Examples:
   sudo ./reset_usb0_otg_stack.sh
@@ -24,7 +31,9 @@ Examples:
 EOF
 }
 
-UDC_DEVICE="fe800000.usb"
+# Empty default: auto-detect the bound UDC after argument parsing unless the
+# caller passes --udc explicitly.  Avoids hardcoding an RK3399 address.
+UDC_DEVICE=""
 SETTLE_SEC="1"
 DRY_RUN=0
 
@@ -59,6 +68,22 @@ done
 if [[ $EUID -ne 0 ]]; then
     echo "error: this script must run as root" >&2
     exit 1
+fi
+
+# Auto-detect the UDC unless one was given explicitly.  This keeps the script
+# board-agnostic: the dwc3/phy/extcon discovery below all keys off the UDC, so
+# detecting it here is enough to follow whatever controller the SoC exposes.
+if [[ -z "$UDC_DEVICE" ]]; then
+    mapfile -t _udcs < <(ls /sys/class/udc/ 2>/dev/null)
+    if [[ ${#_udcs[@]} -eq 0 ]]; then
+        echo "error: no UDC found under /sys/class/udc; nothing to reset" >&2
+        exit 1
+    fi
+    if [[ ${#_udcs[@]} -gt 1 ]]; then
+        echo "error: multiple UDCs found: ${_udcs[*]}; pass --udc to choose one" >&2
+        exit 1
+    fi
+    UDC_DEVICE="${_udcs[0]}"
 fi
 
 read_one() {
@@ -233,8 +258,13 @@ DWC3_DRIVER="$(basename "$DWC3_DRIVER_PATH")"
 
 OTG_PHY_DEVICE_PATH="$(find_otg_phy "$DWC3_DEVICE" || true)"
 if [[ -z "$OTG_PHY_DEVICE_PATH" ]]; then
-    echo "error: could not find the OTG usb2phy provider for $DWC3_DEVICE" >&2
-    exit 1
+    # No usb2phy OTG provider behind this controller.  This is expected on SoCs
+    # other than the RK3399 (e.g. Allwinner musb/sunxi), which don't have the
+    # dwc3 + usb2phy + extcon topology this recovery path manipulates.  Nothing
+    # to reset here, so exit cleanly rather than failing the calling service.
+    echo "note: no usb2phy OTG provider behind $DWC3_DEVICE (driver $DWC3_DRIVER);" \
+         "this recovery path only applies to the RK3399 dwc3+usb2phy stack — skipping" >&2
+    exit 0
 fi
 
 OTG_PHY_DEVICE="$(basename "$OTG_PHY_DEVICE_PATH")"
