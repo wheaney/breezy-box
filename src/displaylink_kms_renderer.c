@@ -1,6 +1,7 @@
-#define _POSIX_C_SOURCE 200809L
+#define _GNU_SOURCE   /* sched_setaffinity / CPU_SET */
 
 #include <errno.h>
+#include <sched.h>
 #include <math.h>
 #include <pthread.h>
 #include <signal.h>
@@ -90,6 +91,9 @@ struct drm_fb {
 struct kms_display_tex {
 	struct gbm_bo *bo;
 	uint32_t bo_stride;
+	void *bo_map;          /* persistent gbm_bo_map handle (decode thread writes) */
+	void *bo_map_data;     /* opaque cookie for gbm_bo_unmap */
+	uint32_t bo_map_stride;/* mapped stride in bytes */
 	EGLImageKHR egl_image;
 	GLuint gl_tex;
 	GLuint fallback_tex;
@@ -202,6 +206,10 @@ struct kms_state {
 
 	/* Back-pointer to the long-lived app state (not owned by the renderer). */
 	struct breezy_state *state;
+
+	/* Back-pointer to the server runtime (owns the per-device udl_runtime,
+	 * which outlives renderer reconnect cycles). */
+	struct server_runtime *server;
 };
 
 /* ----------------------------------------------------------------
@@ -1184,6 +1192,12 @@ static void renderer_destroy(struct kms_state *kms)
 	for (i = 0u; i < MAX_USBIP_DEVICES; i++) {
 		struct kms_display_tex *disp = &kms->displays[i];
 
+		/* Stop the decode thread writing this bo before we unmap/destroy it. */
+		if (kms->server)
+			udl_runtime_set_scanout_target(&kms->server->devices[i].udl,
+			                               NULL, 0, 0, 0);
+		if (disp->bo_map)
+			gbm_bo_unmap(disp->bo, disp->bo_map_data);
 		if (disp->gl_tex)
 			glDeleteTextures(1, &disp->gl_tex);
 		if (disp->egl_image && kms->eglDestroyImageKHR)
@@ -1289,9 +1303,29 @@ static int kms_init_display_tex(struct kms_state *kms, size_t idx,
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 		glBindTexture(GL_TEXTURE_2D, 0);
 
+		/* Persistently map the bo and hand it to the decode thread as its
+		 * scanout target, so dirty rects land in this GPU-visible buffer with
+		 * no work on the render thread. */
+		disp->bo_map = gbm_bo_map(disp->bo, 0, 0, w, h,
+		                          GBM_BO_TRANSFER_WRITE,
+		                          &disp->bo_map_stride, &disp->bo_map_data);
+		if (!disp->bo_map) {
+			fprintf(stderr, "kms: gbm_bo_map failed for display %zu, using fallback\n", idx);
+			kms->eglDestroyImageKHR(kms->egl_display, disp->egl_image);
+			disp->egl_image = EGL_NO_IMAGE_KHR;
+			glDeleteTextures(1, &disp->gl_tex);
+			disp->gl_tex = 0;
+			gbm_bo_destroy(disp->bo);
+			disp->bo = NULL;
+			goto fallback;
+		}
+		udl_runtime_set_scanout_target(udl, (uint16_t *)disp->bo_map,
+		                               disp->bo_map_stride / sizeof(uint16_t),
+		                               w, h);
+
 		if (verbose)
-			printf("kms: display %zu DMA-buf texture %ux%u stride=%u\n",
-			       idx, w, h, disp->bo_stride);
+			printf("kms: display %zu DMA-buf texture %ux%u stride=%u map_stride=%u\n",
+			       idx, w, h, disp->bo_stride, disp->bo_map_stride);
 		disp->initialized = true;
 		return 0;
 	}
@@ -1337,6 +1371,12 @@ static int kms_init_display_textures(struct kms_state *kms, struct server_runtim
  * Texture update from UDL decode buffer
  * ---------------------------------------------------------------- */
 
+/*
+ * On the DMA-buf path the decode thread writes dirty rects straight into each
+ * display's mapped bo (registered as its scanout target), so the render thread
+ * does no per-frame copy — the EGLImage already views that live memory.  Only
+ * the fallback path (no DMA-buf) needs a CPU->GL upload here.
+ */
 static void kms_update_display_textures(struct kms_state *kms,
                                          struct server_runtime *server)
 {
@@ -1346,12 +1386,7 @@ static void kms_update_display_textures(struct kms_state *kms,
 		struct kms_display_tex *disp = &kms->displays[i];
 		struct udl_runtime *udl;
 		struct udl_sink_damage damage;
-		uint32_t x1;
-		uint32_t y1;
-		uint32_t x2;
-		uint32_t y2;
-		uint32_t dirty_width;
-		uint32_t dirty_height;
+		uint32_t x1, y1, x2, y2, dirty_width, dirty_height;
 
 		if (!server_slot_is_active(server, i))
 			continue;
@@ -1371,6 +1406,13 @@ static void kms_update_display_textures(struct kms_state *kms,
 		if (!udl_runtime_consume_damage(udl, &damage))
 			continue;
 
+		/* DMA-buf path: decode thread already wrote the bo; nothing to do. */
+		if (kms->dma_buf_supported && disp->bo && disp->gl_tex)
+			continue;
+
+		if (!disp->fallback_tex)
+			continue;
+
 		x1 = damage.x1 < disp->width ? damage.x1 : disp->width;
 		y1 = damage.y1 < disp->height ? damage.y1 : disp->height;
 		x2 = damage.x2 < disp->width ? damage.x2 : disp->width;
@@ -1380,40 +1422,18 @@ static void kms_update_display_textures(struct kms_state *kms,
 		dirty_width = x2 - x1;
 		dirty_height = y2 - y1;
 
-		if (kms->dma_buf_supported && disp->bo && disp->gl_tex) {
-			void *map_data = NULL;
-			uint32_t stride;
-			void *mapped = gbm_bo_map(disp->bo, x1, y1,
-			                          dirty_width, dirty_height,
-			                          GBM_BO_TRANSFER_WRITE, &stride, &map_data);
-			if (mapped) {
-				uint32_t row;
-
-				for (row = 0u; row < dirty_height; row++) {
-					memcpy((uint8_t *)mapped + (size_t)row * stride,
-					       udl->framebuffer_rgb565 +
-					       (size_t)(y1 + row) * udl->backing_width + x1,
-					       (size_t)dirty_width * 2u);
-				}
-				gbm_bo_unmap(disp->bo, map_data);
-				glBindTexture(GL_TEXTURE_2D, disp->gl_tex);
-				kms->glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, disp->egl_image);
-				glBindTexture(GL_TEXTURE_2D, 0);
-			}
-		} else if (disp->fallback_tex) {
-			glBindTexture(GL_TEXTURE_2D, disp->fallback_tex);
-			glPixelStorei(GL_UNPACK_ALIGNMENT, 2);
-			for (uint32_t row = 0u; row < dirty_height; row++) {
-				glTexSubImage2D(GL_TEXTURE_2D, 0,
-				                (GLint)x1, (GLint)(y1 + row),
-				                (GLsizei)dirty_width, 1,
-				                GL_RGB, GL_UNSIGNED_SHORT_5_6_5,
-				                udl->framebuffer_rgb565 +
-				                (size_t)(y1 + row) * udl->backing_width + x1);
-			}
-			glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-			glBindTexture(GL_TEXTURE_2D, 0);
+		glBindTexture(GL_TEXTURE_2D, disp->fallback_tex);
+		glPixelStorei(GL_UNPACK_ALIGNMENT, 2);
+		for (uint32_t row = 0u; row < dirty_height; row++) {
+			glTexSubImage2D(GL_TEXTURE_2D, 0,
+			                (GLint)x1, (GLint)(y1 + row),
+			                (GLsizei)dirty_width, 1,
+			                GL_RGB, GL_UNSIGNED_SHORT_5_6_5,
+			                udl->framebuffer_rgb565 +
+			                (size_t)(y1 + row) * udl->backing_width + x1);
 		}
+		glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+		glBindTexture(GL_TEXTURE_2D, 0);
 	}
 }
 
@@ -1646,6 +1666,14 @@ static void kms_teardown_display_tex(struct kms_state *kms, size_t idx)
 {
 	struct kms_display_tex *disp = &kms->displays[idx];
 
+	/* Stop the decode thread writing this bo before we unmap/destroy it. */
+	if (kms->server)
+		udl_runtime_set_scanout_target(&kms->server->devices[idx].udl,
+		                               NULL, 0, 0, 0);
+	if (disp->bo_map) {
+		gbm_bo_unmap(disp->bo, disp->bo_map_data);
+		disp->bo_map = NULL;
+	}
 	if (disp->gl_tex) {
 		glDeleteTextures(1, &disp->gl_tex);
 		disp->gl_tex = 0;
@@ -2045,6 +2073,43 @@ static void kms_render_frame(struct kms_state *kms,
  * KMS page-flip render loop
  * ---------------------------------------------------------------- */
 
+/*
+ * Give the render thread real-time scheduling so head-anchoring stays smooth
+ * even while the decode threads saturate the other cores.  Best-effort: both
+ * SCHED_FIFO and CPU affinity require CAP_SYS_NICE (granted to the renderer
+ * unit via AmbientCapabilities=CAP_SYS_NICE).  If we lack it we log and carry
+ * on at normal priority rather than refusing to render.
+ */
+static void kms_boost_render_thread(void)
+{
+	pthread_t self = pthread_self();
+	struct sched_param sp;
+
+	memset(&sp, 0, sizeof sp);
+	/* Mid-range RT priority: above SCHED_OTHER (decode), well below kernel
+	 * threads/IRQ handlers so we never starve the system. */
+	sp.sched_priority = 20;
+	if (pthread_setschedparam(self, SCHED_FIFO, &sp) != 0)
+		fprintf(stderr,
+			"kms: SCHED_FIFO boost unavailable (%s) — running at normal "
+			"priority; grant CAP_SYS_NICE for smoother anchoring\n",
+			strerror(errno));
+	else
+		fprintf(stderr, "kms: render thread boosted to SCHED_FIFO prio %d\n",
+			sp.sched_priority);
+
+	/* Pin to CPU 0 so the decode threads (left on the other cores) can't
+	 * preempt the render thread's core.  Also best-effort. */
+	{
+		cpu_set_t set;
+		CPU_ZERO(&set);
+		CPU_SET(0, &set);
+		if (sched_setaffinity(0, sizeof set, &set) != 0)
+			fprintf(stderr, "kms: render-thread CPU pin failed (%s)\n",
+				strerror(errno));
+	}
+}
+
 static int kms_run(struct kms_state *kms, struct server_runtime *server)
 {
 	drmEventContext evctx = {
@@ -2055,13 +2120,20 @@ static int kms_run(struct kms_state *kms, struct server_runtime *server)
 	struct drm_fb *fb;
 	fd_set fds;
 
+	kms->server = server;
+
 	if (drmSetMaster(kms->drm_fd) < 0)
 		fprintf(stderr, "kms: drmSetMaster: %s (may still work)\n", strerror(errno));
 
 	{
 		uint64_t cap = 0;
 		kms->async_flip = (drmGetCap(kms->drm_fd, DRM_CAP_ASYNC_PAGE_FLIP, &cap) == 0 && cap != 0);
-		printf("kms: async page flip: %s\n", kms->async_flip ? "enabled" : "disabled");
+		printf("kms: async page flip: %s\n", kms->async_flip ? "enabled (tearing, no vsync wait)" : "disabled");
+		if (!kms->async_flip)
+			fprintf(stderr,
+				"kms: WARNING async page flip unsupported by this DRM driver — "
+				"render loop falls back to vsync-synced flips and will be capped "
+				"to the display refresh; head-anchoring latency will be higher\n");
 	}
 
 	kms->device_active            = false;
@@ -2117,6 +2189,9 @@ static int kms_run(struct kms_state *kms, struct server_runtime *server)
 		perror("drmModeSetCrtc");
 		return -1;
 	}
+
+	/* This is the render thread; boost it so anchoring never jitters. */
+	kms_boost_render_thread();
 
 	uint64_t last_frame_ms = 0;
 

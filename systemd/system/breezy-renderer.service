@@ -36,6 +36,12 @@ StandardOutput=journal
 StandardError=journal
 # Groups needed for DRM/GBM, GPU render, and reading input/IMU devices.
 SupplementaryGroups=video render input
+# The renderer puts its render thread on SCHED_FIFO so head-anchoring stays
+# smooth while decode threads load the other cores.  An unprivileged service
+# needs CAP_SYS_NICE to set RT scheduling, and LimitRTPRIO raised above the
+# priority it requests (20); without these the boost silently no-ops.
+AmbientCapabilities=CAP_SYS_NICE
+LimitRTPRIO=40
 ExecStart=/home/__APP_USER__/.local/bin/displaylink_kms_renderer
 # Always restart, even on a clean (SIGTERM) exit, so a stray VT signal can't
 # leave the screen black.  The start-limit (in [Unit]) prevents a hot loop.

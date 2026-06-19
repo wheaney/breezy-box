@@ -57,6 +57,19 @@ struct udl_runtime {
 	const char *window_title;
 	int gadget_fd;   /* fd for /dev/udl_gadget; -1 when not in use */
 
+	/*
+	 * Optional caller-owned RGB565 scanout buffer.  When set, the decode
+	 * thread copies each decoded dirty rect straight into it so a renderer can
+	 * sample it without doing the copy itself.  scanout_mutex guards
+	 * (re)assignment against the decode-thread writes.
+	 */
+	uint16_t *scanout_dst;        /* RGB565 target buffer, or NULL */
+	uint32_t  scanout_stride_px;  /* row stride of scanout_dst, in pixels */
+	uint32_t  scanout_width;
+	uint32_t  scanout_height;
+	pthread_mutex_t scanout_mutex;
+	bool scanout_mutex_initialized;
+
 	/* Decode-thread profiling (enabled by BREEZY_UDL_DECODE_STATS=1). */
 	bool decode_stats_enabled;
 	uint64_t stats_window_start_ns;
@@ -94,6 +107,14 @@ int udl_runtime_enqueue_bulk(struct udl_runtime *runtime, const uint8_t *data, s
 int udl_runtime_enqueue_bulk_owned(struct udl_runtime *runtime, uint8_t *data, size_t length);
 void udl_runtime_record_damage(struct udl_runtime *runtime, const struct udl_sink_damage *damage);
 bool udl_runtime_consume_damage(struct udl_runtime *runtime, struct udl_sink_damage *damage);
+
+/*
+ * Register (or clear, with dst==NULL) a caller-owned RGB565 buffer the decode
+ * thread copies decoded dirty rects into.  Thread-safe against decode.
+ */
+void udl_runtime_set_scanout_target(struct udl_runtime *runtime,
+				    uint16_t *dst, uint32_t stride_px,
+				    uint32_t width, uint32_t height);
 int udl_runtime_feed(struct udl_runtime *runtime, const uint8_t *data, size_t length);
 
 /*

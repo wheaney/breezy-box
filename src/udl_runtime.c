@@ -175,6 +175,49 @@ void udl_runtime_record_damage(struct udl_runtime *runtime, const struct udl_sin
 	atomic_store(&runtime->frame_dirty, true);
 }
 
+void udl_runtime_set_scanout_target(struct udl_runtime *runtime,
+				    uint16_t *dst, uint32_t stride_px,
+				    uint32_t width, uint32_t height)
+{
+	if (!runtime || !runtime->scanout_mutex_initialized)
+		return;
+	pthread_mutex_lock(&runtime->scanout_mutex);
+	runtime->scanout_dst       = dst;
+	runtime->scanout_stride_px = stride_px;
+	runtime->scanout_width     = width;
+	runtime->scanout_height    = height;
+	pthread_mutex_unlock(&runtime->scanout_mutex);
+}
+
+/* Copy a decoded dirty rect into the registered scanout buffer (decode thread). */
+static void udl_runtime_blit_scanout(struct udl_runtime *runtime,
+				     const struct udl_sink_damage *damage)
+{
+	if (!runtime->scanout_mutex_initialized || !damage || !damage->touched)
+		return;
+
+	pthread_mutex_lock(&runtime->scanout_mutex);
+	uint16_t *dst = runtime->scanout_dst;
+	if (dst && runtime->framebuffer_rgb565) {
+		uint32_t x1 = damage->x1;
+		uint32_t y1 = damage->y1;
+		uint32_t x2 = damage->x2 < runtime->scanout_width  ? damage->x2 : runtime->scanout_width;
+		uint32_t y2 = damage->y2 < runtime->scanout_height ? damage->y2 : runtime->scanout_height;
+		if (x1 < x2 && y1 < y2) {
+			uint32_t src_stride = runtime->backing_width;
+			uint32_t dst_stride = runtime->scanout_stride_px;
+			size_t   row_bytes  = (size_t)(x2 - x1) * sizeof(uint16_t);
+			for (uint32_t row = y1; row < y2; row++) {
+				memcpy(dst + (size_t)row * dst_stride + x1,
+				       runtime->framebuffer_rgb565 +
+				           (size_t)row * src_stride + x1,
+				       row_bytes);
+			}
+		}
+	}
+	pthread_mutex_unlock(&runtime->scanout_mutex);
+}
+
 bool udl_runtime_consume_damage(struct udl_runtime *runtime, struct udl_sink_damage *damage)
 {
 	if (!runtime || !damage || !runtime->damage_mutex_initialized)
@@ -209,6 +252,7 @@ static void udl_runtime_flush_pending(struct udl_runtime *runtime)
 					   runtime->last_hpixels != 0u ? runtime->last_hpixels : runtime->width,
 					   runtime->last_vpixels != 0u ? runtime->last_vpixels : runtime->height,
 					   &flush_visible);
+		udl_runtime_blit_scanout(runtime, &flush_visible);
 		udl_runtime_record_damage(runtime, &flush_visible);
 	}
 }
@@ -362,6 +406,10 @@ int udl_runtime_init(struct udl_runtime *runtime, const struct options *opts)
 		return -1;
 	runtime->damage_mutex_initialized = true;
 
+	if (pthread_mutex_init(&runtime->scanout_mutex, NULL) != 0)
+		return -1;
+	runtime->scanout_mutex_initialized = true;
+
 	if (pthread_mutex_init(&runtime->decode_mutex, NULL) != 0)
 		return -1;
 	if (pthread_cond_init(&runtime->decode_cond_not_empty, NULL) != 0)
@@ -427,6 +475,13 @@ void udl_runtime_destroy(struct udl_runtime *runtime)
 	if (runtime->damage_mutex_initialized) {
 		pthread_mutex_destroy(&runtime->damage_mutex);
 		runtime->damage_mutex_initialized = false;
+	}
+	if (runtime->scanout_mutex_initialized) {
+		pthread_mutex_lock(&runtime->scanout_mutex);
+		runtime->scanout_dst = NULL;
+		pthread_mutex_unlock(&runtime->scanout_mutex);
+		pthread_mutex_destroy(&runtime->scanout_mutex);
+		runtime->scanout_mutex_initialized = false;
 	}
 
 	udl_transport_destroy(&runtime->transport);
@@ -662,6 +717,9 @@ int udl_runtime_feed(struct udl_runtime *runtime, const uint8_t *data, size_t le
 		extern void log_udl_writereg_commands(const uint8_t *data, size_t length);
 		log_udl_writereg_commands(data, length);
 	}
+	/* Blit before publishing damage so a consumer never sees frame_dirty
+	 * before the pixels have landed. */
+	udl_runtime_blit_scanout(runtime, &visible_damage);
 	udl_runtime_record_damage(runtime, &visible_damage);
 
 	if (runtime->decode_stats_enabled) {
