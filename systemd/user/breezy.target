@@ -3,8 +3,11 @@ Description=Breezy Box services
 # The KMS renderer is a SYSTEM service (breezy-renderer.service on tty1) so it
 # can take DRM master on seat0; it is not part of this user target.  These are
 # the headless services that run in the user session.
-Wants=breezy-xvfb.service breezy-web.service
-After=breezy-xvfb.service breezy-web.service
+# breezy-novnc Requires=breezy-x11vnc Requires=breezy-xvfb, so listing novnc
+# here pulls the whole VNC chain in.  Without it the VNC services never start
+# (nothing Wants them) and the web UI's remote-desktop view stays dark.
+Wants=breezy-xvfb.service breezy-web.service breezy-novnc.service
+After=breezy-xvfb.service breezy-web.service breezy-novnc.service
 
 [Install]
 WantedBy=default.target
