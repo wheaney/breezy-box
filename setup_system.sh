@@ -440,10 +440,14 @@ else
             pkg_install libcap2-bin || warn_msg "libcap2-bin install failed — render thread stays at normal priority"
         fi
         if command -v setcap &>/dev/null; then
-            if setcap cap_sys_nice+ep "$RENDERER_BIN" 2>/dev/null; then
+            # Capture stderr: the common failure is $HOME on a nosuid mount or a
+            # filesystem without xattr support, and the reason matters.
+            setcap_err="$(setcap cap_sys_nice+ep "$RENDERER_BIN" 2>&1)"
+            if [[ $? -eq 0 ]]; then
                 done_msg "granted cap_sys_nice to $RENDERER_BIN (SCHED_FIFO render thread)"
             else
-                warn_msg "setcap on $RENDERER_BIN failed — render thread stays at normal priority"
+                warn_msg "setcap on $RENDERER_BIN failed (${setcap_err:-unknown}) — render thread stays at normal priority"
+                warn_msg "  if the fs lacks xattr/is nosuid, install the binary to /usr/local/bin instead"
             fi
         fi
     else
