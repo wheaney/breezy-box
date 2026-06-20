@@ -111,10 +111,25 @@ seat**. Combined with `User=` + `PAMName=login` it changes the PAM credential or
 so logind no longer seats the session on seat0 — which *also* costs DRM master
 (`drmSetMaster: Permission denied`). Symptom looks identical to the kmscon problem.
 
-**Correct config:** `LimitRTPRIO=40` **alone**. Linux lets an unprivileged process use
-`SCHED_FIFO` up to its `RLIMIT_RTPRIO` ceiling **without** `CAP_SYS_NICE`. The CPU pin
-(`sched_setaffinity`) needs no capability either. If the boost can't be set the
-renderer logs and continues at normal priority (best-effort).
+**What actually works:** `LimitRTPRIO=40` alone is **NOT** enough on this kernel — it
+still refuses unprivileged `SCHED_FIFO` (`kms: SCHED_FIFO boost unavailable (Operation
+not permitted)`). The fix is to grant `CAP_SYS_NICE` **on the binary** via `setcap`
+(setup_system.sh runs `setcap cap_sys_nice+ep` on the renderer after the unit install):
+
+```
+sudo setcap cap_sys_nice+ep ~/.local/bin/displaylink_kms_renderer
+```
+
+A *file* capability is independent of the systemd credential path, so it grants the cap
+**without** perturbing the seat (unlike `AmbientCapabilities`). Caveats:
+- Must be **re-applied whenever the binary is recopied** — setup does it every run; if
+  you `cp` a fresh build manually, re-run setup or re-`setcap`.
+- A file-capability binary is treated like setuid by ld.so, so it ignores
+  `LD_LIBRARY_PATH`/`$ORIGIN` rpath — fine here, the renderer's libs (Mesa/EGL/libdrm/
+  gbm) are in standard system paths.
+- The CPU pin (`sched_setaffinity`) needs no capability. `LimitRTPRIO=40` stays in the
+  unit as a backstop. If the boost still can't be set the renderer logs and continues at
+  normal priority (best-effort).
 
 ## 5. Async page flip unsupported — no true vsync-off / tearing path
 

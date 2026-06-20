@@ -70,25 +70,6 @@ pkg_install() {
 # port-redirect sections branch on this: networkd profiles are inert when NM
 # owns the interfaces.
 nm_active() { systemctl is-active --quiet NetworkManager 2>/dev/null; }
-warn_msg()  { echo "  warn: $*"; }
-
-# Install one or more packages via the host's package manager.  Returns 0 on
-# success.  Supports pacman (CachyOS/Arch) and apt (Armbian/Debian).
-pkg_install() {
-    if command -v pacman &>/dev/null; then
-        pacman -S --noconfirm --needed "$@"
-    elif command -v apt-get &>/dev/null; then
-        apt-get update -qq && apt-get install -y "$@"
-    else
-        warn_msg "no supported package manager (pacman/apt) — install manually: $*"
-        return 1
-    fi
-}
-
-# True when NetworkManager is the active network stack.  The wired-link and
-# port-redirect sections branch on this: networkd profiles are inert when NM
-# owns the interfaces.
-nm_active() { systemctl is-active --quiet NetworkManager 2>/dev/null; }
 
 # ---------------------------------------------------------------------------
 section "Kernel modules for USB gadget"
@@ -391,9 +372,12 @@ mask_unit() {
 # 1. Template console instances bound to the renderer's VT, e.g.
 #    getty@tty1.service, kmsconvt@tty1.service, serial-getty@tty1.service.
 #    Scoped to "@${RENDERER_VT}" so other VTs' gettys (tty2…) are untouched.
+#    NOTE: list-units prefixes a "●" status bullet on failed/active units even
+#    with --no-legend, so we must pick the field ending in .service, not $1
+#    (which would capture the bullet and feed "●" into systemctl mask).
 VT_UNITS="$(
     systemctl list-units --all --no-legend "*@${RENDERER_VT}.service" 2>/dev/null \
-        | awk '{print $1}'
+        | grep -oE '[^[:space:]]+@'"${RENDERER_VT}"'\.service'
 )"
 
 # 2. Console template families whose unit FILE exists but may not be loaded yet
@@ -439,6 +423,32 @@ else
         skip_msg "$RENDERER_SVC_DST already up to date"
     fi
     rm -f "$RENDERER_SVC_TMP"
+
+    # Grant CAP_SYS_NICE on the renderer BINARY (not via systemd
+    # AmbientCapabilities, which — combined with User=+PAMName=login — changes
+    # PAM credential ordering and costs the renderer its seat/DRM master).  The
+    # renderer needs CAP_SYS_NICE to put its GL render thread on SCHED_FIFO:
+    # unprivileged RT is refused on this kernel even with LimitRTPRIO set
+    # ("SCHED_FIFO boost unavailable: Operation not permitted").  A file
+    # capability is independent of the systemd credential path, so it grants the
+    # cap without perturbing the seat.  Must be re-applied whenever the binary
+    # is recopied — hence it runs here, every setup.
+    RENDERER_BIN="/home/$APP_USER/.local/bin/displaylink_kms_renderer"
+    if [[ -x "$RENDERER_BIN" ]]; then
+        if ! command -v setcap &>/dev/null; then
+            warn_msg "setcap not found — installing libcap2-bin"
+            pkg_install libcap2-bin || warn_msg "libcap2-bin install failed — render thread stays at normal priority"
+        fi
+        if command -v setcap &>/dev/null; then
+            if setcap cap_sys_nice+ep "$RENDERER_BIN" 2>/dev/null; then
+                done_msg "granted cap_sys_nice to $RENDERER_BIN (SCHED_FIFO render thread)"
+            else
+                warn_msg "setcap on $RENDERER_BIN failed — render thread stays at normal priority"
+            fi
+        fi
+    else
+        warn_msg "renderer binary not found at $RENDERER_BIN — build+copy it, then re-run setup to grant cap_sys_nice"
+    fi
 
     if systemctl is-enabled --quiet breezy-renderer.service 2>/dev/null; then
         skip_msg "breezy-renderer.service already enabled"
