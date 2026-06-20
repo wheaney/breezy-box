@@ -6,16 +6,10 @@ A Breezy Box is an "XR dock" -- a no-software, no-setup device for multi-display
 
 To spoof a dock that can attach multiple moniters over standard USB, we'll be using the "old" DisplayLink protocol (the newer one is encrypted and hasn't been reverse engineered). This requires USB OTG hardware so our device can act as a USB peripheral. Many SBCs come with the appropriate hardware, but devices that share the OTG port with power delivery like the Raspberry Pi seem to fight against attempts to use the port OTG purposes. So at the moment, the hardware requirements are:
 1. Can run Linux (the necessary chipset drivers are available), ideally something like Armbian 
-2. At least one USB port that supports OTG (doesn't matter if USB-A or USB-C)
-3. Power delivery via a port separate from OTG
-4. USB-C with DisplayPort Alt Mode support
-
-### Candidate SBCs
-
-* Libre Computer Renegade Elite ROC-RK3399-PC **maybe best overall package including price**
-* FriendlyElec NanoPC-T6
-* Radxa Rock 5B **requires extra work to separate power deliver from the dp-alt port**
-* Orange Pi 5 Plus
+2. Either:
+ * An Ethernet port OR
+ * At least one USB port that supports OTG (doesn't matter if USB-A or USB-C). Power delivery via a port separate from OTG
+3. USB-C with DisplayPort Alt Mode support
 
 ## Software components
 

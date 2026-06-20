@@ -359,21 +359,69 @@ section "breezy-renderer kiosk system service (DRM master on tty1)"
 RENDERER_SVC_SRC="$SCRIPT_DIR/systemd/system/breezy-renderer.service"
 RENDERER_SVC_DST="/etc/systemd/system/breezy-renderer.service"
 
-# Remove the now-obsolete getty autologin drop-in (renderer owns tty1 instead).
-OLD_GETTY_DROPIN="/etc/systemd/system/getty@tty1.service.d/autologin.conf"
+# The VT the renderer owns (matches TTYPath in breezy-renderer.service).
+RENDERER_VT="tty1"
+
+# Remove the now-obsolete getty autologin drop-in (renderer owns the VT instead).
+OLD_GETTY_DROPIN="/etc/systemd/system/getty@${RENDERER_VT}.service.d/autologin.conf"
 if [[ -f "$OLD_GETTY_DROPIN" ]]; then
     rm -f "$OLD_GETTY_DROPIN"
     rmdir "$(dirname "$OLD_GETTY_DROPIN")" 2>/dev/null || true
     done_msg "removed obsolete getty autologin drop-in"
 fi
 
-# Mask getty@tty1 so nothing re-spawns a login on the renderer's VT.
-if [[ "$(systemctl is-enabled getty@tty1.service 2>/dev/null)" == "masked" ]]; then
-    skip_msg "getty@tty1.service already masked"
+# Mask every console unit that could occupy the renderer's VT.  Rather than
+# hardcode getty/kmscon, discover whatever owns the VT: any console daemon
+# (getty, kmsconvt, console-getty, a greeter, etc.) grabs the tty and, for the
+# KMS ones, DRM master — which makes the renderer's drmSetMaster() fail with
+# EPERM (black screen + Restart=always loop).  We mask each so the renderer is
+# the sole owner of the VT and the seat.
+mask_unit() {
+    local unit="$1" why="$2"
+    [[ -z "$unit" ]] && return 0
+    if [[ "$(systemctl is-enabled "$unit" 2>/dev/null || true)" == "masked" ]]; then
+        skip_msg "$unit already masked"
+        return 0
+    fi
+    systemctl stop "$unit" 2>/dev/null || true
+    systemctl mask "$unit"
+    done_msg "masked $unit ($why)"
+}
+
+# 1. Template console instances bound to the renderer's VT, e.g.
+#    getty@tty1.service, kmsconvt@tty1.service, serial-getty@tty1.service.
+#    Scoped to "@${RENDERER_VT}" so other VTs' gettys (tty2…) are untouched.
+VT_UNITS="$(
+    systemctl list-units --all --no-legend "*@${RENDERER_VT}.service" 2>/dev/null \
+        | awk '{print $1}'
+)"
+
+# 2. Console template families whose unit FILE exists but may not be loaded yet
+#    (logind instantiates them lazily on VT activation).  Mask the VT instance
+#    so it can never start there.  list-units in step 1 only sees loaded units,
+#    so this catches the not-yet-spawned case.
+for tmpl in getty kmsconvt serial-getty; do
+    systemctl list-unit-files "${tmpl}@.service" --no-legend 2>/dev/null | grep -q . \
+        && VT_UNITS+=$'\n'"${tmpl}@${RENDERER_VT}.service"
+done
+
+# 3. Static (non-templated) console units that grab DRM master regardless of
+#    VT, masked only if present.  Service units only — never targets.
+for static_unit in kmscon.service console-getty.service; do
+    systemctl list-unit-files "$static_unit" --no-legend 2>/dev/null | grep -q . \
+        && VT_UNITS+=$'\n'"$static_unit"
+done
+
+# De-dupe (steps 1 and 2 overlap when a template instance is already loaded).
+VT_UNITS="$(printf '%s\n' "$VT_UNITS" | awk 'NF' | sort -u)"
+
+if [[ -z "${VT_UNITS//[$'\n\t ']/}" ]]; then
+    skip_msg "no console units found on ${RENDERER_VT} (renderer already sole owner)"
 else
-    systemctl stop getty@tty1.service 2>/dev/null || true
-    systemctl mask getty@tty1.service
-    done_msg "masked getty@tty1.service (renderer owns tty1)"
+    while IFS= read -r unit; do
+        [[ -z "$unit" ]] && continue
+        mask_unit "$unit" "frees ${RENDERER_VT} + DRM master for the renderer"
+    done <<< "$VT_UNITS"
 fi
 
 if [[ ! -f "$RENDERER_SVC_SRC" ]]; then
