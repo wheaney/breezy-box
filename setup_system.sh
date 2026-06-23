@@ -618,15 +618,28 @@ if id "$APP_USER" &>/dev/null; then
         done_msg "enabled linger for $APP_USER (headless services start at boot)"
     fi
 
-    # Enable + (re)start breezy.target in the app user's manager.
+    # Enable + start breezy.target in the app user's manager.
     USER_CMD="XDG_RUNTIME_DIR=/run/user/$(id -u "$APP_USER") systemctl --user"
+    su -l "$APP_USER" -s /bin/bash -c "$USER_CMD daemon-reload" 2>/dev/null || true
     su -l "$APP_USER" -s /bin/bash -c "$USER_CMD enable breezy.target" \
         2>/dev/null && done_msg "enabled breezy.target (user)" || true
-    if [[ "$UNITS_CHANGED" -eq 1 ]]; then
+    # If the unit files changed, restart the member SERVICES so the new content
+    # takes effect (a target restart does not reliably re-pull its Wants= members
+    # — it can stop them in the stop phase and leave them dead).  Restarting the
+    # services directly reloads their changed definitions and brings them up.
+    if [[ "$UNITS_CHANGED" -eq 1 ]] \
+        && su -l "$APP_USER" -s /bin/bash -c "$USER_CMD is-active --quiet breezy.target" 2>/dev/null; then
         su -l "$APP_USER" -s /bin/bash -c \
-            "$USER_CMD is-active --quiet breezy.target && $USER_CMD restart breezy.target" \
-            2>/dev/null && done_msg "restarted breezy.target (units changed)" || true
+            "$USER_CMD restart breezy-xvfb.service breezy-desktop.service breezy-x11vnc.service breezy-novnc.service breezy-web.service" \
+            2>/dev/null && done_msg "restarted breezy services (units changed)" || true
     fi
+    # Always (re)start the target so its Wants= pull every member up.  Using
+    # 'start' (not 'restart') is deliberate: a target start enqueues the Wants=
+    # members without first tearing the target down, so this both covers the
+    # first install (target not yet active) and re-pulls anything left stopped.
+    su -l "$APP_USER" -s /bin/bash -c "$USER_CMD start breezy.target" \
+        2>/dev/null && done_msg "started breezy.target (user)" \
+        || echo "  warn: failed to start breezy.target — check: systemctl --user status breezy.target"
 
     # Clean up the obsolete tty1 launch block from a previous (getty) install.
     PROFILE_DST="/home/$APP_USER/.bash_profile"
