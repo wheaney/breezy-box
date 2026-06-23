@@ -6,8 +6,11 @@ Description=Breezy Box services
 # breezy-novnc Requires=breezy-x11vnc Requires=breezy-xvfb, so listing novnc
 # here pulls the whole VNC chain in.  Without it the VNC services never start
 # (nothing Wants them) and the web UI's remote-desktop view stays dark.
-Wants=breezy-xvfb.service breezy-web.service breezy-novnc.service
-After=breezy-xvfb.service breezy-web.service breezy-novnc.service
+# breezy-desktop is the GTK UI that actually DRAWS onto Xvfb :1; nothing else
+# pulls it in, so without it here the VNC chain serves an empty X server — the
+# noVNC view connects fine but renders a black screen.
+Wants=breezy-xvfb.service breezy-web.service breezy-novnc.service breezy-desktop.service
+After=breezy-xvfb.service breezy-web.service breezy-novnc.service breezy-desktop.service
 
 [Install]
 WantedBy=default.target
