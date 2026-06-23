@@ -745,6 +745,30 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+section "Default renderer config (~/.config/breezy-box/config.json)"
+
+# Install the default config only when the user already exists and has no
+# config of their own.  Never overwrite an existing file so user edits survive
+# re-runs.  The config lives in the app user's XDG_CONFIG_HOME, so we write it
+# as that user rather than root.
+CONFIG_DEFAULT_SRC="$SCRIPT_DIR/config.default.json"
+if [[ ! -f "$CONFIG_DEFAULT_SRC" ]]; then
+    warn_msg "config.default.json not found in $SCRIPT_DIR — skipping default config install"
+elif ! id "$APP_USER" &>/dev/null; then
+    warn_msg "user $APP_USER not found — default config will be installed when the user exists"
+else
+    APP_HOME="$(getent passwd "$APP_USER" | cut -d: -f6)"
+    CONFIG_DST="${APP_HOME}/.config/breezy-box/config.json"
+    if [[ -f "$CONFIG_DST" ]]; then
+        skip_msg "$CONFIG_DST already exists (not overwriting)"
+    else
+        install -o "$APP_USER" -g "$APP_USER" -m 0644 -D \
+            "$CONFIG_DEFAULT_SRC" "$CONFIG_DST"
+        done_msg "installed default config: $CONFIG_DST (3× 1080p@30)"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 echo
 echo "System setup complete."
 echo
