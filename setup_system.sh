@@ -71,6 +71,15 @@ pkg_install() {
 # owns the interfaces.
 nm_active() { systemctl is-active --quiet NetworkManager 2>/dev/null; }
 
+# True when the GPU is an Imagination PowerVR (img,gpu / pvrsrvkm) — the Allwinner
+# A733 case.  Mali/Panfrost boards (e.g. RK3399) return false so they never pull
+# the PowerVR userspace blob.  See docs/hardware/radxa-cubie-a7s.md §7.
+is_powervr() {
+    grep -qs 'img,gpu' /sys/class/drm/*/device/uevent 2>/dev/null \
+        || [[ -e /sys/module/pvrsrvkm ]] \
+        || grep -qsw pvrsrvkm /proc/modules 2>/dev/null
+}
+
 # ---------------------------------------------------------------------------
 section "Kernel modules for USB gadget"
 
@@ -329,6 +338,78 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+section "GPU userspace (PowerVR BXM) — hardware GLES/Vulkan"
+
+# Only relevant on the Allwinner A733 (Imagination PowerVR).  Mali/Panfrost
+# boards skip this entirely.  Armbian ships only the KERNEL half (img-bxm-dkms);
+# the matching closed DDK userspace + GPU firmware live in Radxa's a733 test
+# repo, version-locked to the kernel module's DDK (24.2@6603887 / BVNC
+# 36.56.104.183) so they bind with no DDK_VERSION_MISMATCH.  Without it the
+# renderer falls back to llvmpipe (software).  See docs/hardware/radxa-cubie-a7s.md §7.
+PVR_USERSPACE_LIB="/usr/lib/libVK_IMG.so"
+PVR_REPO="https://radxa-repo.github.io/a733-trixie-test"
+PVR_PKG="xserver-xorg-img-bxm-1.21.1-2.deb"   # the package NAME (Allwinnertech quirk)
+
+if ! is_powervr; then
+    skip_msg "no PowerVR GPU detected (not an A733) — GPU userspace not needed"
+elif [[ -e "$PVR_USERSPACE_LIB" ]]; then
+    skip_msg "PowerVR userspace already installed ($PVR_USERSPACE_LIB)"
+elif ! command -v curl &>/dev/null; then
+    warn_msg "PowerVR GPU present but userspace missing, and curl not found"
+    warn_msg "  install curl and re-run, or install $PVR_PKG manually (see §7)"
+else
+    warn_msg "PowerVR GPU present but userspace blob missing — installing from Radxa a733 repo"
+    # Resolve the .deb path from the repo's Packages index, then install directly
+    # (the package declares no deps, so dpkg -i is sufficient — no repo to add).
+    pvr_fn="$(curl -fsSL "$PVR_REPO/dists/a733-trixie-test/main/binary-arm64/Packages.gz" 2>/dev/null \
+                | zcat 2>/dev/null \
+                | awk -v p="Package: $PVR_PKG" '$0==p{f=1} f&&/^Filename:/{print $2; exit}')"
+    if [[ -n "$pvr_fn" ]] && curl -fsSL -o /tmp/img-bxm.deb "$PVR_REPO/$pvr_fn" 2>/dev/null; then
+        if dpkg -i /tmp/img-bxm.deb; then
+            ldconfig
+            done_msg "installed PowerVR userspace + firmware ($PVR_PKG)"
+            warn_msg "  reboot (or restart the renderer) so pvrsrvkm loads rgx.fw.* on next GPU bring-up"
+        else
+            warn_msg "dpkg -i of $PVR_PKG failed — install manually (see §7)"
+        fi
+        rm -f /tmp/img-bxm.deb
+    else
+        warn_msg "could not fetch $PVR_PKG from $PVR_REPO (no internet?) — install manually (see §7)"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+section "Realtime scheduling for the render thread (SCHED_FIFO)"
+
+# The renderer boosts its GL thread to SCHED_FIFO (see §4 + breezy-renderer).
+# On kernels with CONFIG_RT_GROUP_SCHED=y under cgroup v2 (the A733 BSP),
+# realtime is denied to every non-root cgroup and cgroup v2 exposes no knob to
+# grant RT bandwidth — so even `chrt -f` as root fails and the file cap is moot.
+# Disabling RT *throttling* globally bypasses the per-group enforcement.
+#
+# GUARDED: applied ONLY when a live probe shows RT is actually blocked.  Boards
+# where setcap alone works (e.g. RK3399, CONFIG_RT_GROUP_SCHED=n) keep their RT
+# throttle intact.  -1 removes throttling system-wide — acceptable for a
+# dedicated appliance with one bounded, CPU-0-pinned RT thread.  The proper fix
+# is a kernel built with CONFIG_RT_GROUP_SCHED=n.  See §4.
+RT_SYSCTL="/etc/sysctl.d/10-breezy-rt.conf"
+if chrt -f 1 true 2>/dev/null; then
+    skip_msg "SCHED_FIFO already available — leaving RT throttle intact"
+elif [[ "$(cat /proc/sys/kernel/sched_rt_runtime_us 2>/dev/null)" == "-1" ]]; then
+    skip_msg "RT throttle already disabled (sched_rt_runtime_us=-1)"
+else
+    echo "kernel.sched_rt_runtime_us = -1" > "$RT_SYSCTL"
+    sysctl -w kernel.sched_rt_runtime_us=-1 >/dev/null 2>&1 || true
+    if chrt -f 1 true 2>/dev/null; then
+        done_msg "RT was blocked (RT_GROUP_SCHED) — disabled RT throttle via $RT_SYSCTL"
+    else
+        rm -f "$RT_SYSCTL"
+        warn_msg "RT still unavailable after sched_rt_runtime_us=-1 — render thread stays at"
+        warn_msg "  normal priority; needs a kernel built with CONFIG_RT_GROUP_SCHED=n"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 section "breezy-renderer kiosk system service (DRM master on tty1)"
 
 # The KMS renderer must take DRM master, which only the active session on seat0
@@ -434,7 +515,33 @@ else
     # cap without perturbing the seat.  Must be re-applied whenever the binary
     # is recopied — hence it runs here, every setup.
     RENDERER_BIN="/home/$APP_USER/.local/bin/displaylink_kms_renderer"
+    RENDERER_DIR="$(dirname "$RENDERER_BIN")"
     if [[ -x "$RENDERER_BIN" ]]; then
+        # Absolute rpath BEFORE setcap.  The cap makes the binary AT_SECURE, so
+        # ld.so ignores $ORIGIN/LD_LIBRARY_PATH — it then can't find its NativeAOT
+        # sibling ZeroKvm.NativeBridge.so, nor (on PowerVR) the PVR Mesa in
+        # /usr/local/lib.  An ABSOLUTE rpath covering both fixes it.  patchelf
+        # rewrites the file and WIPES the file cap, so this must run before setcap.
+        # See docs/hardware/radxa-cubie-a7s.md §4 + §7.
+        if [[ ! -e "$RENDERER_DIR/ZeroKvm.NativeBridge.so" ]]; then
+            warn_msg "ZeroKvm.NativeBridge.so missing from $RENDERER_DIR — renderer won't start under the cap"
+            warn_msg "  copy it from the build tree: .../ZeroKvm.NativeBridge/bin/Release/*/linux-arm64/publish/"
+        fi
+        WANT_RPATH="$RENDERER_DIR:/usr/local/lib"   # /usr/local/lib is harmless (empty) on non-PVR boards
+        if ! command -v patchelf &>/dev/null; then
+            warn_msg "patchelf not found — installing patchelf"
+            pkg_install patchelf || warn_msg "patchelf install failed — cannot set rpath (ZeroKvm + GPU accel may fail under the cap)"
+        fi
+        if command -v patchelf &>/dev/null; then
+            if [[ "$(patchelf --print-rpath "$RENDERER_BIN" 2>/dev/null || true)" != "$WANT_RPATH" ]]; then
+                patchelf --force-rpath --set-rpath "$WANT_RPATH" "$RENDERER_BIN" \
+                    && done_msg "set renderer rpath $WANT_RPATH (ZeroKvm + PVR Mesa under cap)" \
+                    || warn_msg "patchelf --set-rpath failed on $RENDERER_BIN"
+            else
+                skip_msg "renderer rpath already $WANT_RPATH"
+            fi
+        fi
+
         if ! command -v setcap &>/dev/null; then
             warn_msg "setcap not found — installing libcap2-bin"
             pkg_install libcap2-bin || warn_msg "libcap2-bin install failed — render thread stays at normal priority"
@@ -647,6 +754,9 @@ echo "     Add to groups:        usermod -aG video,render,input $APP_USER"
 echo "  2. Fetch vendored deps and build (run as $APP_USER):"
 echo "     cd /home/$APP_USER/breezy-box && make deps && make"
 echo "     cp displaylink_kms_renderer breezy_web ~/.local/bin/"
+echo "     # the renderer's NativeAOT sibling must sit beside it (cap makes \$ORIGIN unusable):"
+echo "     cp modules/ZeroKVM/src/ZeroKvm.NativeBridge/bin/Release/*/linux-arm64/publish/ZeroKvm.NativeBridge.so ~/.local/bin/"
+echo "     # then re-run setup so it sets the absolute rpath + cap, and (A733) installs the PowerVR userspace"
 echo "  3. Trust the self-signed cert on each client:"
 echo "     scp root@breezy.local:/etc/breezy-box/tls/server.crt ."
 echo "     Then import server.crt into your browser / OS trust store."
