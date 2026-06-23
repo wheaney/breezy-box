@@ -150,6 +150,9 @@ struct kms_state {
 	 * device_aspect = device_width/device_height. */
 	float    device_fov_half_v_tan;
 	float    device_aspect;
+	/* Device look-ahead config (KWin lookAheadConfig): [0] constant ms,
+	 * [2] per-scanline ms for rolling-shutter shear.  Refreshed each poll. */
+	float    look_ahead_cfg[4];
 	uint64_t last_config_poll;         /* realtime_ms() of last poll */
 
 	/* GSettings-driven display settings, updated via change signal. */
@@ -557,6 +560,7 @@ static void kms_poll_device_config(struct kms_state *kms,
 		}
 		kms->device_fov_half_v_tan = fov_len.height_unit * 0.5f;
 	}
+	memcpy(kms->look_ahead_cfg, cfg.look_ahead_cfg, sizeof(kms->look_ahead_cfg));
 	kms->device_complete_dist_px = fov_det.complete_dist_px;
 	kms->device_lens_dist_px     = fov_det.lens_distance_px;
 	kms->display_size            = dist_adj;
@@ -1833,9 +1837,6 @@ static void kms_render_frame(struct kms_state *kms,
 	 * The framebuffer/mode aspect is intentionally NOT used here — the reference
 	 * always projects through the device's own aspect ratio.
 	 */
-	es_perspective_unit(&proj, kms->device_fov_half_v_tan, kms->device_aspect,
-	                    KMS_NEAR, KMS_FAR);
-
 	/*
 	 * Smooth follow: advance the state machine, then drive the whole camera from
 	 * the smooth-follow origin while follow is engaged (or still slerping back
@@ -1846,13 +1847,73 @@ static void kms_render_frame(struct kms_state *kms,
 	uint64_t now_ms = kms_realtime_ms();
 	kms_update_smooth_follow(kms, now_ms);
 
+	/*
+	 * Look-ahead + rolling-shutter shear (mirrors CameraController.updateCamera /
+	 * applyLookAhead / applyRollingShutterShear).  Extrapolate the camera
+	 * orientation forward by look_ahead_ms using the angular rate between the last
+	 * two samples, and skew the projection by the per-scanline rate so a fast pan
+	 * doesn't tear the frame.  cq is the current-frame (T0) orientation from the
+	 * same source smooth follow uses (origin while following, else head pose); the
+	 * matching T1 comes from the freshly-read pose.  When no rate is measurable
+	 * (cold start / single sample) es_lookahead_quat collapses to T0 and zero
+	 * shear, matching the un-predicted behaviour.
+	 */
 	ESMatrix view, proj_view;
 	const float *cq = smooth_follow_camera_quat(&kms->sf);
+
+	float yaw_rate_rad = 0.0f, pitch_rate_rad = 0.0f;
 	if (cq) {
-		es_view_from_quat(&view, cq[0], cq[1], cq[2], cq[3]);
+		struct breezy_imu_pose pose;
+		bool use_origin = smooth_follow_use_origin(&kms->sf);
+		float q_t0[4] = { cq[0], cq[1], cq[2], cq[3] };
+		float q_t1[4] = { cq[0], cq[1], cq[2], cq[3] };
+		float elapsed_ms = 0.0f;
+
+		if (breezy_imu_try_get_pose(&pose)) {
+			if (use_origin) {
+				q_t1[0] = pose.sf_prev_quat_w; q_t1[1] = pose.sf_prev_quat_x;
+				q_t1[2] = pose.sf_prev_quat_y; q_t1[3] = pose.sf_prev_quat_z;
+			} else {
+				q_t1[0] = pose.prev_quat_w; q_t1[1] = pose.prev_quat_x;
+				q_t1[2] = pose.prev_quat_y; q_t1[3] = pose.prev_quat_z;
+			}
+			elapsed_ms = pose.elapsed_ms;
+
+			/* lookAheadMS: (override==-1 ? cfg[0] : override) + dataAge. */
+			float override_ms = (float)kms->settings.look_ahead_override;
+			float base_ms = (override_ms < 0.0f) ? kms->look_ahead_cfg[0] : override_ms;
+			float data_age = (pose.timestamp_ms != 0 && now_ms > pose.timestamp_ms)
+			               ? (float)(now_ms - pose.timestamp_ms) : 0.0f;
+			float look_ahead_ms = base_ms + data_age;
+			if (look_ahead_ms < 0.0f) look_ahead_ms = 0.0f;
+
+			float q_ahead[4];
+			es_lookahead_quat(q_t0, q_t1, elapsed_ms, look_ahead_ms,
+			                  q_ahead, &yaw_rate_rad, &pitch_rate_rad);
+			es_view_from_quat(&view, q_ahead[0], q_ahead[1], q_ahead[2], q_ahead[3]);
+		} else {
+			es_view_from_quat(&view, q_t0[0], q_t0[1], q_t0[2], q_t0[3]);
+		}
 	} else {
 		es_load_identity(&view);
 	}
+
+	/*
+	 * Sheared projection: shx/shy from the radian rates × per-scanline look-ahead
+	 * (cfg[2]).  fovHalfHorizontalTangent = fovHalfVerticalTangent × aspect.  With
+	 * zero rates this is identical to es_perspective_unit.
+	 */
+	{
+		float scanline_ms = kms->look_ahead_cfg[2];
+		float fov_h_tan = kms->device_fov_half_v_tan * kms->device_aspect;
+		float shx = (fov_h_tan != 0.0f)
+		          ? (yaw_rate_rad * scanline_ms / fov_h_tan) / 2.0f : 0.0f;
+		float shy = (kms->device_fov_half_v_tan != 0.0f)
+		          ? -(pitch_rate_rad * scanline_ms / kms->device_fov_half_v_tan) / 2.0f : 0.0f;
+		es_perspective_unit_shear(&proj, kms->device_fov_half_v_tan, kms->device_aspect,
+		                          KMS_NEAR, KMS_FAR, shx, shy);
+	}
+
 	/*
 	 * Lens pivot offset: the rotation origin is behind the eye by lensDistancePixels.
 	 * Rotating the lens vector back through R_conj always yields (0, 0, +lens_dist)

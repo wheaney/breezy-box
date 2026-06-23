@@ -35,6 +35,40 @@ void es_perspective_unit(ESMatrix *result,
                          float device_aspect,
                          float nearZ, float farZ);
 
+/*
+ * Sheared variant of es_perspective_unit for rolling-shutter compensation,
+ * mirroring KWin CameraController.applyRollingShutterShear().  shx/shy are the
+ * pre-halved NDC shear coefficients the renderer derives from the head's angular
+ * rates and the per-scanline look-ahead time:
+ *   shx = (yaw_rad   * scanline_ms / fov_half_horizontal_tangent) / 2
+ *   shy = -(pitch_rad * scanline_ms / fov_half_vertical_tangent)  / 2
+ * Passing shx = shy = 0 yields exactly es_perspective_unit.
+ */
+void es_perspective_unit_shear(ESMatrix *result,
+                               float fov_half_vertical_tangent,
+                               float device_aspect,
+                               float nearZ, float farZ,
+                               float shx, float shy);
+
+/*
+ * Look-ahead orientation extrapolation, mirroring KWin CameraController's
+ * ratesOfChange() + applyLookAhead().  Converts the current (T0) and previous
+ * (T1) EUS quaternions to Qt-convention euler angles (intrinsic Y-X-Z, degrees),
+ * measures the per-axis angular rate over elapsed_ms, and extrapolates T0 forward
+ * by look_ahead_ms, writing the result quaternion to out_quat[4] = {w,x,y,z}.
+ *
+ * When elapsed_ms <= 0 (single sample / cold start) there is no measurable rate:
+ * out_quat is set to T0 unchanged and the returned rates are zero, so callers
+ * collapse to the un-predicted behaviour.
+ *
+ * yaw_rate_rad_out / pitch_rate_rad_out receive the yaw/pitch rates in
+ * radians-per-millisecond for the companion shear (may be NULL).
+ */
+void es_lookahead_quat(const float q_t0[4], const float q_t1[4],
+                       float elapsed_ms, float look_ahead_ms,
+                       float out_quat[4],
+                       float *yaw_rate_rad_out, float *pitch_rate_rad_out);
+
 /* Model matrix: Y-rotation by angle, then translation (tx, ty, tz). */
 void es_display_model(ESMatrix *m, float angle, float tx, float ty, float tz);
 

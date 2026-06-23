@@ -131,6 +131,143 @@ void es_perspective_unit(ESMatrix *result,
     result->m[3][2] = (2.0f * farZ * nearZ) * nf;
 }
 
+/*
+ * Rolling-shutter shear, mirroring CameraController.applyRollingShutterShear().
+ * The reference builds the same base projection as es_perspective_unit, then
+ * adds the shear terms into the X and Y rows.  We reproduce it column-major
+ * (m[col][row]) so the literal r<row>c<col> values map to m[col][row].
+ */
+void es_perspective_unit_shear(ESMatrix *result,
+                               float fov_half_vertical_tangent,
+                               float device_aspect,
+                               float nearZ, float farZ,
+                               float shx, float shy)
+{
+    float f  = 1.0f / fov_half_vertical_tangent;
+    float nf = 1.0f / (nearZ - farZ);
+    float m00 = f / device_aspect;
+    float m11 = f;
+    float m22 = (farZ + nearZ) * nf;
+    float m23 = (2.0f * farZ * nearZ) * nf;
+
+    memset(result, 0, sizeof(*result));
+    /*
+     * KWin row/col → our m[col][row].  Reference (row-major) literals:
+     *   r0c0=m00  r0c1=-(shx*m11)/2  r0c2=-shx/2
+     *   r1c1=m11*(1-shy/2)           r1c2=-shy/2
+     *   r2c2=m22  r2c3=m23
+     *   r3c2=-1
+     */
+    result->m[0][0] = m00;                       /* r0c0 */
+    result->m[1][0] = -(shx * m11) / 2.0f;       /* r0c1 */
+    result->m[2][0] = -shx / 2.0f;               /* r0c2 */
+    result->m[1][1] = m11 * (1.0f - shy / 2.0f); /* r1c1 */
+    result->m[2][1] = -shy / 2.0f;               /* r1c2 */
+    result->m[2][2] = m22;                        /* r2c2 */
+    result->m[3][2] = m23;                        /* r2c3 */
+    result->m[2][3] = -1.0f;                      /* r3c2 */
+}
+
+/* ----------------------------------------------------------------
+ * Look-ahead orientation extrapolation
+ *
+ * Reproduces KWin CameraController.ratesOfChange() + applyLookAhead(), which
+ * operate on Qt euler angles.  Qt's QQuaternion::getEulerAngles()/fromEulerAngles()
+ * use intrinsic rotations in yaw(Y) → pitch(X) → roll(Z) order; the two helpers
+ * below mirror Qt 6's exact formulas (including the gimbal-lock branch) so the
+ * extrapolated orientation matches the reference engine.
+ * ---------------------------------------------------------------- */
+
+/* q = {w,x,y,z} (EUS) → euler {pitch_x, yaw_y, roll_z} in degrees, Qt convention. */
+static void dr_quat_to_euler_deg(const float q[4], float *pitch, float *yaw, float *roll)
+{
+    float w = q[0], x = q[1], y = q[2], z = q[3];
+
+    float xx = x * x, xy = x * y, xz = x * z, xw = x * w;
+    float yy = y * y, yz = y * z, yw = y * w;
+    float zz = z * z, zw = z * w;
+
+    /* pitch (X) = asin(2*(xw - yz)), clamped to the valid asin domain. */
+    const float pi      = DR_PI;
+    const float halfpi  = DR_PI * 0.5f;
+    float sinp = 2.0f * (xw - yz);
+    if (sinp >  1.0f) sinp =  1.0f;
+    if (sinp < -1.0f) sinp = -1.0f;
+    float p = asinf(sinp);
+
+    float ya, ro;
+    if (p < halfpi) {
+        if (p > -halfpi) {
+            ya = atan2f(2.0f * (xz + yw), 1.0f - 2.0f * (xx + yy));
+            ro = atan2f(2.0f * (xy + zw), 1.0f - 2.0f * (xx + zz));
+        } else {
+            /* pitch == -90°, gimbal lock: roll defined as 0, yaw absorbs both. */
+            ya = -2.0f * atan2f(x, w);
+            ro = 0.0f;
+        }
+    } else {
+        /* pitch == +90°, gimbal lock. */
+        ya = 2.0f * atan2f(x, w);
+        ro = 0.0f;
+    }
+
+    *pitch = p  * (180.0f / pi);
+    *yaw   = ya * (180.0f / pi);
+    *roll  = ro * (180.0f / pi);
+}
+
+/* euler {pitch_x, yaw_y, roll_z} degrees (Qt convention) → q = {w,x,y,z}. */
+static void dr_euler_deg_to_quat(float pitch, float yaw, float roll, float out[4])
+{
+    const float to_half_rad = (DR_PI / 180.0f) * 0.5f;
+    float cp = cosf(pitch * to_half_rad), sp = sinf(pitch * to_half_rad);
+    float cy = cosf(yaw   * to_half_rad), sy = sinf(yaw   * to_half_rad);
+    float cr = cosf(roll  * to_half_rad), sr = sinf(roll  * to_half_rad);
+
+    /* Qt fromEulerAngles: q = qYaw(Y) * qPitch(X) * qRoll(Z). */
+    out[0] = cy * cp * cr + sy * sp * sr;  /* w */
+    out[1] = cy * sp * cr + sy * cp * sr;  /* x */
+    out[2] = sy * cp * cr - cy * sp * sr;  /* y */
+    out[3] = cy * cp * sr - sy * sp * cr;  /* z */
+}
+
+void es_lookahead_quat(const float q_t0[4], const float q_t1[4],
+                       float elapsed_ms, float look_ahead_ms,
+                       float out_quat[4],
+                       float *yaw_rate_rad_out, float *pitch_rate_rad_out)
+{
+    /* No measurable rate: pass T0 through and report zero rates. */
+    if (!(elapsed_ms > 0.0f)) {
+        out_quat[0] = q_t0[0];
+        out_quat[1] = q_t0[1];
+        out_quat[2] = q_t0[2];
+        out_quat[3] = q_t0[3];
+        if (yaw_rate_rad_out)   *yaw_rate_rad_out   = 0.0f;
+        if (pitch_rate_rad_out) *pitch_rate_rad_out = 0.0f;
+        return;
+    }
+
+    float p0, ya0, ro0, p1, ya1, ro1;
+    dr_quat_to_euler_deg(q_t0, &p0, &ya0, &ro0);
+    dr_quat_to_euler_deg(q_t1, &p1, &ya1, &ro1);
+
+    /* Per-axis rate in degrees/ms (KWin ratesOfChange uses (T0 - T1) / dt). */
+    float pitch_rate = (p0  - p1)  / elapsed_ms;
+    float yaw_rate   = (ya0 - ya1) / elapsed_ms;
+    float roll_rate  = (ro0 - ro1) / elapsed_ms;
+
+    /* applyLookAhead: extrapolate T0's euler forward by look_ahead_ms. */
+    dr_euler_deg_to_quat(p0  + pitch_rate * look_ahead_ms,
+                         ya0 + yaw_rate   * look_ahead_ms,
+                         ro0 + roll_rate  * look_ahead_ms,
+                         out_quat);
+
+    /* Shear consumes the radian rates (applyRollingShutterShear uses rates.yaw/pitch). */
+    const float deg_to_rad = DR_PI / 180.0f;
+    if (yaw_rate_rad_out)   *yaw_rate_rad_out   = yaw_rate   * deg_to_rad;
+    if (pitch_rate_rad_out) *pitch_rate_rad_out = pitch_rate * deg_to_rad;
+}
+
 void es_display_model(ESMatrix *m, float angle, float tx, float ty, float tz)
 {
     float ca = cosf(angle);

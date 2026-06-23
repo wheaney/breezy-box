@@ -28,6 +28,18 @@ struct breezy_imu_pose {
 	bool enabled;
 	bool sf_enabled;
 	float sf_quat_w, sf_quat_x, sf_quat_y, sf_quat_z;
+
+	/*
+	 * Previous-sample orientations (T1) and the elapsed time between T0 and T1,
+	 * for the look-ahead / rolling-shutter shear math that mirrors KWin's
+	 * CameraController.  POSE_ORIENT and SF_ORIGIN are each 4 rows: row 0 = T0
+	 * (the quats above), row 1 = T1 (here), row 3 = per-sample timestamps.  EUS,
+	 * same w/x/y/z convention as the T0 fields.  elapsed_ms is 0 when only one
+	 * sample is available (cold start), which callers must treat as "no rate".
+	 */
+	float prev_quat_w, prev_quat_x, prev_quat_y, prev_quat_z;
+	float sf_prev_quat_w, sf_prev_quat_x, sf_prev_quat_y, sf_prev_quat_z;
+	float elapsed_ms;
 };
 
 /*
@@ -41,6 +53,12 @@ struct breezy_imu_device_config {
 	float    lens_distance_ratio; /* IPD / lens offset ratio */
 	uint8_t  version;             /* protocol version written by the driver */
 	bool     enabled;             /* driver's own enabled flag */
+	/*
+	 * Device look-ahead config, mirroring KWin's lookAheadConfig:
+	 *   [0] constant (default look-ahead ms), [1] multiplier (unused here),
+	 *   [2] per-scanline ms (rolling-shutter shear), [3] reserved.
+	 */
+	float    look_ahead_cfg[4];
 };
 
 /*

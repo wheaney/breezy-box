@@ -193,6 +193,23 @@ static void parse_and_store(void)
 	pose.quat_z = -q[0];
 
 	/*
+	 * Row 1 (T1): the previous-sample orientation, same NWU→EUS conversion as
+	 * row 0.  Row 3 is not a quaternion — it holds per-sample timestamps;
+	 * elapsed time between T0 and T1 is row3[0] - row3[1] (mirrors KWin's
+	 * m_poseTimeElapsedMs).  These feed the look-ahead / shear rate math.
+	 */
+	float qp[4];
+	memcpy(qp, buf + DV_POSE_ORIENT_O + DV_POSE_ORIENT_S * 4, sizeof(qp));
+	pose.prev_quat_w =  qp[3];
+	pose.prev_quat_x = -qp[1];
+	pose.prev_quat_y =  qp[2];
+	pose.prev_quat_z = -qp[0];
+
+	float orient_ts[2];
+	memcpy(orient_ts, buf + DV_POSE_ORIENT_O + DV_POSE_ORIENT_S * 12, sizeof(orient_ts));
+	pose.elapsed_ms = orient_ts[0] - orient_ts[1];
+
+	/*
 	 * Smooth-follow origin: SF_ORIGIN_DATA is 16 floats (4×4) like POSE_ORIENT;
 	 * only row 0 is the quaternion [x, y, z, w] in NWU.  Convert to EUS exactly
 	 * as the pose quaternion above (w unchanged, x = -y_nwu, y = z_nwu,
@@ -207,6 +224,14 @@ static void parse_and_store(void)
 	pose.sf_quat_y =  sfq[2];
 	pose.sf_quat_z = -sfq[0];
 
+	/* SF_ORIGIN row 1 (T1) — same layout as POSE_ORIENT; shares pose.elapsed_ms. */
+	float sfqp[4];
+	memcpy(sfqp, buf + DV_SF_ORIGIN_DATA_O + DV_SF_ORIGIN_DATA_S * 4, sizeof(sfqp));
+	pose.sf_prev_quat_w =  sfqp[3];
+	pose.sf_prev_quat_x = -sfqp[1];
+	pose.sf_prev_quat_y =  sfqp[2];
+	pose.sf_prev_quat_z = -sfqp[0];
+
 	/* Device config — relatively static, parsed alongside every pose update. */
 	struct breezy_imu_device_config config;
 	config.version = buf[DV_VERSION_O];
@@ -219,6 +244,7 @@ static void parse_and_store(void)
 
 	memcpy(&config.diagonal_fov_deg,    buf + DV_DISPLAY_FOV_O,      sizeof(float));
 	memcpy(&config.lens_distance_ratio, buf + DV_LENS_DIST_RATIO_O,  sizeof(float));
+	memcpy(config.look_ahead_cfg,       buf + DV_LOOK_AHEAD_CFG_O,   sizeof(config.look_ahead_cfg));
 
 	pthread_mutex_lock(&g_pose_mutex);
 	g_pose   = pose;
