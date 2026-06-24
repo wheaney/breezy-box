@@ -74,6 +74,20 @@ warn_msg()  { echo "  warn: $*"; }
 # owns the interfaces.
 nm_active() { systemctl is-active --quiet NetworkManager 2>/dev/null; }
 
+# True when NetworkManager is actually MANAGING the given interface — not merely
+# running.  On Armbian/netplan images NM and systemd-networkd are both active, but
+# netplan steers the wired port to networkd and NM reports it "unmanaged"; a
+# global `nm_active` test would then wrongly write an inert NM keyfile for a
+# device NM doesn't own.  Key the wired-link branch on this per-iface check.
+nm_manages_iface() {
+    local iface="$1" state
+    nm_active || return 1
+    state="$(nmcli -t -f GENERAL.STATE device show "$iface" 2>/dev/null)"
+    # GENERAL.STATE is like "10 (unmanaged)" / "100 (connected)"; anything that
+    # contains "unmanaged" (or is empty/absent) means NM is not the owner.
+    [[ -n "$state" && "$state" != *unmanaged* ]]
+}
+
 # Echo the first physical wired Ethernet interface that is not the OTG gadget
 # netdev and not wireless, or nothing if none is found.  Criteria mirror
 # detect_wired_eth_iface() in displaylink_kms_renderer.c.  Used by both the
@@ -427,7 +441,7 @@ ETH_IFACE="$(detect_wired_eth_iface || true)"
 
 if [[ -z "$ETH_IFACE" ]]; then
     echo "  skip: no wired Ethernet interface found — plug it in and re-run if needed"
-elif nm_active; then
+elif nm_manages_iface "$ETH_IFACE"; then
     # NetworkManager owns the wired interface, so a systemd-networkd profile for
     # it is inert (NM keeps the device and applies no static IP / DHCP).  Write
     # an NM keyfile instead: static 192.168.77.2/30 with ipv4.method=shared so
@@ -475,11 +489,23 @@ method=ignore"
         skip_msg "$ETH_NM_DST already up to date"
     fi
 else
-    # No NetworkManager — use systemd-networkd's built-in DHCP server.
+    # NM is either not running, or running but does NOT manage this iface (the
+    # Armbian/netplan case: NM marks the wired port "unmanaged" and networkd owns
+    # it).  Either way, drive it with systemd-networkd's built-in DHCP server.
     # Prefix with 05- so this file sorts before netplan's generated
     # 10-netplan-all-eth-interfaces.network, which otherwise wins and leaves
     # the interface with no static IP and no DHCPServer.
     ETH_NET_DST="/etc/systemd/network/05-breezy-${ETH_IFACE}.network"
+
+    # Drop any inert NM keyfile from an earlier run that took the NM branch (e.g.
+    # before nm_manages_iface() existed, when a global nm_active test wrote a
+    # keyfile NM never applied).  Leaving it risks the two stacks fighting.
+    ETH_NM_OLD="/etc/NetworkManager/system-connections/breezy-${ETH_IFACE}.nmconnection"
+    if [[ -f "$ETH_NM_OLD" ]]; then
+        rm -f "$ETH_NM_OLD"
+        done_msg "removed inert NM keyfile $ETH_NM_OLD"
+        nmcli connection reload 2>/dev/null || true
+    fi
 
     # Remove any old unprefixed file left by a previous run of setup_system.sh.
     OLD_ETH_NET_DST="/etc/systemd/network/breezy-${ETH_IFACE}.network"
