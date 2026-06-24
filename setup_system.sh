@@ -1040,7 +1040,9 @@ else
     if [[ -f "$CONFIG_DST" ]]; then
         skip_msg "$CONFIG_DST already exists (not overwriting)"
     else
-        install -o "$APP_USER" -g "$APP_USER" -m 0644 -D \
+        install -o "$APP_USER" -g "$APP_USER" -m 0755 -d \
+            "$(dirname "$CONFIG_DST")"
+        install -o "$APP_USER" -g "$APP_USER" -m 0644 \
             "$CONFIG_DEFAULT_SRC" "$CONFIG_DST"
         done_msg "installed default config: $CONFIG_DST (3× 1080p@30)"
     fi
