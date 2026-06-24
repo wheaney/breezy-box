@@ -206,6 +206,11 @@ struct kms_state {
 
 	/* Overlay: GL texture for connection-status messages; text from breezy_state. */
 	struct overlay_text overlay_tex;
+	/* Cached overlay world-space position (updated after each display loop so the
+	 * overlay can be rendered before displays to be depth-occluded by them). */
+	float overlay_x_px;
+	float overlay_y_px;
+	bool  overlay_pos_valid;
 
 	/* Back-pointer to the long-lived app state (not owned by the renderer). */
 	struct breezy_state *state;
@@ -1931,9 +1936,34 @@ static void kms_render_frame(struct kms_state *kms,
 	kms_step_zoom_eases(kms, now_ms);
 
 	/*
+	 * Render the overlay first using the position cached from the previous frame.
+	 * Displays drawn afterwards with GL_LEQUAL overwrite it wherever they overlap,
+	 * so the overlay is naturally depth-occluded without any special depth trick.
+	 * The one-frame position lag is imperceptible.
+	 */
+	if (kms->overlay_tex.tex && kms->overlay_pos_valid) {
+		float ot_scale  = kms->meshes_computed ? kms->display_size : 1.0f;
+		float ot_w_half = (float)kms->overlay_tex.tex_w * 0.5f * ot_scale;
+		float ot_h_half = (float)kms->overlay_tex.tex_h * 0.5f * ot_scale;
+
+		es_display_model(&model, 0.0f, kms->overlay_x_px, kms->overlay_y_px,
+		                 -kms->device_complete_dist_px);
+		es_multiply(&mvp, &model, &proj_view);
+
+		glEnable(GL_DEPTH_TEST);
+		glDepthFunc(GL_LEQUAL);
+		glDepthMask(GL_TRUE);
+		glEnable(GL_BLEND);
+		glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+		display_renderer_draw_quad_alpha(&kms->dr, &mvp,
+						 kms->overlay_tex.tex,
+						 ot_w_half, ot_h_half);
+		glDisable(GL_BLEND);
+	}
+
+	/*
 	 * Display meshes are opaque: depth-test so a nearer (e.g. focused/zoomed-in)
-	 * display occludes a farther one regardless of draw order.  The blended
-	 * overlay strip below re-disables depth before compositing.
+	 * display occludes a farther one regardless of draw order.
 	 */
 	glEnable(GL_DEPTH_TEST);
 	glDepthFunc(GL_LEQUAL);
@@ -1962,6 +1992,7 @@ static void kms_render_frame(struct kms_state *kms,
 	float min_x_px  = 0.0f;
 	float max_x_px  = 0.0f;
 	bool  first_ext = true;
+	bool  first_top = true;
 	float arc_r_px  = kms->device_complete_dist_px;
 
 	/*
@@ -2051,12 +2082,17 @@ static void kms_render_frame(struct kms_state *kms,
 			float h_half  = (float)server->opts.devices[i].decode_height * 0.5f * kms->display_size;
 			float left_x  = kms->placements[i].cnx - w_half;
 			float right_x = kms->placements[i].cnx + w_half;
-			float quad_top = kms->placements[i].cny + h_half;
+			/* For vertical stacking (ang_x != 0), the GL Y centre of the quad
+			 * is -sin(ang_x)*cnz after the X-axis arc rotation; cny is 0. */
+			float center_y = (ang_x != 0.0f)
+			               ? -sinf(ang_x) * kms->placements[i].cnz
+			               : kms->placements[i].cny;
+			float quad_top = center_y + h_half;
 			if (server->opts.verbose)
 				printf("kms_overlay: slot=%zu cnx=%.0f w=%.0f left=%.0f right=%.0f\n",
 				       i, kms->placements[i].cnx, w_half*2.0f, left_x, right_x);
-			if (quad_top > top_y_px)
-				top_y_px = quad_top;
+			if (first_top || quad_top > top_y_px) top_y_px = quad_top;
+			first_top = false;
 			if (first_ext || left_x  < min_x_px) min_x_px = left_x;
 			if (first_ext || right_x > max_x_px) max_x_px = right_x;
 			first_ext = false;
@@ -2070,7 +2106,8 @@ static void kms_render_frame(struct kms_state *kms,
 			es_multiply(&mvp, &model, &proj_view);
 			display_renderer_draw_quad(&kms->dr, &mvp, tex, w_half, h_half);
 
-			if (h_half > top_y_px) top_y_px = h_half;
+			if (first_top || h_half > top_y_px) top_y_px = h_half;
+			first_top = false;
 		}
 	}
 
@@ -2087,47 +2124,34 @@ static void kms_render_frame(struct kms_state *kms,
 
 	/* Midpoint of the combined left-edge to right-edge span. */
 	float center_x_px = first_ext ? 0.0f : (min_x_px + max_x_px) * 0.5f;
-	{
-		static size_t last_visible = SIZE_MAX;
-		static float  last_cx = 0.0f;
-		if (visible_count != last_visible || center_x_px != last_cx) {
-			if (server->opts.verbose)
-				printf("kms_overlay: visible=%zu meshes=%d "
-				       "min_x=%.0f max_x=%.0f center_x=%.0f top_y=%.0f\n",
-				       visible_count, (int)kms->meshes_computed,
-				       min_x_px, max_x_px, center_x_px, top_y_px);
-			last_visible = visible_count;
-			last_cx = center_x_px;
-		}
-	}
 
-	/* ---- Overlay info strip above the display group ---- */
+	/* Update cached overlay position for the next frame. */
 	if (kms->overlay_tex.tex) {
 		float ot_scale  = kms->meshes_computed ? kms->display_size : 1.0f;
-		float ot_w_half = (float)kms->overlay_tex.tex_w * 0.5f * ot_scale;
 		float ot_h_half = (float)kms->overlay_tex.tex_h * 0.5f * ot_scale;
-		float gap_px    = ot_h_half;                       /* one text-height gap */
+		float gap_px    = ot_h_half;
 		float ot_y      = top_y_px + gap_px + ot_h_half;
+		float ot_x      = kms->meshes_computed ? center_x_px : 0.0f;
 
-		if (kms->meshes_computed) {
-			/* Place at arc radius, horizontally centred over the display group. */
-			es_display_model(&model, 0.0f, center_x_px, ot_y, -arc_r_px);
-		} else {
-			es_display_model(&model, 0.0f, 0.0f, ot_y, -arc_r_px);
+		if (server->opts.verbose) {
+			static size_t last_visible = SIZE_MAX;
+			static float  last_cx = 0.0f, last_ty = 0.0f;
+			if (visible_count != last_visible || ot_x != last_cx || ot_y != last_ty) {
+				printf("kms_overlay: visible=%zu meshes=%d "
+				       "min_x=%.0f max_x=%.0f center_x=%.0f top_y=%.0f ot_y=%.0f\n",
+				       visible_count, (int)kms->meshes_computed,
+				       min_x_px, max_x_px, center_x_px, top_y_px, ot_y);
+				last_visible = visible_count;
+				last_cx = ot_x;
+				last_ty = ot_y;
+			}
 		}
-		es_multiply(&mvp, &model, &proj_view);
 
-		/* HUD label: composite over the scene without depth occlusion. */
-		glDisable(GL_DEPTH_TEST);
-		glEnable(GL_BLEND);
-		glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-		display_renderer_draw_quad_alpha(&kms->dr, &mvp,
-						 kms->overlay_tex.tex,
-						 ot_w_half, ot_h_half);
-		glDisable(GL_BLEND);
+		kms->overlay_x_px    = ot_x;
+		kms->overlay_y_px    = ot_y;
+		kms->overlay_pos_valid = true;
 	}
 
-	/* Leave depth test disabled for the next frame's overlay-only path. */
 	glDisable(GL_DEPTH_TEST);
 }
 
