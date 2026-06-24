@@ -53,6 +53,8 @@ ExecStart=/home/__APP_USER__/.local/bin/displaylink_kms_renderer
 # leave the screen black.  The start-limit (in [Unit]) prevents a hot loop.
 Restart=always
 RestartSec=2
+# Force-kill if SIGTERM doesn't land within 5 s (e.g. blocked in GL/DRM call).
+TimeoutStopSec=5
 UtmpIdentifier=tty1
 UtmpMode=user
 

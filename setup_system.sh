@@ -492,6 +492,9 @@ fi
 if [[ ! -f "$RENDERER_SVC_SRC" ]]; then
     echo "  warn: $RENDERER_SVC_SRC not found, skipping renderer service install"
 else
+    # Stop the renderer before patchelf/setcap modify the binary on disk.
+    systemctl stop --wait breezy-renderer.service 2>/dev/null || true
+
     # Substitute the app user into the unit's __APP_USER__ placeholders.
     RENDERER_SVC_TMP="$(mktemp)"
     sed "s/__APP_USER__/$APP_USER/g" "$RENDERER_SVC_SRC" > "$RENDERER_SVC_TMP"
@@ -567,8 +570,7 @@ else
         systemctl enable breezy-renderer.service
         done_msg "enabled breezy-renderer.service"
     fi
-    # Start now (takes over tty1 from getty).
-    systemctl restart breezy-renderer.service 2>/dev/null \
+    systemctl start breezy-renderer.service 2>/dev/null \
         && done_msg "started breezy-renderer.service" \
         || echo "  warn: breezy-renderer.service failed to start — check: journalctl -u breezy-renderer"
 fi
