@@ -36,6 +36,7 @@
 #include <unistd.h>
 
 #include <json-c/json.h>
+#include <json-c/json_util.h>
 #include <sys/types.h>
 
 #define DEFAULT_HTTP_LISTEN    "http://0.0.0.0:80"
@@ -436,6 +437,7 @@ static void handle_monitors_post(struct mg_connection *c, struct mg_http_message
 
 	char config_path[PATH_MAX];
 	resolve_config_path(config_path, sizeof(config_path));
+	fprintf(stderr, "breezy_web: monitors config path: %s\n", config_path);
 
 	struct json_object *root = json_object_from_file(config_path);
 	if (!root) {
@@ -484,6 +486,8 @@ static void handle_monitors_post(struct mg_connection *c, struct mg_http_message
 	if (json_object_to_file_ext(tmp, root,
 	                            JSON_C_TO_STRING_PRETTY |
 	                            JSON_C_TO_STRING_SPACED) != 0) {
+		fprintf(stderr, "breezy_web: json_object_to_file_ext(%s) failed: %s (errno: %s)\n",
+		        tmp, json_util_get_last_err(), strerror(errno));
 		json_object_put(root);
 		mg_http_reply(c, 500, "Content-Type: application/json\r\n",
 		              "{\"error\":\"failed to write config\"}\n");
