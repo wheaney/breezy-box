@@ -27,19 +27,32 @@ required for the current session.
 Options:
   --app-user USER    User that will run the KMS app (default: the user that
                      invoked sudo).  No user is created.
+  --no-wlan          Skip Wi-Fi setup entirely (do not prompt for SSID/password).
+  --reset-wlan       Force the Wi-Fi setup to run again even if a connection is
+                     already configured (prompts for SSID/password anew).
   -h, --help         Show this help and exit.
+
+Wi-Fi is configured BEFORE any wired-network changes so that, when this script
+is run over an SSH session arriving on the Ethernet port, it can bring up
+wireless first and then abort safely — reconfiguring the wired link would
+otherwise drop that very session.  Run again over Wi-Fi (or a local console)
+to finish.
 EOF
 }
 
 # Default to the user that invoked sudo (the human running this script), not a
 # hardcoded name.  Falls back to logname/USER if SUDO_USER is unset.
 APP_USER="${SUDO_USER:-$(logname 2>/dev/null || echo "${USER:-root}")}"
+NO_WLAN=0
+RESET_WLAN=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --app-user)
             [[ $# -lt 2 ]] && { echo "error: --app-user requires a value" >&2; exit 1; }
             APP_USER="$2"; shift 2 ;;
+        --no-wlan)    NO_WLAN=1; shift ;;
+        --reset-wlan) RESET_WLAN=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "error: unknown argument: $1" >&2; usage >&2; exit 1 ;;
     esac
@@ -56,20 +69,28 @@ done_msg()  { echo "  done: $*"; }
 skip_msg()  { echo "  skip: $* (already configured)"; }
 warn_msg()  { echo "  warn: $*"; }
 
-# Install one or more packages via apt (Armbian/Debian).
-pkg_install() {
-    if command -v apt-get &>/dev/null; then
-        apt-get update -qq && apt-get install -y "$@"
-    else
-        warn_msg "apt-get not found — install manually: $*"
-        return 1
-    fi
-}
-
 # True when NetworkManager is the active network stack.  The wired-link and
 # port-redirect sections branch on this: networkd profiles are inert when NM
 # owns the interfaces.
 nm_active() { systemctl is-active --quiet NetworkManager 2>/dev/null; }
+
+# Echo the first physical wired Ethernet interface that is not the OTG gadget
+# netdev and not wireless, or nothing if none is found.  Criteria mirror
+# detect_wired_eth_iface() in displaylink_kms_renderer.c.  Used by both the
+# SSH-over-Ethernet guard and the wired-link section.
+detect_wired_eth_iface() {
+    local iface
+    for iface in $(ls /sys/class/net/ 2>/dev/null | sort); do
+        [[ "${#iface}" -ge 16 ]]                  && continue   # IFNAMSIZ safety
+        [[ "$iface" == "lo" ]]                    && continue
+        [[ "$iface" == "usb0" ]]                  && continue
+        [[ -d "/sys/class/net/$iface/wireless" ]] && continue
+        [[ ! -e "/sys/class/net/$iface/device" ]] && continue
+        echo "$iface"
+        return 0
+    done
+    return 1
+}
 
 # True when the GPU is an Imagination PowerVR (img,gpu / pvrsrvkm) — the Allwinner
 # A733 case.  Mali/Panfrost boards (e.g. RK3399) return false so they never pull
@@ -79,6 +100,54 @@ is_powervr() {
         || [[ -e /sys/module/pvrsrvkm ]] \
         || grep -qsw pvrsrvkm /proc/modules 2>/dev/null
 }
+
+# ---------------------------------------------------------------------------
+section "Required packages (preflight)"
+
+# This script installs NOTHING.  Every package it (and the breezy-box runtime)
+# needs must be present up front, or we fail here with the exact apt line to
+# run.  Failing fast beats half-configuring the box and then dying mid-network.
+#
+# Each entry is "command:package" — we check the command and, if missing, add
+# the package to the install hint.  A few deps are services with no single
+# probe command (dnsmasq's daemon, avahi), so they are checked by package.
+MISSING_PKGS=()
+
+# Tools the setup script invokes directly.
+require_cmd() {
+    local cmd="$1" pkg="$2"
+    command -v "$cmd" &>/dev/null || MISSING_PKGS+=("$pkg")
+}
+
+require_cmd nmcli      network-manager   # Wi-Fi setup + NM-owned wired link
+require_cmd ip         iproute2          # routing / SSH-iface detection
+require_cmd curl       curl              # connectivity check + PowerVR blob fetch
+require_cmd ping       iputils-ping      # connectivity check fallback
+require_cmd openssl    openssl           # self-signed TLS cert for breezy-web
+require_cmd nft        nftables          # :80/:443 -> :8081/:8443 redirects
+require_cmd patchelf   patchelf          # absolute rpath on the renderer binary
+require_cmd setcap     libcap2-bin       # cap_sys_nice for the SCHED_FIFO thread
+require_cmd zcat       gzip              # decompress the PowerVR Packages.gz index
+
+# Runtime services with no convenient single-command probe: check the binary the
+# breezy runtime spawns.  avahi-publish-address (avahi-utils) + the daemon
+# (avahi-daemon) back mDNS; dnsmasq serves DHCP on the direct links.
+command -v avahi-publish-address &>/dev/null || MISSING_PKGS+=(avahi-utils avahi-daemon)
+command -v dnsmasq               &>/dev/null || MISSING_PKGS+=(dnsmasq)
+
+if [[ "${#MISSING_PKGS[@]}" -gt 0 ]]; then
+    # De-dupe while preserving a stable order.
+    readarray -t MISSING_PKGS < <(printf '%s\n' "${MISSING_PKGS[@]}" | awk '!seen[$0]++')
+    echo "  error: required packages are missing." >&2
+    echo >&2
+    echo "  Install them first, then re-run this script:" >&2
+    echo >&2
+    echo "      sudo apt update" >&2
+    echo "      sudo apt install -y ${MISSING_PKGS[*]}" >&2
+    echo >&2
+    exit 1
+fi
+done_msg "all required packages present"
 
 # ---------------------------------------------------------------------------
 section "Kernel modules for USB gadget"
@@ -114,6 +183,153 @@ if ! mountpoint -q /sys/kernel/config 2>/dev/null; then
     done_msg "mounted configfs now"
 else
     skip_msg "configfs already mounted"
+fi
+
+# ---------------------------------------------------------------------------
+section "Wi-Fi (wireless internet uplink)"
+
+# Configure wireless BEFORE any wired-network changes.  Rationale: this script
+# reconfigures the Ethernet port into a direct host link, which drops a regular
+# LAN uplink on it.  If the operator is SSH'd in over that wired port, bringing
+# up Wi-Fi first gives them a way back in; the SSH-over-Ethernet guard below
+# then aborts so the wired reconfig never kills the live session.
+#
+# Skipped entirely with --no-wlan.  --reset-wlan forces a fresh prompt even when
+# a connection already exists.  Currently NetworkManager-only (nmcli); on a
+# networkd/wpa_supplicant box we warn and leave Wi-Fi to the operator.
+
+# Echo the first wireless interface name, or nothing.
+detect_wlan_iface() {
+    local iface
+    for iface in $(ls /sys/class/net/ 2>/dev/null | sort); do
+        [[ -d "/sys/class/net/$iface/wireless" ]] && { echo "$iface"; return 0; }
+    done
+    return 1
+}
+
+# True when we have a usable default route AND can resolve/reach the internet.
+# Used to verify the Wi-Fi actually came up before we proceed to wired changes.
+have_internet() {
+    # A default route is necessary but not sufficient; confirm reachability.
+    ip route show default 2>/dev/null | grep -q . || return 1
+    # Prefer a quick TCP/HTTP check (works where ICMP is filtered); fall back to ping.
+    if command -v curl &>/dev/null; then
+        curl -fsS --max-time 5 -o /dev/null https://1.1.1.1 2>/dev/null && return 0
+    fi
+    ping -c1 -W3 1.1.1.1 &>/dev/null
+}
+
+WLAN_IFACE="$(detect_wlan_iface || true)"
+
+if [[ "$NO_WLAN" -eq 1 ]]; then
+    skip_msg "Wi-Fi setup (--no-wlan)"
+elif [[ -z "$WLAN_IFACE" ]]; then
+    warn_msg "no wireless interface found — skipping Wi-Fi setup"
+elif ! nm_active; then
+    warn_msg "NetworkManager is not active — automated Wi-Fi setup unsupported here"
+    warn_msg "  configure wpa_supplicant/networkd manually, or run with --no-wlan to silence this"
+else
+    # Is a Wi-Fi connection already configured/active?
+    WIFI_ACTIVE_SSID="$(nmcli -t -f ACTIVE,SSID dev wifi 2>/dev/null \
+                          | awk -F: '$1=="yes"{print $2; exit}')"
+    HAVE_WIFI_PROFILE="$(nmcli -t -f TYPE connection show 2>/dev/null \
+                          | grep -qx '802-11-wireless' && echo 1 || echo 0)"
+
+    if [[ "$RESET_WLAN" -ne 1 && ( -n "$WIFI_ACTIVE_SSID" || "$HAVE_WIFI_PROFILE" -eq 1 ) ]]; then
+        skip_msg "Wi-Fi already configured (${WIFI_ACTIVE_SSID:-saved profile}); use --reset-wlan to redo"
+    else
+        # Prompt for credentials.  Read from the controlling terminal so this
+        # works even when the script's stdin is a pipe (curl | sudo bash).
+        if [[ ! -t 0 && ! -e /dev/tty ]]; then
+            warn_msg "no terminal available to prompt for Wi-Fi credentials — skipping"
+            warn_msg "  run interactively, pass credentials via 'nmcli dev wifi connect' first, or use --no-wlan"
+        else
+            echo "  Enter Wi-Fi credentials for the wireless internet uplink (interface: $WLAN_IFACE)."
+            echo "  Leave SSID blank to skip Wi-Fi setup."
+            read -r -p "  SSID: " WIFI_SSID < /dev/tty
+            if [[ -z "$WIFI_SSID" ]]; then
+                skip_msg "Wi-Fi setup (no SSID entered)"
+            else
+                read -r -s -p "  Password (blank for open network): " WIFI_PSK < /dev/tty
+                echo
+                # Make sure the radio is on and rescan so the SSID is visible.
+                nmcli radio wifi on 2>/dev/null || true
+                nmcli dev wifi rescan 2>/dev/null || true
+                sleep 2
+
+                if [[ -n "$WIFI_PSK" ]]; then
+                    nmcli dev wifi connect "$WIFI_SSID" password "$WIFI_PSK" ifname "$WLAN_IFACE" 2>&1 \
+                        | sed 's/^/    /' || true
+                else
+                    nmcli dev wifi connect "$WIFI_SSID" ifname "$WLAN_IFACE" 2>&1 \
+                        | sed 's/^/    /' || true
+                fi
+                unset WIFI_PSK   # don't leave the secret in the environment
+
+                # Verify: poll for internet for up to ~30s (DHCP + association
+                # can take a few seconds).  We REFUSE to proceed to the wired
+                # reconfig until Wi-Fi is genuinely up, per the design.
+                echo "  Verifying wireless connectivity..."
+                wlan_ok=0
+                for _ in $(seq 1 15); do
+                    if have_internet; then wlan_ok=1; break; fi
+                    sleep 2
+                done
+
+                if [[ "$wlan_ok" -eq 1 ]]; then
+                    done_msg "Wi-Fi connected to '$WIFI_SSID' with internet access"
+                else
+                    warn_msg "Wi-Fi did NOT come up with internet access after connecting to '$WIFI_SSID'"
+                    warn_msg "  check the password/SSID and signal, then re-run with --reset-wlan"
+                    warn_msg "  ABORTING before any wired-network change so internet/SSH stays intact"
+                    exit 1
+                fi
+            fi
+        fi
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+section "SSH-over-Ethernet safety guard"
+
+# The wired-network sections below reconfigure the Ethernet port into a direct
+# host link (static 192.168.77.2/30 + DHCP server / NM shared).  If THIS script
+# is being run from an SSH session that arrives over that very wired interface,
+# applying those changes would drop the connection mid-run and leave the box
+# half-configured.  So: if we can prove the active SSH client is reaching us via
+# the wired Ethernet iface, abort here (Wi-Fi is already up by now, so there is
+# a way back in).  SSH over Wi-Fi, or a local TTY, proceeds normally.
+
+ssh_session_iface() {
+    # SSH_CONNECTION = "<client_ip> <client_port> <server_ip> <server_port>".
+    # Resolve which local interface owns the route back to the client IP.
+    [[ -z "${SSH_CONNECTION:-}" ]] && return 1
+    local client_ip dev
+    client_ip="$(awk '{print $1}' <<< "$SSH_CONNECTION")"
+    [[ -z "$client_ip" ]] && return 1
+    dev="$(ip route get "$client_ip" 2>/dev/null | grep -oE 'dev [^ ]+' | awk '{print $2}' | head -n1)"
+    [[ -n "$dev" ]] && echo "$dev"
+}
+
+GUARD_ETH_IFACE="$(detect_wired_eth_iface || true)"
+SSH_IFACE="$(ssh_session_iface || true)"
+
+if [[ -z "${SSH_CONNECTION:-}" ]]; then
+    skip_msg "not an SSH session (local console) — wired reconfig is safe"
+elif [[ -z "$SSH_IFACE" ]]; then
+    warn_msg "could not determine the SSH session's interface — proceeding (assuming not wired)"
+elif [[ -n "$GUARD_ETH_IFACE" && "$SSH_IFACE" == "$GUARD_ETH_IFACE" ]]; then
+    echo
+    echo "  ABORT: this SSH session is arriving over the wired Ethernet port ($SSH_IFACE)."
+    echo "  The wired-network setup that follows would reconfigure $SSH_IFACE into a"
+    echo "  direct host link (192.168.77.2/30) and DROP this connection."
+    echo
+    echo "  Wi-Fi has been configured above. Reconnect over Wi-Fi (or via breezy.local /"
+    echo "  the OTG USB link) and run setup_system.sh again to finish the wired setup."
+    echo
+    exit 1
+else
+    skip_msg "SSH session is on '$SSH_IFACE' (not the wired port) — wired reconfig is safe"
 fi
 
 # ---------------------------------------------------------------------------
@@ -160,16 +376,11 @@ section "systemd-networkd profile for direct Ethernet link"
 # NOTE: this assumes the SBC's Ethernet port is used solely for the direct
 # host connection.  Do not run setup_system.sh while it is also serving as
 # a regular LAN uplink.
-ETH_IFACE=""
-for iface in $(ls /sys/class/net/ 2>/dev/null | sort); do
-    [[ "${#iface}" -ge 16 ]]           && continue   # IFNAMSIZ safety
-    [[ "$iface" == "lo" ]]             && continue
-    [[ "$iface" == "usb0" ]]           && continue
-    [[ -d "/sys/class/net/$iface/wireless" ]] && continue
-    [[ ! -e "/sys/class/net/$iface/device" ]] && continue
-    ETH_IFACE="$iface"
-    break
-done
+#
+# To avoid killing the very session that runs this script, the WLAN-setup and
+# SSH-over-Ethernet guard sections above abort before we reach here when the
+# operator is connected via the wired port (see those sections).
+ETH_IFACE="$(detect_wired_eth_iface || true)"
 
 if [[ -z "$ETH_IFACE" ]]; then
     echo "  skip: no wired Ethernet interface found — plug it in and re-run if needed"
@@ -531,34 +742,23 @@ else
             warn_msg "  copy it from the build tree: .../ZeroKvm.NativeBridge/bin/Release/*/linux-arm64/publish/"
         fi
         WANT_RPATH="$RENDERER_DIR:/usr/local/lib"   # /usr/local/lib is harmless (empty) on non-PVR boards
-        if ! command -v patchelf &>/dev/null; then
-            warn_msg "patchelf not found — installing patchelf"
-            pkg_install patchelf || warn_msg "patchelf install failed — cannot set rpath (ZeroKvm + GPU accel may fail under the cap)"
-        fi
-        if command -v patchelf &>/dev/null; then
-            if [[ "$(patchelf --print-rpath "$RENDERER_BIN" 2>/dev/null || true)" != "$WANT_RPATH" ]]; then
-                patchelf --force-rpath --set-rpath "$WANT_RPATH" "$RENDERER_BIN" \
-                    && done_msg "set renderer rpath $WANT_RPATH (ZeroKvm + PVR Mesa under cap)" \
-                    || warn_msg "patchelf --set-rpath failed on $RENDERER_BIN"
-            else
-                skip_msg "renderer rpath already $WANT_RPATH"
-            fi
+        # patchelf is guaranteed present by the preflight check.
+        if [[ "$(patchelf --print-rpath "$RENDERER_BIN" 2>/dev/null || true)" != "$WANT_RPATH" ]]; then
+            patchelf --force-rpath --set-rpath "$WANT_RPATH" "$RENDERER_BIN" \
+                && done_msg "set renderer rpath $WANT_RPATH (ZeroKvm + PVR Mesa under cap)" \
+                || warn_msg "patchelf --set-rpath failed on $RENDERER_BIN"
+        else
+            skip_msg "renderer rpath already $WANT_RPATH"
         fi
 
-        if ! command -v setcap &>/dev/null; then
-            warn_msg "setcap not found — installing libcap2-bin"
-            pkg_install libcap2-bin || warn_msg "libcap2-bin install failed — render thread stays at normal priority"
-        fi
-        if command -v setcap &>/dev/null; then
-            # Capture stderr: the common failure is $HOME on a nosuid mount or a
-            # filesystem without xattr support, and the reason matters.
-            setcap_err="$(setcap cap_sys_nice+ep "$RENDERER_BIN" 2>&1)"
-            if [[ $? -eq 0 ]]; then
-                done_msg "granted cap_sys_nice to $RENDERER_BIN (SCHED_FIFO render thread)"
-            else
-                warn_msg "setcap on $RENDERER_BIN failed (${setcap_err:-unknown}) — render thread stays at normal priority"
-                warn_msg "  if the fs lacks xattr/is nosuid, install the binary to /usr/local/bin instead"
-            fi
+        # setcap is guaranteed present by the preflight check.  Capture stderr:
+        # the common failure is $HOME on a nosuid mount or a filesystem without
+        # xattr support, and the reason matters.
+        if setcap_err="$(setcap cap_sys_nice+ep "$RENDERER_BIN" 2>&1)"; then
+            done_msg "granted cap_sys_nice to $RENDERER_BIN (SCHED_FIFO render thread)"
+        else
+            warn_msg "setcap on $RENDERER_BIN failed (${setcap_err:-unknown}) — render thread stays at normal priority"
+            warn_msg "  if the fs lacks xattr/is nosuid, install the binary to /usr/local/bin instead"
         fi
     else
         warn_msg "renderer binary not found at $RENDERER_BIN — build+copy it, then re-run setup to grant cap_sys_nice"
@@ -700,14 +900,8 @@ section "Port 80 -> 8081 and 443 -> 8443 redirects (breezy-web)"
 # only reachable on :8443 — hitting https://<box> (port 443) gets no answer.
 NFT_RULE_MARKER="# breezy-box: redirect ports 80->8081 and 443->8443"
 
-# If neither redirect tool is present, install nftables so the rule below can
-# apply.  (A silent skip here is exactly why the redirect never took on the
-# Cubie image, which ships without nft or iptables.)
-if ! command -v nft &>/dev/null && ! command -v iptables &>/dev/null; then
-    warn_msg "no nft/iptables found — installing nftables"
-    pkg_install nftables || warn_msg "nftables install failed — UI will only be reachable on :8443"
-fi
-
+# nftables is guaranteed present by the preflight check; the iptables branch
+# below remains as a fallback for boards that already use iptables instead.
 if command -v nft &>/dev/null; then
     # Ensure the rules loaded from /etc/nftables.conf survive reboot.
     systemctl enable nftables.service 2>/dev/null || true
@@ -789,7 +983,7 @@ echo "System setup complete."
 echo
 echo "Next steps if not done yet:"
 echo "  1. Create the app user:  useradd -m -s /bin/bash -c 'Breezy Box' $APP_USER"
-echo "     Add to groups:        usermod -aG video,render,input $APP_USER"
+echo "     Add to groups:        sudo usermod -aG video,render,input $APP_USER"
 echo "  2. Fetch vendored deps and build (run as $APP_USER):"
 echo "     cd /home/$APP_USER/breezy-box && make deps && make"
 echo "     cp displaylink_kms_renderer breezy_web ~/.local/bin/"
