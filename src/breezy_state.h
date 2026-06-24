@@ -6,7 +6,7 @@
 /*
  * breezy_state — connection-status state machine for the Breezy Box.
  *
- * Tracks five states and builds the appropriate human-readable message string.
+ * Tracks six states and builds the appropriate human-readable message string.
  * This struct is pure CPU state — no GL, no EGL.  It survives renderer
  * teardown and reconnect cycles unchanged.
  *
@@ -38,6 +38,7 @@
 enum breezy_state_mode {
 	BREEZY_STATE_XR_DRIVER_DOWN,
 	BREEZY_STATE_NO_GLASSES,
+	BREEZY_STATE_CALIBRATING,
 	BREEZY_STATE_NO_HOST,
 	BREEZY_STATE_NO_CLIENTS,
 	BREEZY_STATE_NORMAL,

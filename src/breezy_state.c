@@ -16,6 +16,32 @@
 #include <unistd.h>
 
 /* ----------------------------------------------------------------
+ * XR driver state helpers
+ * ---------------------------------------------------------------- */
+
+/*
+ * Returns true when the XR driver is actively calibrating the glasses IMU.
+ * Reads /dev/shm/xr_driver_state and looks for calibration_state=CALIBRATING.
+ */
+static bool xr_driver_is_calibrating(void)
+{
+	FILE *f = fopen("/dev/shm/xr_driver_state", "r");
+	if (!f)
+		return false;
+
+	char line[256];
+	bool calibrating = false;
+	while (fgets(line, sizeof(line), f)) {
+		if (strncmp(line, "calibration_state=", 18) == 0) {
+			calibrating = strncmp(line + 18, "CALIBRATING", 11) == 0;
+			break;
+		}
+	}
+	fclose(f);
+	return calibrating;
+}
+
+/* ----------------------------------------------------------------
  * Network helpers
  * ---------------------------------------------------------------- */
 
@@ -255,11 +281,15 @@ bool breezy_state_update(struct breezy_state *bs,
 		       bs->eth_iface, (int)eth_connected,
 		       (int)xr_driver_up, (int)glasses_active, imported_count, (int)bs->mode);
 
+	bool is_calibrating = glasses_active && xr_driver_is_calibrating();
+
 	enum breezy_state_mode next;
 	if (!xr_driver_up)
 		next = BREEZY_STATE_XR_DRIVER_DOWN;
 	else if (!glasses_active)
 		next = BREEZY_STATE_NO_GLASSES;
+	else if (is_calibrating)
+		next = BREEZY_STATE_CALIBRATING;
 	else if (!host_connected)
 		next = BREEZY_STATE_NO_HOST;
 	else if (imported_count == 0u)
@@ -291,6 +321,7 @@ bool breezy_state_update(struct breezy_state *bs,
 	static const char *const mode_names[] = {
 		[BREEZY_STATE_XR_DRIVER_DOWN] = "xr-driver-down",
 		[BREEZY_STATE_NO_GLASSES]     = "no-glasses",
+		[BREEZY_STATE_CALIBRATING]    = "calibrating",
 		[BREEZY_STATE_NO_HOST]        = "no-host",
 		[BREEZY_STATE_NO_CLIENTS]     = "no-clients",
 		[BREEZY_STATE_NORMAL]         = "normal",
@@ -346,6 +377,11 @@ void breezy_state_format_message(const struct breezy_state *bs,
 	case BREEZY_STATE_NO_GLASSES:
 		snprintf(buf, cap,
 			 "Please connect a supported pair of XR glasses");
+		break;
+
+	case BREEZY_STATE_CALIBRATING:
+		snprintf(buf, cap,
+			 "Calibrating your glasses. Set down your glasses or sit still for a few moments...");
 		break;
 
 	case BREEZY_STATE_NO_HOST: {
