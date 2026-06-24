@@ -288,12 +288,12 @@ bool breezy_state_update(struct breezy_state *bs,
 		next = BREEZY_STATE_XR_DRIVER_DOWN;
 	else if (!glasses_active)
 		next = BREEZY_STATE_NO_GLASSES;
-	else if (is_calibrating)
-		next = BREEZY_STATE_CALIBRATING;
 	else if (!host_connected)
 		next = BREEZY_STATE_NO_HOST;
 	else if (imported_count == 0u)
 		next = BREEZY_STATE_NO_CLIENTS;
+	else if (is_calibrating)
+		next = BREEZY_STATE_CALIBRATING;
 	else
 		next = BREEZY_STATE_NORMAL;
 
