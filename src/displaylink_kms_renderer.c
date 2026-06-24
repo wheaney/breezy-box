@@ -2047,8 +2047,8 @@ static void kms_render_frame(struct kms_state *kms,
 				                          (const float *)mesh->verts, mesh->vert_count);
 			}
 
-			float w_half  = (float)server->opts.devices[i].decode_width  * 0.5f;
-			float h_half  = (float)server->opts.devices[i].decode_height * 0.5f;
+			float w_half  = (float)server->opts.devices[i].decode_width  * 0.5f * kms->display_size;
+			float h_half  = (float)server->opts.devices[i].decode_height * 0.5f * kms->display_size;
 			float left_x  = kms->placements[i].cnx - w_half;
 			float right_x = kms->placements[i].cnx + w_half;
 			float quad_top = kms->placements[i].cny + h_half;
@@ -2103,8 +2103,9 @@ static void kms_render_frame(struct kms_state *kms,
 
 	/* ---- Overlay info strip above the display group ---- */
 	if (kms->overlay_tex.tex) {
-		float ot_w_half = (float)kms->overlay_tex.tex_w * 0.5f;
-		float ot_h_half = (float)kms->overlay_tex.tex_h * 0.5f;
+		float ot_scale  = kms->meshes_computed ? kms->display_size : 1.0f;
+		float ot_w_half = (float)kms->overlay_tex.tex_w * 0.5f * ot_scale;
+		float ot_h_half = (float)kms->overlay_tex.tex_h * 0.5f * ot_scale;
 		float gap_px    = ot_h_half;                       /* one text-height gap */
 		float ot_y      = top_y_px + gap_px + ot_h_half;
 
@@ -2247,7 +2248,9 @@ static int kms_run(struct kms_state *kms, struct server_runtime *server)
 	}
 	if (drmModeSetCrtc(kms->drm_fd, kms->crtc_id, fb->fb_id, 0, 0,
 	                   &kms->connector_id, 1, &kms->mode) != 0) {
-		perror("drmModeSetCrtc");
+		fprintf(stderr, "kms: drmModeSetCrtc failed: %s"
+		        " (another process may hold DRM master — check for competing compositors)\n",
+		        strerror(errno));
 		return -1;
 	}
 
@@ -2579,17 +2582,27 @@ int main(int argc, char **argv)
 	 * sessions remain running throughout; only the DRM/GBM/EGL/GL layer
 	 * is torn down and rebuilt on each reconnect.
 	 */
+	uint64_t last_reconnect_ms = 0;
 	while (!stop_requested) {
+		/* Rate-limit reconnect attempts to avoid log spam on persistent errors. */
+		{
+			uint64_t now_ms = kms_realtime_ms();
+			uint64_t elapsed = now_ms - last_reconnect_ms;
+			if (last_reconnect_ms != 0 && elapsed < 1000u) {
+				struct timespec ts = { 0, (long)(1000u - elapsed) * 1000000L };
+				nanosleep(&ts, NULL);
+			}
+			last_reconnect_ms = kms_realtime_ms();
+		}
+
 		if (renderer_init(&kms, drm_device) != 0) {
 			fprintf(stderr, "kms: renderer init failed, retrying in 1 s\n");
-			nanosleep(&(struct timespec){1, 0}, NULL);
 			continue;
 		}
 
 		if (kms_init_display_textures(&kms, &server) != 0) {
 			fprintf(stderr, "kms: display texture init failed, retrying in 1 s\n");
 			renderer_destroy(&kms);
-			nanosleep(&(struct timespec){1, 0}, NULL);
 			continue;
 		}
 
