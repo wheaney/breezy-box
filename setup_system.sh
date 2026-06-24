@@ -300,21 +300,64 @@ section "SSH-over-Ethernet safety guard"
 # the wired Ethernet iface, abort here (Wi-Fi is already up by now, so there is
 # a way back in).  SSH over Wi-Fi, or a local TTY, proceeds normally.
 
+# Find the interface carrying the SSH session that ultimately invoked this
+# script (even under sudo, which strips SSH_CONNECTION from the environment).
+# Strategy: walk up the process tree from $$ to find an sshd ancestor, then
+# read its TCP peer from /proc/net/tcp (hex little-endian), convert to a dotted
+# IP, and resolve that to an interface via "ip route get".
 ssh_session_iface() {
-    # SSH_CONNECTION = "<client_ip> <client_port> <server_ip> <server_port>".
-    # Resolve which local interface owns the route back to the client IP.
-    [[ -z "${SSH_CONNECTION:-}" ]] && return 1
-    local client_ip dev
-    client_ip="$(awk '{print $1}' <<< "$SSH_CONNECTION")"
-    [[ -z "$client_ip" ]] && return 1
-    dev="$(ip route get "$client_ip" 2>/dev/null | grep -oE 'dev [^ ]+' | awk '{print $2}' | head -n1)"
+    local pid ppid comm client_ip dev
+
+    # Walk up to find the nearest sshd ancestor of this process.
+    pid=$$
+    while [[ "$pid" -gt 1 ]]; do
+        comm="$(cat /proc/"$pid"/comm 2>/dev/null || true)"
+        if [[ "$comm" == sshd ]]; then
+            break
+        fi
+        ppid="$(awk '{print $4}' /proc/"$pid"/stat 2>/dev/null || true)"
+        [[ -z "$ppid" || "$ppid" == "$pid" ]] && return 1
+        pid="$ppid"
+    done
+    [[ "$comm" != sshd ]] && return 1   # no sshd ancestor — local console
+
+    # Get the file descriptors for this sshd pid and find the TCP socket inode
+    # that is in ESTABLISHED state (tcp_state=01) by cross-referencing /proc/net/tcp.
+    local inode sock_inode
+    for fd in /proc/"$pid"/fd/*; do
+        sock_inode="$(readlink "$fd" 2>/dev/null)" || continue
+        [[ "$sock_inode" == socket:* ]] || continue
+        inode="${sock_inode//[^0-9]/}"
+
+        # /proc/net/tcp columns: sl local_addr rem_addr state ... inode
+        # state=01 = ESTABLISHED; rem_addr is client (hex little-endian).
+        client_hex="$(awk -v in="$inode" '$10==in && $4=="01" {print $3}' \
+                      /proc/net/tcp 2>/dev/null | head -n1)"
+        [[ -z "$client_hex" ]] && continue
+
+        # Convert hex little-endian IP:PORT → dotted IP.
+        # Format: AABBCCDD:PPPP where AABBCCDD is the IP in little-endian hex.
+        local hex_ip hex_b1 hex_b2 hex_b3 hex_b4
+        hex_ip="${client_hex%%:*}"
+        hex_b4=$(( 16#${hex_ip:0:2} ))
+        hex_b3=$(( 16#${hex_ip:2:2} ))
+        hex_b2=$(( 16#${hex_ip:4:2} ))
+        hex_b1=$(( 16#${hex_ip:6:2} ))
+        client_ip="${hex_b1}.${hex_b2}.${hex_b3}.${hex_b4}"
+        break
+    done
+
+    [[ -z "${client_ip:-}" ]] && return 1
+
+    dev="$(ip route get "$client_ip" 2>/dev/null \
+           | grep -oE 'dev [^ ]+' | awk '{print $2}' | head -n1)"
     [[ -n "$dev" ]] && echo "$dev"
 }
 
 GUARD_ETH_IFACE="$(detect_wired_eth_iface || true)"
 SSH_IFACE="$(ssh_session_iface || true)"
 
-if [[ -z "${SSH_CONNECTION:-}" ]]; then
+if [[ -z "$SSH_IFACE" && -z "${SSH_CONNECTION:-}" ]]; then
     skip_msg "not an SSH session (local console) — wired reconfig is safe"
 elif [[ -z "$SSH_IFACE" ]]; then
     warn_msg "could not determine the SSH session's interface — proceeding (assuming not wired)"

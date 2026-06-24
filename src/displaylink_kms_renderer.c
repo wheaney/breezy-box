@@ -141,7 +141,6 @@ struct kms_state {
 	bool placements_computed;
 
 	/* Device state — updated by kms_poll_device_config() every ~1 s. */
-	bool     async_flip;               /* DRM_CAP_ASYNC_PAGE_FLIP supported */
 	bool     device_active;            /* glasses connected, data valid, version OK */
 	float    device_complete_dist_px;  /* completeScreenDistancePixels — arc radius in pixel units */
 	float    device_lens_dist_px;      /* lensDistancePixels — pivot-to-eye offset along -Z */
@@ -2211,17 +2210,6 @@ static int kms_run(struct kms_state *kms, struct server_runtime *server)
 	if (drmSetMaster(kms->drm_fd) < 0)
 		fprintf(stderr, "kms: drmSetMaster: %s (may still work)\n", strerror(errno));
 
-	{
-		uint64_t cap = 0;
-		kms->async_flip = (drmGetCap(kms->drm_fd, DRM_CAP_ASYNC_PAGE_FLIP, &cap) == 0 && cap != 0);
-		printf("kms: async page flip: %s\n", kms->async_flip ? "enabled (tearing, no vsync wait)" : "disabled");
-		if (!kms->async_flip)
-			fprintf(stderr,
-				"kms: WARNING async page flip unsupported by this DRM driver — "
-				"render loop falls back to vsync-synced flips and will be capped "
-				"to the display refresh; head-anchoring latency will be higher\n");
-	}
-
 	kms->device_active            = false;
 	kms->device_complete_dist_px  = 0.0f;
 	kms->device_lens_dist_px      = 0.0f;
@@ -2327,37 +2315,25 @@ static int kms_run(struct kms_state *kms, struct server_runtime *server)
 			break;
 		}
 
-		if (kms->async_flip) {
-			ret = drmModePageFlip(kms->drm_fd, kms->crtc_id, next_fb->fb_id,
-			                      DRM_MODE_PAGE_FLIP_ASYNC, NULL);
-			if (ret && errno == EBUSY) {
-				/* Display engine still scanning: drop this frame, try next iteration. */
-				gbm_surface_release_buffer(kms->gbm_surface, next_bo);
-				continue;
-			}
-		} else {
-			ret = drmModePageFlip(kms->drm_fd, kms->crtc_id, next_fb->fb_id,
-			                      DRM_MODE_PAGE_FLIP_EVENT, &waiting_for_flip);
-		}
+		ret = drmModePageFlip(kms->drm_fd, kms->crtc_id, next_fb->fb_id,
+		                      DRM_MODE_PAGE_FLIP_EVENT, &waiting_for_flip);
 		if (ret) {
 			fprintf(stderr, "kms: drmModePageFlip: %s\n", strerror(errno));
 			gbm_surface_release_buffer(kms->gbm_surface, next_bo);
 			break;
 		}
 
-		if (!kms->async_flip) {
-			while (waiting_for_flip && !stop_requested) {
-				struct timeval tv = {0, 1000};
+		while (waiting_for_flip && !stop_requested) {
+			struct timeval tv = {0, 1000};
 
-				FD_ZERO(&fds);
-				FD_SET(kms->drm_fd, &fds);
-				ret = select(kms->drm_fd + 1, &fds, NULL, NULL, &tv);
-				if (ret < 0 && errno != EINTR) {
-					perror("select");
-					waiting_for_flip = 0;
-				} else if (ret > 0 && FD_ISSET(kms->drm_fd, &fds)) {
-					drmHandleEvent(kms->drm_fd, &evctx);
-				}
+			FD_ZERO(&fds);
+			FD_SET(kms->drm_fd, &fds);
+			ret = select(kms->drm_fd + 1, &fds, NULL, NULL, &tv);
+			if (ret < 0 && errno != EINTR) {
+				perror("select");
+				waiting_for_flip = 0;
+			} else if (ret > 0 && FD_ISSET(kms->drm_fd, &fds)) {
+				drmHandleEvent(kms->drm_fd, &evctx);
 			}
 		}
 

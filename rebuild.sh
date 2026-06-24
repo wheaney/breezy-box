@@ -3,6 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN_DIR="$HOME/.local/bin"
+mkdir -p "$BIN_DIR"
 
 cd "$SCRIPT_DIR"
 
@@ -10,7 +11,7 @@ echo "=== Building ==="
 make
 
 echo "=== Stopping services ==="
-sudo systemctl stop --wait breezy-renderer.service 2>/dev/null || true
+sudo systemctl stop breezy-renderer.service 2>/dev/null || true
 systemctl --user stop breezy.target 2>/dev/null || true
 
 echo "=== Copying binaries ==="
