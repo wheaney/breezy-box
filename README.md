@@ -1,5 +1,12 @@
 # Breezy Box
 
+> [!TIP]
+> This project is still a work-in-progress. Please star this repo to show your interest in the project and follow updates on [Reddit](https://reddit.com/u/watercanhydrate), [YouTube](https://www.youtube.com/@WayneHeaney), [Ko-fi](https://ko-fi.com/U7U8OVC0L), or [Discord](https://discord.gg/azSBTXNXMt).
+
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/U7U8OVC0L)
+
+[![Chat](https://img.shields.io/badge/chat-on%20discord-7289da.svg)](https://discord.gg/azSBTXNXMt)
+
 A Breezy Box is an "XR dock" -- a no-software, no-setup device for multi-display, XR productivity on any PC, any OS, and any USB port using just a single-board-computer.
 
 ## Hardware Requirements
