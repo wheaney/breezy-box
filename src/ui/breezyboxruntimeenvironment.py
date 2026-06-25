@@ -399,8 +399,8 @@ class BreezyBoxRuntimeEnvironment(RuntimeEnvironment):
 
     APP_NAMESPACE = 'breezy_box'
 
-    LICENSES_PROXY_ENDPOINT = "http://127.0.0.1:80/licenses/v1"
-    TOKENS_PROXY_ENDPOINT = "http://127.0.0.1:80/tokens/v1"
+    LICENSES_PROXY_ENDPOINT = "https://127.0.0.1:8443/licenses/v1"
+    TOKENS_PROXY_ENDPOINT = "https://127.0.0.1:8443/tokens/v1"
 
     def create_ipc(self, logger, config_home):
         return XRDriverIPC(logger, config_home,
