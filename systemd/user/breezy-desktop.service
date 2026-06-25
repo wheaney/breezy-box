@@ -8,7 +8,7 @@ PartOf=breezy.target
 Environment=DISPLAY=:1
 Environment=GTK_A11Y=none
 ExecStart=%h/.local/bin/breezydesktop
-Restart=on-failure
+Restart=always
 RestartSec=2
 
 [Install]
