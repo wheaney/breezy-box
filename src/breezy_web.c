@@ -49,6 +49,11 @@
 #define MAX_GSETTINGS_KEY      128
 #define GSETTINGS_OUT_MAX      1024
 #define MAX_CONTROL_SIGNAL_NAME 128
+#define PROXY_BODY_MAX          (64 * 1024)
+#define PROXY_HEADER_MAX        4096
+#define PROXY_TIMEOUT_MS        15000
+#define TOKENS_ENDPOINT_REAL    "https://eu.driver-backend.xronlinux.com/tokens/v1"
+#define LICENSES_ENDPOINT_REAL  "https://eu.driver-backend.xronlinux.com/licenses/v1"
 
 #define GSETTINGS_SCHEMA "com.xronlinux.BreezyDesktop"
 
@@ -56,6 +61,30 @@ static volatile int g_stop = 0;
 static char g_web_root[MAX_WEB_ROOT] = DEFAULT_WEB_ROOT;
 static char g_tls_cert_path[MAX_PATH_ARG] = "";
 static char g_tls_key_path[MAX_PATH_ARG]  = "";
+
+/* Single-slot long-poll proxy: the GTK UI posts to /proxy/request and parks
+ * here; the host browser picks it up via /proxy/pending and relays the real
+ * HTTP response back via /proxy/response, which unblocks the waiting UI call. */
+typedef enum {
+	PROXY_IDLE,       /* no pending request */
+	PROXY_WAITING,    /* UI connection parked, browser hasn't fetched yet */
+	PROXY_INFLIGHT,   /* browser fetched the request, response not yet back */
+} proxy_state_t;
+
+static struct {
+	proxy_state_t  state;
+	unsigned long  conn_id;    /* ID of the parked UI mg_connection */
+	uint64_t       deadline;   /* mg_millis() deadline; 504 if exceeded */
+	char           method[16];
+	char           url[2048];
+	char           req_headers[PROXY_HEADER_MAX];
+	char           req_body[PROXY_BODY_MAX];
+	size_t         req_body_len;
+	int            resp_status;
+	char           resp_headers[PROXY_HEADER_MAX];
+	char           resp_body[PROXY_BODY_MAX];
+	size_t         resp_body_len;
+} g_proxy;
 
 /* PEM contents loaded from the cert/key files at startup. Mongoose's built-in
  * TLS expects the certificate/key *data* in mg_tls_opts, not a file path, so we
@@ -505,8 +534,227 @@ static void handle_monitors_post(struct mg_connection *c, struct mg_http_message
 	              "{\"status\":\"ok\",\"matched\":%d}\n", updated);
 }
 
+/* Called each poll tick to check if the parked UI connection has timed out. */
+static void proxy_tick(struct mg_mgr *mgr)
+{
+	if (g_proxy.state != PROXY_WAITING && g_proxy.state != PROXY_INFLIGHT)
+		return;
+	if (mg_millis() < g_proxy.deadline)
+		return;
+
+	fprintf(stderr, "breezy_web/proxy: TIMEOUT state=%s url=%s conn_id=%lu\n",
+	        g_proxy.state == PROXY_WAITING ? "WAITING" : "INFLIGHT",
+	        g_proxy.url, g_proxy.conn_id);
+
+	if (g_proxy.state == PROXY_WAITING) {
+		for (struct mg_connection *cx = mgr->conns; cx; cx = cx->next) {
+			if (cx->id == g_proxy.conn_id) {
+				mg_http_reply(cx, 504,
+				              "Content-Type: application/json\r\n",
+				              "{\"error\":\"proxy timeout: browser did not relay request\"}\n");
+				break;
+			}
+		}
+	}
+	g_proxy.state = PROXY_IDLE;
+}
+
+/* Park a connection as a proxy slot with an explicit target URL and method.
+ * The raw body of hm is forwarded verbatim. Returns false and sends an error
+ * reply if the slot is busy. */
+static bool proxy_park(struct mg_connection *c, struct mg_http_message *hm,
+                       const char *target_url, const char *method)
+{
+	if (g_proxy.state != PROXY_IDLE) {
+		fprintf(stderr, "breezy_web/proxy: BUSY (state=%d) — rejecting %s %s\n",
+		        g_proxy.state, method, target_url);
+		mg_http_reply(c, 503,
+		              "Content-Type: application/json\r\n",
+		              "{\"error\":\"proxy slot busy\"}\n");
+		return false;
+	}
+
+	memset(&g_proxy, 0, sizeof(g_proxy));
+	snprintf(g_proxy.method, sizeof(g_proxy.method), "%s", method);
+	snprintf(g_proxy.url,    sizeof(g_proxy.url),    "%s", target_url);
+	snprintf(g_proxy.req_headers, sizeof(g_proxy.req_headers),
+	         "{\"Content-Type\":\"application/json\"}");
+
+	size_t body_len = hm->body.len;
+	if (body_len >= sizeof(g_proxy.req_body))
+		body_len = sizeof(g_proxy.req_body) - 1;
+	memcpy(g_proxy.req_body, hm->body.buf, body_len);
+	g_proxy.req_body[body_len] = '\0';
+	g_proxy.req_body_len = body_len;
+
+	g_proxy.conn_id  = c->id;
+	g_proxy.deadline = mg_millis() + PROXY_TIMEOUT_MS;
+	g_proxy.state    = PROXY_WAITING;
+	c->is_resp = 1;
+
+	fprintf(stderr, "breezy_web/proxy: PARKED %s %s conn_id=%lu body_len=%zu\n",
+	        method, target_url, c->id, body_len);
+	return true;
+}
+
+static void copy_method(struct mg_http_message *hm, char *buf, size_t bufsz)
+{
+	size_t mlen = hm->method.len < bufsz - 1 ? hm->method.len : bufsz - 1;
+	memcpy(buf, hm->method.buf, mlen);
+	buf[mlen] = '\0';
+}
+
+/* POST /tokens/v1 and PUT /tokens/v1 */
+static void handle_tokens(struct mg_connection *c, struct mg_http_message *hm)
+{
+	char method[16];
+	copy_method(hm, method, sizeof(method));
+	proxy_park(c, hm, TOKENS_ENDPOINT_REAL, method);
+}
+
+/* POST /licenses/v1 */
+static void handle_licenses(struct mg_connection *c, struct mg_http_message *hm)
+{
+	char method[16];
+	copy_method(hm, method, sizeof(method));
+	proxy_park(c, hm, LICENSES_ENDPOINT_REAL, method);
+}
+
+/* POST /proxy/request
+ * Body: {"url":"https://...","method":"POST","headers":{...},"body":"..."}
+ * Parks the connection and long-polls until the browser relays a response. */
+static void handle_proxy_request(struct mg_connection *c, struct mg_http_message *hm)
+{
+	char *url    = mg_json_get_str(hm->body, "$.url");
+	char *method = mg_json_get_str(hm->body, "$.method");
+	char *body   = mg_json_get_str(hm->body, "$.body");
+
+	if (!url || !method) {
+		free(url); free(method); free(body);
+		mg_http_reply(c, 400,
+		              "Content-Type: application/json\r\n",
+		              "{\"error\":\"body must include url and method\"}\n");
+		return;
+	}
+
+	if (g_proxy.state != PROXY_IDLE) {
+		fprintf(stderr, "breezy_web/proxy: BUSY (state=%d) — rejecting generic proxy request for %s %s\n",
+		        g_proxy.state, method, url);
+		free(url); free(method); free(body);
+		mg_http_reply(c, 503,
+		              "Content-Type: application/json\r\n",
+		              "{\"error\":\"proxy slot busy\"}\n");
+		return;
+	}
+
+	memset(&g_proxy, 0, sizeof(g_proxy));
+	snprintf(g_proxy.method, sizeof(g_proxy.method), "%s", method);
+	snprintf(g_proxy.url,    sizeof(g_proxy.url),    "%s", url);
+
+	int hdrs_len = 0;
+	int hdrs_off = mg_json_get(hm->body, "$.headers", &hdrs_len);
+	if (hdrs_off >= 0 && hdrs_len > 0 && hdrs_len < (int)sizeof(g_proxy.req_headers)) {
+		memcpy(g_proxy.req_headers, hm->body.buf + hdrs_off, (size_t)hdrs_len);
+		g_proxy.req_headers[hdrs_len] = '\0';
+	}
+
+	if (body) {
+		g_proxy.req_body_len = strlen(body);
+		if (g_proxy.req_body_len >= sizeof(g_proxy.req_body))
+			g_proxy.req_body_len = sizeof(g_proxy.req_body) - 1;
+		memcpy(g_proxy.req_body, body, g_proxy.req_body_len);
+	}
+	free(url); free(method); free(body);
+
+	g_proxy.conn_id  = c->id;
+	g_proxy.deadline = mg_millis() + PROXY_TIMEOUT_MS;
+	g_proxy.state    = PROXY_WAITING;
+	c->is_resp = 1;
+
+	fprintf(stderr, "breezy_web/proxy: PARKED (generic) %s %s conn_id=%lu\n",
+	        g_proxy.method, g_proxy.url, c->id);
+}
+
+/* GET /proxy/pending
+ * Returns 204 when idle, or the parked request as JSON. */
+static void handle_proxy_pending(struct mg_connection *c)
+{
+	if (g_proxy.state != PROXY_WAITING) {
+		mg_http_reply(c, 204, "", "");
+		return;
+	}
+
+	fprintf(stderr, "breezy_web/proxy: DISPATCHING to browser: %s %s conn_id=%lu\n",
+	        g_proxy.method, g_proxy.url, g_proxy.conn_id);
+	g_proxy.state = PROXY_INFLIGHT;
+
+	mg_http_reply(c, 200,
+	              "Content-Type: application/json\r\n",
+	              "{\"method\":%m,\"url\":%m,\"headers\":%s,\"body\":%m}\n",
+	              MG_ESC(g_proxy.method),
+	              MG_ESC(g_proxy.url),
+	              g_proxy.req_headers[0] ? g_proxy.req_headers : "{}",
+	              MG_ESC(g_proxy.req_body));
+}
+
+/* POST /proxy/response
+ * Body: {"status":200,"headers":{...},"body":"..."}
+ * Delivers the relayed response back to the parked UI connection. */
+static void handle_proxy_response(struct mg_connection *c, struct mg_http_message *hm,
+                                  struct mg_mgr *mgr)
+{
+	if (g_proxy.state != PROXY_INFLIGHT) {
+		fprintf(stderr, "breezy_web/proxy: RESPONSE arrived but state=%d (not INFLIGHT) — discarding\n",
+		        g_proxy.state);
+		mg_http_reply(c, 409,
+		              "Content-Type: application/json\r\n",
+		              "{\"error\":\"no inflight proxy request\"}\n");
+		return;
+	}
+
+	char *body   = mg_json_get_str(hm->body, "$.body");
+	long  status = mg_json_get_long(hm->body, "$.status", 200);
+
+	size_t body_len = body ? strlen(body) : 0;
+	if (body_len >= sizeof(g_proxy.resp_body))
+		body_len = sizeof(g_proxy.resp_body) - 1;
+	if (body) memcpy(g_proxy.resp_body, body, body_len);
+	g_proxy.resp_body[body_len] = '\0';
+	g_proxy.resp_body_len = body_len;
+	g_proxy.resp_status = (int)status;
+	free(body);
+
+	fprintf(stderr, "breezy_web/proxy: RESPONSE received status=%ld url=%s body_len=%zu\n",
+	        status, g_proxy.url, body_len);
+
+	/* Find and unblock the parked UI connection. */
+	bool found = false;
+	for (struct mg_connection *cx = mgr->conns; cx; cx = cx->next) {
+		if (cx->id == g_proxy.conn_id) {
+			mg_http_reply(cx, g_proxy.resp_status,
+			              "Content-Type: application/json\r\n",
+			              "%s", g_proxy.resp_body);
+			found = true;
+			break;
+		}
+	}
+	if (!found)
+		fprintf(stderr, "breezy_web/proxy: WARN conn_id=%lu already gone when response arrived\n",
+		        g_proxy.conn_id);
+
+	g_proxy.state = PROXY_IDLE;
+
+	mg_http_reply(c, 200,
+	              "Content-Type: application/json\r\n",
+	              "{\"status\":\"ok\"}\n");
+}
+
 static void ev_handler(struct mg_connection *c, int ev, void *ev_data)
 {
+	if (ev == MG_EV_POLL) {
+		proxy_tick(c->mgr);
+		return;
+	}
 	if (ev != MG_EV_HTTP_MSG)
 		return;
 
@@ -531,6 +779,22 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data)
 	} else if (mg_match(hm->uri, mg_str("/controls/*"), NULL) &&
 			   mg_match(hm->method, mg_str("PUT"), NULL)) {
 		handle_control_signal_put(c, hm);
+	} else if (mg_match(hm->uri, mg_str("/tokens/v1"), NULL) &&
+	           (mg_match(hm->method, mg_str("POST"), NULL) ||
+	            mg_match(hm->method, mg_str("PUT"), NULL))) {
+		handle_tokens(c, hm);
+	} else if (mg_match(hm->uri, mg_str("/licenses/v1"), NULL) &&
+	           mg_match(hm->method, mg_str("POST"), NULL)) {
+		handle_licenses(c, hm);
+	} else if (mg_match(hm->uri, mg_str("/proxy/request"), NULL) &&
+	           mg_match(hm->method, mg_str("POST"), NULL)) {
+		handle_proxy_request(c, hm);
+	} else if (mg_match(hm->uri, mg_str("/proxy/pending"), NULL) &&
+	           mg_match(hm->method, mg_str("GET"), NULL)) {
+		handle_proxy_pending(c);
+	} else if (mg_match(hm->uri, mg_str("/proxy/response"), NULL) &&
+	           mg_match(hm->method, mg_str("POST"), NULL)) {
+		handle_proxy_response(c, hm, c->mgr);
 	} else {
 		mg_http_reply(c, 404, "", "Not found\n");
 	}

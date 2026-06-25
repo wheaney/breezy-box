@@ -170,6 +170,60 @@
 
       requestWindowManagement();
 
+      /* Relay proxy: poll for requests the SBC UI needs the host browser to make. */
+      (function proxyRelay() {
+        function poll() {
+          fetch('/proxy/pending')
+            .then(function (res) {
+              if (res.status === 204) return null;
+              if (!res.ok) {
+                console.warn('[proxy] /proxy/pending returned unexpected status', res.status);
+                return null;
+              }
+              return res.json();
+            })
+            .then(function (req) {
+              if (!req) return;
+              console.log('[proxy] dispatching', req.method, req.url,
+                          'body_len=' + (req.body ? req.body.length : 0));
+              var fetchOpts = {
+                method:  req.method,
+                headers: Object.assign({ 'Content-Type': 'application/json' }, req.headers || {}),
+              };
+              if (req.body && req.body.length > 0) fetchOpts.body = req.body;
+              return fetch(req.url, fetchOpts)
+                .then(function (r) {
+                  return r.text().then(function (text) {
+                    console.log('[proxy] response status=' + r.status,
+                                'url=' + req.url, 'body_len=' + text.length);
+                    return fetch('/proxy/response', {
+                      method:  'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body:    JSON.stringify({ status: r.status, body: text }),
+                    }).then(function (pr) {
+                      if (!pr.ok) console.warn('[proxy] /proxy/response rejected with', pr.status);
+                      else console.log('[proxy] response delivered to SBC');
+                    });
+                  });
+                })
+                .catch(function (err) {
+                  console.error('[proxy] fetch failed for', req.url, '—', err);
+                  return fetch('/proxy/response', {
+                    method:  'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body:    JSON.stringify({ status: 502, body: JSON.stringify({ error: String(err) }) }),
+                  });
+                });
+            })
+            .catch(function (err) {
+              console.error('[proxy] poll error —', err);
+            })
+            .then(function () { setTimeout(poll, 500); });
+        }
+        console.log('[proxy] relay started, polling /proxy/pending every 500ms');
+        poll();
+      })();
+
       function onResize() {
         frame.style.height = window.innerHeight + 'px';
       }

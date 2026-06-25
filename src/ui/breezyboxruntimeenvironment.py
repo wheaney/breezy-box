@@ -18,6 +18,7 @@ from gi.repository import Adw, Gio, GLib, GObject, Gtk
 from ..files import get_config_dir
 from ..runtimeenvironment import ExtraField, ExtraTab, RuntimeEnvironment
 from ..settingsmanager import SettingsManager
+from ..xrdriveripc import XRDriverIPC
 
 _ = gettext.gettext
 logger = logging.getLogger('breezy_ui')
@@ -397,6 +398,54 @@ class BreezyBoxRuntimeEnvironment(RuntimeEnvironment):
     """
 
     APP_NAMESPACE = 'breezy_box'
+
+    LICENSES_PROXY_ENDPOINT = "http://127.0.0.1:80/licenses/v1"
+    TOKENS_PROXY_ENDPOINT = "http://127.0.0.1:80/tokens/v1"
+
+    def create_ipc(self, logger, config_home):
+        return XRDriverIPC(logger, config_home,
+                           tokens_endpoint=self.TOKENS_PROXY_ENDPOINT,
+                           write_control_flags_hook=self.write_control_flags_hook)
+
+    def write_control_flags_hook(self, flags, default_write):
+        if 'refresh_device_license' in flags:
+            import threading
+            threading.Thread(target=self._refresh_license, daemon=True).start()
+            flags = {k: v for k, v in flags.items() if k != 'refresh_device_license'}
+        if flags:
+            default_write(flags)
+
+    def _refresh_license(self):
+        import ssl
+        import urllib.request
+        try:
+            state = XRDriverIPC.get_instance().retrieve_driver_state()
+            hardware_id = state.get('hardware_id')
+            if not hardware_id:
+                logger.error('breezy_box: refresh_license: no hardware_id in driver state')
+                return
+
+            body = json.dumps({"hardwareId": hardware_id, "features": []}).encode()
+            ctx = ssl._create_unverified_context()
+            req = urllib.request.Request(
+                self.LICENSES_PROXY_ENDPOINT, method='POST',
+                headers={'Content-Type': 'application/json'},
+                data=body)
+            with urllib.request.urlopen(req, context=ctx, timeout=20) as resp:
+                payload = resp.read()
+
+            state_home = os.path.expanduser(os.environ.get('XDG_STATE_HOME', '~/.local/state'))
+            state_dir = os.path.join(state_home, 'xr_driver')
+            os.makedirs(state_dir, exist_ok=True)
+            fname = ('%.8s_license.json' % hardware_id)
+            tmp_path = os.path.join(state_dir, 'license.tmp.json')
+            final_path = os.path.join(state_dir, fname)
+            with open(tmp_path, 'wb') as f:
+                f.write(payload)
+            os.replace(tmp_path, final_path)
+            logger.info('breezy_box: license written to %s', final_path)
+        except Exception as e:
+            logger.error('breezy_box: refresh_license failed: %s', e)
 
     # The box runtime is always present; no separate component to install.
     def is_installed(self):
