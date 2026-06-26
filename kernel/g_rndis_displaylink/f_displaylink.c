@@ -179,7 +179,8 @@ int f_dl_handle_ctrl(struct f_displaylink *dl,
 	if (rt  == (USB_DIR_IN | USB_TYPE_STANDARD | USB_RECIP_DEVICE) &&
 	    req_ == USB_REQ_GET_DESCRIPTOR &&
 	    (wval >> 8) == UDL_VENDOR_DESC_TYPE) {
-		u16 n = min_t(u16, wlen, dl->vendor_desc_len);
+		u16 n = min_t(u16, wlen, min_t(u16, dl->vendor_desc_len,
+					       sizeof(dl->vendor_desc)));
 
 		memcpy(req->buf, dl->vendor_desc, n);
 		value = n;
