@@ -8,10 +8,23 @@
 #include <linux/wait.h>
 #include <linux/usb/composite.h>
 
-/* DIAGNOSTIC: minimal bulk buffering (was 4 x 64K) to isolate a dwc3 bulk-OUT
- * wedge.  Restore to 4 / (64*1024) once the freeze is understood. */
-#define DL_NUM_REQS     1
-#define DL_BULK_BUFSIZE (4 * 1024)
+/*
+ * Bulk-OUT buffering.  Two host facts drive these sizes:
+ *
+ *  - The host's udl driver keeps up to WRITES_IN_FLIGHT (20) bulk URBs queued,
+ *    so we keep several OUT requests armed at all times: if the endpoint ever
+ *    runs dry between completions, host URBs pile up unacked and the dwc3 OUT
+ *    endpoint can wedge.
+ *  - A single host URB is up to MAX_TRANSFER = PAGE_SIZE*16 - BULK_SIZE =
+ *    65024 bytes.  Our per-request buffer MUST be >= that, or a full-size OUT
+ *    overflows the request and the controller babbles / wedges the endpoint.
+ *
+ * 64 KiB is a multiple of the 512-byte HS maxpacket (and page-aligned), so it
+ * covers the largest host URB and never trips dwc3's unaligned bounce/extra-TRB
+ * path on a short final packet.
+ */
+#define DL_NUM_REQS     8
+#define DL_BULK_BUFSIZE (64 * 1024)
 
 struct f_displaylink {
 	struct usb_function      func;
