@@ -560,6 +560,15 @@ static int handle_control_event(struct raw_gadget *gadget,
 	memset(&io, 0, sizeof(io));
 	io.inner.ep = 0u;
 
+	fprintf(stderr,
+		"raw-gadget: SETUP rt=0x%02x req=0x%02x val=0x%04x idx=0x%04x len=%u dev=%s\n",
+		(unsigned int)setup->bRequestType,
+		(unsigned int)setup->bRequest,
+		(unsigned int)(uint16_t)setup->wValue,
+		(unsigned int)(uint16_t)setup->wIndex,
+		(unsigned int)wLength,
+		dev ? "yes" : "no");
+
 	/* Collect an OUT data stage up front so vendor handlers (e.g. SET_KEY)
 	 * see the payload, mirroring the USB/IP submit which carries it inline. */
 	if (host_to_device && wLength > 0u) {
@@ -641,6 +650,18 @@ static int handle_control_event(struct raw_gadget *gadget,
 		memcpy(io.data, result.data, len);
 		io.inner.ep = 0u;
 		io.inner.length = (unsigned int)len;
+		if ((setup->bRequestType & USB_TYPE_MASK) == USB_TYPE_STANDARD &&
+		    setup->bRequest == USB_REQ_GET_DESCRIPTOR &&
+		    (uint8_t)((uint16_t)setup->wValue >> 8) == UDL_VENDOR_DESCRIPTOR_TYPE) {
+			fprintf(stderr,
+				"raw-gadget: GET_DESCRIPTOR 0x5f req_len=%u sent=%zu hdr=[%u,0x%02x,0x%02x,0x%02x,%u]\n",
+				(unsigned int)wLength, len,
+				(unsigned int)(len >= 1u ? io.data[0] : 0u),
+				(unsigned int)(len >= 2u ? io.data[1] : 0u),
+				(unsigned int)(len >= 3u ? io.data[2] : 0u),
+				(unsigned int)(len >= 4u ? io.data[3] : 0u),
+				(unsigned int)(len >= 5u ? io.data[4] : 0u));
+		}
 		if (raw_ep0_write(gadget->fd, &io) < 0) {
 			perror("ioctl USB_RAW_IOCTL_EP0_WRITE");
 			return -1;
