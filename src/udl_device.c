@@ -909,7 +909,15 @@ void build_default_edid(uint8_t edid[256],
 {
 	uint32_t sum = 0u;
 	size_t index;
-	const uint16_t manufacturer = encode_manufacturer_id('B', 'B', 'X');
+	/*
+	 * 'BZY' ("Breezy") rather than a real DisplayLink/Plugable PNP ID: 'BBX'
+	 * (the previous value) collides with the registered PNP ID for Black Box
+	 * Corporation (see /usr/share/hwdata/pnp.ids), which hosts resolve via their
+	 * own vendor-ID database and surface as the monitor's manufacturer name
+	 * (e.g. GNOME's Displays panel showed "Black Box Corporation" instead of
+	 * anything Breezy-branded).  Confirmed unregistered as of this fix.
+	 */
+	const uint16_t manufacturer = encode_manufacturer_id('B', 'Z', 'Y');
 	static const uint8_t chromaticity[10] = {
 		0xee, 0x91, 0xa3, 0x54, 0x4c,
 		0x99, 0x26, 0x0f, 0x50, 0x54,
@@ -1091,7 +1099,8 @@ void build_default_edid(uint8_t edid[256],
 /* ----------------------------------------------------------------
  * USB descriptor builders
  * ---------------------------------------------------------------- */
-void build_vendor_descriptor(struct device_runtime *runtime)
+void udl_fill_vendor_descriptor(uint8_t buf[UDL_VENDOR_DESCRIPTOR_LENGTH],
+				uint32_t width, uint32_t height)
 {
 	static const uint8_t vendor_template[UDL_VENDOR_DESCRIPTOR_LENGTH] = {
 		UDL_VENDOR_DESCRIPTOR_LENGTH,
@@ -1116,15 +1125,22 @@ void build_vendor_descriptor(struct device_runtime *runtime)
 		1u,
 		0x02u,
 	};
-	const uint64_t pixels = (uint64_t)runtime->opts.decode_width * (uint64_t)runtime->opts.decode_height;
-		uint32_t pixel_limit = pixels > UINT32_MAX ? UINT32_MAX : (uint32_t)pixels;
+	const uint64_t pixels = (uint64_t)width * (uint64_t)height;
+	uint32_t pixel_limit = pixels > UINT32_MAX ? UINT32_MAX : (uint32_t)pixels;
 
 	if (pixel_limit < UDL_VENDOR_DEFAULT_PIXEL_LIMIT)
 		pixel_limit = UDL_VENDOR_DEFAULT_PIXEL_LIMIT;
 
-	memcpy(runtime->vendor_descriptor, vendor_template, sizeof(vendor_template));
-	store_le32_reply(&runtime->vendor_descriptor[19], pixel_limit);
-	runtime->vendor_descriptor_len = sizeof(vendor_template);
+	memcpy(buf, vendor_template, sizeof(vendor_template));
+	store_le32_reply(&buf[19], pixel_limit);
+}
+
+void build_vendor_descriptor(struct device_runtime *runtime)
+{
+	udl_fill_vendor_descriptor(runtime->vendor_descriptor,
+				   runtime->opts.decode_width,
+				   runtime->opts.decode_height);
+	runtime->vendor_descriptor_len = UDL_VENDOR_DESCRIPTOR_LENGTH;
 }
 
 void build_device_descriptor(struct device_runtime *runtime)
@@ -1747,13 +1763,18 @@ static int prepare_vendor_request(struct device_runtime *runtime,
 	return 1;
 }
 
-static int handle_control_submit(struct device_runtime *runtime,
-				 const struct usbip_header *request,
-				 const uint8_t *payload,
-				 size_t payload_length,
-				 struct control_result *result)
+/*
+ * Transport-independent EP0 control dispatch.  Both the USB/IP path (via
+ * handle_control_submit) and the Raw Gadget path (raw_gadget.c) funnel their
+ * setup packets through here so the two transports present the identical modern
+ * DisplayLink protocol (descriptors, SET_KEY, memory peek/poke, Windows queries).
+ */
+int udl_device_handle_control(struct device_runtime *runtime,
+			      const struct usb_ctrlrequest *setup,
+			      const uint8_t *payload,
+			      size_t payload_length,
+			      struct control_result *result)
 {
-	const struct usb_ctrlrequest *setup = (const struct usb_ctrlrequest *)request->u.cmd_submit.setup;
 	int rc;
 
 	memset(result, 0, sizeof(*result));
@@ -1762,7 +1783,7 @@ static int handle_control_submit(struct device_runtime *runtime,
 
 	if (runtime->opts.verbose) {
 		fprintf(stderr,
-			"USB/IP setup: bmRequestType=0x%02x bRequest=0x%02x wValue=0x%04x wIndex=0x%04x wLength=%u\n",
+			"EP0 setup: bmRequestType=0x%02x bRequest=0x%02x wValue=0x%04x wIndex=0x%04x wLength=%u\n",
 			setup->bRequestType,
 			setup->bRequest,
 			(unsigned int)((uint16_t)setup->wValue),
@@ -1791,6 +1812,17 @@ static int handle_control_submit(struct device_runtime *runtime,
 	result->action = CONTROL_ACTION_STALL;
 	result->status = -EPIPE;
 	return 0;
+}
+
+static int handle_control_submit(struct device_runtime *runtime,
+				 const struct usbip_header *request,
+				 const uint8_t *payload,
+				 size_t payload_length,
+				 struct control_result *result)
+{
+	const struct usb_ctrlrequest *setup = (const struct usb_ctrlrequest *)request->u.cmd_submit.setup;
+
+	return udl_device_handle_control(runtime, setup, payload, payload_length, result);
 }
 
 static int send_submit_response(int fd,

@@ -48,6 +48,8 @@
 #include "smooth_follow.h"
 #include "usb_gadget.h"
 #include "link_services.h"
+#include "ffs_gadget.h"  /* dead code: cannot answer GET_DESCRIPTOR(0x5f), see start-up comment below */
+#include "raw_gadget.h"
 
 /* Global stop flag — declared extern in kms_common.h */
 volatile sig_atomic_t stop_requested = 0;
@@ -386,7 +388,7 @@ static void kms_poll_device_config(struct kms_state *kms,
 			if (!server_slot_is_active(server, i))
 				continue;
 			slot_active = dev->is_gadget_device
-					  ? (dev->udl.gadget_fd >= 0)
+					  ? dev->gadget_host_connected
 					  : dev->imported;
 			if (slot_active)
 				active_slots++;
@@ -433,7 +435,7 @@ static void kms_poll_device_config(struct kms_state *kms,
 		if (!server_slot_is_active(server, i))
 			continue;
 		connected = dev->is_gadget_device
-		                ? (dev->udl.gadget_fd >= 0)
+		                ? dev->gadget_host_connected
 		                : dev->imported;
 		if (!connected)
 			continue;
@@ -1980,7 +1982,7 @@ static void kms_render_frame(struct kms_state *kms,
 			continue;
 		const struct device_runtime *dev = &server->devices[i];
 		bool active_slot = dev->is_gadget_device
-				       ? (dev->udl.gadget_fd >= 0)
+				       ? dev->gadget_host_connected
 				       : dev->imported;
 		if (active_slot)
 			visible_idx[visible_count++] = i;
@@ -2449,6 +2451,8 @@ int main(int argc, char **argv)
 	char eth_iface[32] = "";
 	pthread_t srv_thread;
 	bool srv_thread_created = false;
+	struct raw_gadget gadget;
+	bool gadget_started = false;
 	int exit_code = EXIT_FAILURE;
 	const char *drm_device = NULL;
 
@@ -2558,6 +2562,32 @@ int main(int argc, char **argv)
 		fprintf(stderr, "Warning: config hot-reload unavailable\n");
 
 	/*
+	 * If /dev/raw-gadget and a UDC are present, start the gadget transport. It
+	 * does NOT claim a display slot now — it comes up slot-less and claims the
+	 * lowest-index free slot only when a host actually connects (and releases
+	 * it on disconnect), feeding the slot's udl_runtime exactly like a USB/IP
+	 * display.  The slot claim coordinates with the live USB/IP import path
+	 * under import_mutex, so starting it after the listener is safe.
+	 *
+	 * (FunctionFS (ffs_gadget.c) cannot answer the standard GET_DESCRIPTOR(0x5f)
+	 * vendor descriptor the in-kernel Linux udl driver issues: that request is
+	 * unconditionally stalled by drivers/usb/gadget/composite.c::composite_setup()
+	 * before it ever reaches FunctionFS userspace, because 0x5f isn't one of the
+	 * descriptor types the composite core recognizes. raw_gadget bypasses the
+	 * composite framework entirely via direct UDC ioctls, so it can answer 0x5f
+	 * — this is why we're back on raw_gadget instead of FFS.)
+	 */
+	if (raw_gadget_available(NULL)) {
+		if (raw_gadget_start(&gadget, &server, NULL, server.opts.verbose) == 0)
+			gadget_started = true;
+		else
+			fprintf(stderr, "raw-gadget: transport failed to start\n");
+	} else if (server.opts.verbose) {
+		fprintf(stderr,
+			"raw-gadget: no /dev/raw-gadget or UDC; gadget display disabled\n");
+	}
+
+	/*
 	 * Populate address state once — these fields survive renderer reconnect
 	 * cycles and are never wiped by renderer_destroy().
 	 */
@@ -2600,6 +2630,12 @@ int main(int argc, char **argv)
 			continue;
 		}
 
+		/* Publish the glasses mode so a gadget host that connects can size a
+		 * fallback display to match (used only if every configured slot is
+		 * taken by USB/IP at connect time). */
+		server_publish_drm_mode(&server, kms.mode.hdisplay, kms.mode.vdisplay,
+					kms.mode.vrefresh);
+
 		if (kms_init_display_textures(&kms, &server) != 0) {
 			fprintf(stderr, "kms: display texture init failed, retrying in 1 s\n");
 			renderer_destroy(&kms);
@@ -2620,6 +2656,8 @@ int main(int argc, char **argv)
 
 	out:
 	stop_requested = 1;
+	if (gadget_started)
+		raw_gadget_stop(&gadget);
 	server_stop_config_watcher(&server);
 	if (srv_thread_created) {
 		if (server.listen_fd >= 0)

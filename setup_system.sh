@@ -238,7 +238,9 @@ WLAN_IFACE="$(detect_wlan_iface || true)"
 if [[ "$NO_WLAN" -eq 1 ]]; then
     skip_msg "Wi-Fi setup (--no-wlan)"
 elif [[ -z "$WLAN_IFACE" ]]; then
-    warn_msg "no wireless interface found — skipping Wi-Fi setup"
+    warn_msg "no wireless interface found"
+    warn_msg "  ABORTING before any wired-network change so internet/SSH stays intact"
+    exit 1
 elif ! nm_active; then
     warn_msg "NetworkManager is not active — automated Wi-Fi setup unsupported here"
     warn_msg "  configure wpa_supplicant/networkd manually, or run with --no-wlan to silence this"
@@ -546,47 +548,65 @@ EmitRouter=no"
 fi
 
 # ---------------------------------------------------------------------------
-section "breezy-gadget system service (OTG RNDIS setup as root)"
+section "breezy-gadget system service (disabled: DisplayLink transport is raw_gadget, not FunctionFS)"
 
-# The gadget setup script runs as root so the renderer can run unprivileged.
-GADGET_SCRIPT_SRC="$SCRIPT_DIR/breezy_gadget_setup.sh"
-GADGET_SCRIPT_DST="/usr/local/lib/breezy-box/breezy_gadget_setup.sh"
+# breezy-gadget.service used to set up a FunctionFS configfs gadget and
+# permanently bind the box's only UDC to it before the renderer started. The
+# renderer now drives DisplayLink via raw_gadget.c (/dev/raw-gadget), which
+# binds the UDC itself at runtime and releases it on stop — a UDC can only be
+# bound to one gadget driver at a time, so the FFS setup must NOT run, or it
+# starves raw_gadget of the UDC (or vice versa, depending on start order).
+# Disable+stop it if a previous install left it enabled.
+if systemctl is-enabled --quiet breezy-gadget.service 2>/dev/null \
+   || systemctl is-active --quiet breezy-gadget.service 2>/dev/null; then
+    systemctl disable --now breezy-gadget.service 2>/dev/null \
+        && done_msg "disabled breezy-gadget.service (FunctionFS gadget, superseded by raw_gadget)" \
+        || echo "  warn: failed to disable breezy-gadget.service"
+else
+    skip_msg "breezy-gadget.service already disabled"
+fi
+
+# /dev/raw-gadget defaults to root:root mode 0600 (CONFIG_USB_RAW_GADGET); the
+# renderer runs unprivileged (SupplementaryGroups=video in its unit), so grant
+# that group access via udev instead of running the renderer as root.
+RAW_GADGET_UDEV_RULE_SRC="$SCRIPT_DIR/udev/99-breezy-raw-gadget.rules"
+RAW_GADGET_UDEV_RULE_DST="/etc/udev/rules.d/99-breezy-raw-gadget.rules"
+if [[ -f "$RAW_GADGET_UDEV_RULE_SRC" ]]; then
+    if ! cmp -s "$RAW_GADGET_UDEV_RULE_SRC" "$RAW_GADGET_UDEV_RULE_DST" 2>/dev/null; then
+        install -m 0644 "$RAW_GADGET_UDEV_RULE_SRC" "$RAW_GADGET_UDEV_RULE_DST"
+        udevadm control --reload-rules
+        udevadm trigger --name-match=raw-gadget 2>/dev/null || true
+        done_msg "installed $RAW_GADGET_UDEV_RULE_DST"
+    else
+        skip_msg "$RAW_GADGET_UDEV_RULE_DST already up to date"
+    fi
+else
+    echo "  warn: $RAW_GADGET_UDEV_RULE_SRC not found, skipping raw-gadget udev rule install"
+fi
+
+# ---------------------------------------------------------------------------
+section "breezy-gadget-reset system service (OTG PHY reset, transport-agnostic)"
+
+# reset_usb0_otg_stack.sh recovers a wedged dwc3+usb2phy OTG stack (RK3399
+# BC1.2 DCP misclassification) at a level below any gadget driver — it's
+# useful regardless of whether FFS or raw_gadget owns the UDC, so this stays
+# wired up.  Its ExecStartPost used to re-run breezy_gadget_setup.sh (FFS
+# configfs rebind); now that raw_gadget owns the UDC at runtime, that
+# ExecStartPost is dropped from the installed unit below.
 RESET_SCRIPT_SRC="$SCRIPT_DIR/reset_usb0_otg_stack.sh"
 RESET_SCRIPT_DST="/usr/local/lib/breezy-box/reset_usb0_otg_stack.sh"
-GADGET_SERVICE_SRC="$SCRIPT_DIR/systemd/system/breezy-gadget.service"
-GADGET_SERVICE_DST="/etc/systemd/system/breezy-gadget.service"
 RESET_SERVICE_SRC="$SCRIPT_DIR/systemd/system/breezy-gadget-reset.service"
 RESET_SERVICE_DST="/etc/systemd/system/breezy-gadget-reset.service"
 UDEV_RULE_SRC="$SCRIPT_DIR/udev/99-breezy-otg-reset.rules"
 UDEV_RULE_DST="/etc/udev/rules.d/99-breezy-otg-reset.rules"
 
-if [[ ! -f "$GADGET_SCRIPT_SRC" ]]; then
-    echo "  warn: $GADGET_SCRIPT_SRC not found, skipping gadget service install"
-else
-    mkdir -p "$(dirname "$GADGET_SCRIPT_DST")"
-    if ! cmp -s "$GADGET_SCRIPT_SRC" "$GADGET_SCRIPT_DST" 2>/dev/null; then
-        install -m 0755 "$GADGET_SCRIPT_SRC" "$GADGET_SCRIPT_DST"
-        done_msg "installed $GADGET_SCRIPT_DST"
+if [[ -f "$RESET_SCRIPT_SRC" ]]; then
+    mkdir -p "$(dirname "$RESET_SCRIPT_DST")"
+    if ! cmp -s "$RESET_SCRIPT_SRC" "$RESET_SCRIPT_DST" 2>/dev/null; then
+        install -m 0755 "$RESET_SCRIPT_SRC" "$RESET_SCRIPT_DST"
+        done_msg "installed $RESET_SCRIPT_DST"
     else
-        skip_msg "$GADGET_SCRIPT_DST already up to date"
-    fi
-
-    if [[ -f "$RESET_SCRIPT_SRC" ]]; then
-        if ! cmp -s "$RESET_SCRIPT_SRC" "$RESET_SCRIPT_DST" 2>/dev/null; then
-            install -m 0755 "$RESET_SCRIPT_SRC" "$RESET_SCRIPT_DST"
-            done_msg "installed $RESET_SCRIPT_DST"
-        else
-            skip_msg "$RESET_SCRIPT_DST already up to date"
-        fi
-    else
-        echo "  warn: $RESET_SCRIPT_SRC not found"
-    fi
-
-    if ! cmp -s "$GADGET_SERVICE_SRC" "$GADGET_SERVICE_DST" 2>/dev/null; then
-        install -m 0644 "$GADGET_SERVICE_SRC" "$GADGET_SERVICE_DST"
-        done_msg "installed $GADGET_SERVICE_DST"
-    else
-        skip_msg "$GADGET_SERVICE_DST already up to date"
+        skip_msg "$RESET_SCRIPT_DST already up to date"
     fi
 
     if ! cmp -s "$RESET_SERVICE_SRC" "$RESET_SERVICE_DST" 2>/dev/null; then
@@ -605,16 +625,8 @@ else
     fi
 
     systemctl daemon-reload
-    if systemctl is-enabled --quiet breezy-gadget.service 2>/dev/null; then
-        skip_msg "breezy-gadget.service already enabled"
-    else
-        systemctl enable breezy-gadget.service
-        done_msg "enabled breezy-gadget.service"
-    fi
-    # Start now so the gadget comes up without a reboot.
-    systemctl start breezy-gadget.service 2>/dev/null \
-        && done_msg "started breezy-gadget.service" \
-        || echo "  warn: breezy-gadget.service failed to start — check: journalctl -u breezy-gadget"
+else
+    echo "  warn: $RESET_SCRIPT_SRC not found, skipping OTG reset service install"
 fi
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,23 @@
+[Unit]
+Description=Breezy Box DisplayLink-only OTG gadget (boot-time, for shared power+OTG ports)
+Documentation=https://github.com/wheaney/breezy-box
+# Start AFTER the network is up so that if bringing up the gadget wedges the USB
+# stack, SSH is already reachable for diagnosis.  Do NOT order Before=
+# multi-user.target — this service must never be able to block boot.
+After=network-online.target systemd-udevd.service
+Wants=network-online.target
+Conflicts=breezy-gadget.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Hard cap so a stalled USB op can never hang the unit (and thus the boot
+# transaction) indefinitely.
+TimeoutStartSec=20
+ExecStart=/home/wayne/breezy-box/kernel/g_rndis_displaylink/dl_only_boot.sh
+ExecStop=/bin/sh -c 'rmmod g_rndis_displaylink 2>/dev/null || true'
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

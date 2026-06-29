@@ -206,8 +206,22 @@ struct device_runtime {
 	bool first_e0_dumped;
 	bool decrypt_enabled;
 	uint16_t decrypt_offset;
-	/* True when this slot is driven by /dev/udl_gadget rather than USB/IP */
+	/* True when this slot is driven by a gadget transport (FFS/raw) rather than
+	 * USB/IP.  Runtime-mutable: flipped under import_mutex by
+	 * server_claim_gadget_slot()/server_release_gadget_slot() as a host
+	 * connects/disconnects, not fixed for the slot's lifetime. */
 	bool is_gadget_device;
+	/* True only while a gadget transport has an ACTIVELY CONNECTED host on this
+	 * slot (e.g. FFS FUNCTIONFS_ENABLE..DISABLE) — distinct from is_gadget_device,
+	 * which just marks "this slot is reserved for the gadget, not USB/IP" and
+	 * stays true for the slot's claim duration regardless of host presence.
+	 * Set/cleared by the gadget transport itself (ffs_gadget.c's claim/release);
+	 * the renderer's connection-status overlay reads this to know whether to
+	 * show "no host" vs a live gadget feed.  The OLD /dev/udl_gadget kernel-
+	 * module reader path (udl_runtime.gadget_fd) is a different, unrelated
+	 * signal — do not conflate the two when checking "is a gadget host live".
+	 */
+	bool gadget_host_connected;
 };
 
 /* Control endpoint result */
@@ -229,6 +243,18 @@ void fill_usbip_device(struct device_runtime *runtime);
 int run_import_session(struct device_runtime *runtime, int fd);
 int handle_submit(struct device_runtime *runtime, int fd, struct usbip_header *request);
 
+/*
+ * Transport-independent EP0 control dispatch shared by the USB/IP server and the
+ * Raw Gadget transport (raw_gadget.c).  Fills *result with the action/status/data
+ * for the given setup packet (and OUT payload, if any).  Returns 0 on success
+ * (result populated, possibly STALL) or -1 on a fatal handler error.
+ */
+int udl_device_handle_control(struct device_runtime *runtime,
+			      const struct usb_ctrlrequest *setup,
+			      const uint8_t *payload,
+			      size_t payload_length,
+			      struct control_result *result);
+
 /* Logging helpers called from kms_udl_runtime.c via forward declaration */
 void log_hex_window(const char *label,
 		    const uint8_t *data,
@@ -248,6 +274,11 @@ void build_default_edid(uint8_t edid[256],
 			bool allow_30hz_fallback);
 int load_edid_file(const char *path, uint8_t edid[256]);
 void build_vendor_descriptor(struct device_runtime *runtime);
+/* Fill a 0x5f DisplayLink vendor descriptor for the given resolution into buf
+ * (UDL_VENDOR_DESCRIPTOR_LENGTH bytes).  Used by the FFS transport to embed a
+ * descriptor in its functionfs blob before any slot is claimed. */
+void udl_fill_vendor_descriptor(uint8_t buf[UDL_VENDOR_DESCRIPTOR_LENGTH],
+				uint32_t width, uint32_t height);
 void build_device_descriptor(struct device_runtime *runtime);
 void build_device_qualifier(struct device_runtime *runtime);
 void build_bos_descriptor(struct device_runtime *runtime);

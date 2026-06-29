@@ -33,6 +33,18 @@ MODULE_SOFTDEP("pre: usb_f_rndis");
 #define DL_VENDOR_ID   0x17e9
 #define DL_PRODUCT_ID  0x0104
 
+/*
+ * disable_rndis: when set, present a PURE DisplayLink device — a single
+ * vendor-class interface, no RNDIS — matching the known-good DL-only
+ * raw-gadget reference.  The Windows DisplayLink driver only promotes the
+ * device to an active display for a clean single-interface device; the
+ * RNDIS composite makes it health-poll forever without creating a display.
+ * Toggle without a rebuild:  modprobe g_rndis_displaylink disable_rndis=1
+ */
+static bool disable_rndis;
+module_param(disable_rndis, bool, 0444);
+MODULE_PARM_DESC(disable_rndis, "Present DisplayLink only, no RNDIS (Windows display test)");
+
 /* ---------- USB strings ------------------------------------------------- */
 
 #define STR_MANUFACTURER  0
@@ -42,7 +54,7 @@ MODULE_SOFTDEP("pre: usb_f_rndis");
 static struct usb_string gdl_usb_strings[] = {
 	[STR_MANUFACTURER].s = "DisplayLink",
 	[STR_PRODUCT].s      = "Breezy Box",
-	[STR_SERIAL].s       = "BREEZY0001",
+	[STR_SERIAL].s       = "BREEZY0002",
 	{ }
 };
 
@@ -63,17 +75,25 @@ static struct usb_device_descriptor gdl_device_desc = {
 	.bDescriptorType    = USB_DT_DEVICE,
 	.bcdUSB             = cpu_to_le16(0x0200),
 	/*
-	 * bDeviceClass = 0xEF (Misc) + subclass/protocol 0x02/0x01 enables
-	 * Interface Association Descriptors so the host can pair the RNDIS
-	 * control and data interfaces correctly.
+	 * bDeviceClass = 0x00 (per-interface), matching the known-good DL-only
+	 * raw-gadget reference (displaylink_gadget_raw_gadget.c) and a real
+	 * DisplayLink device.  The Windows DisplayLink driver only promotes the
+	 * device to an active display when it sees this class; with 0xEF (Misc/
+	 * IAD, needed to pair RNDIS) the driver binds but health-polls forever and
+	 * never creates a display.
+	 *
+	 * TRADE-OFF: without the IAD, Windows cannot pair the RNDIS control+data
+	 * interfaces, so RNDIS networking will not bind on Windows in this mode.
+	 * This is the deliberate test for whether the device class is what gates
+	 * DisplayLink activation.
 	 */
-	.bDeviceClass       = USB_CLASS_MISC,
-	.bDeviceSubClass    = 0x02,
-	.bDeviceProtocol    = 0x01,
+	.bDeviceClass       = USB_CLASS_PER_INTERFACE,
+	.bDeviceSubClass    = 0x00,
+	.bDeviceProtocol    = 0x00,
 	.bMaxPacketSize0    = 64,
 	.idVendor           = cpu_to_le16(DL_VENDOR_ID),
 	.idProduct          = cpu_to_le16(DL_PRODUCT_ID),
-	.bcdDevice          = cpu_to_le16(0x0100),
+	.bcdDevice          = cpu_to_le16(0x0001),
 	/* iManufacturer / iProduct / iSerialNumber filled in gdl_bind */
 	.bNumConfigurations = 1,
 };
@@ -121,6 +141,11 @@ static int gdl_config_bind(struct usb_configuration *c)
 	if (ret) {
 		pr_err("g_rndis_displaylink: usb_add_function(displaylink) = %d\n", ret);
 		return ret;
+	}
+
+	if (disable_rndis) {
+		pr_info("g_rndis_displaylink: DisplayLink-only mode (RNDIS disabled)\n");
+		return 0;
 	}
 
 	g_f_rndis = usb_get_function(g_fi_rndis);
@@ -204,20 +229,25 @@ static int __init gdl_init(void)
 		return ret;
 	}
 
-	g_fi_rndis = usb_get_function_instance("rndis");
-	if (IS_ERR(g_fi_rndis)) {
-		ret = PTR_ERR(g_fi_rndis);
-		pr_err("g_rndis_displaylink: rndis function unavailable (%d) — "
-		       "load usb_f_rndis.ko first\n", ret);
-		f_dl_free(g_dl);
-		g_dl = NULL;
-		return ret;
+	if (!disable_rndis) {
+		g_fi_rndis = usb_get_function_instance("rndis");
+		if (IS_ERR(g_fi_rndis)) {
+			ret = PTR_ERR(g_fi_rndis);
+			pr_err("g_rndis_displaylink: rndis function unavailable (%d) — "
+			       "load usb_f_rndis.ko first\n", ret);
+			f_dl_free(g_dl);
+			g_dl = NULL;
+			return ret;
+		}
+	} else {
+		g_fi_rndis = NULL;
 	}
 
 	ret = usb_composite_probe(&gdl_driver);
 	if (ret) {
 		pr_err("g_rndis_displaylink: usb_composite_probe = %d\n", ret);
-		usb_put_function_instance(g_fi_rndis);
+		if (!IS_ERR_OR_NULL(g_fi_rndis))
+			usb_put_function_instance(g_fi_rndis);
 		f_dl_free(g_dl);
 		g_dl = NULL;
 		return ret;

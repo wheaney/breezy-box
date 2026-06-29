@@ -1,0 +1,9 @@
+# Grant the renderer's unprivileged user access to /dev/raw-gadget.
+#
+# /dev/raw-gadget defaults to root:root mode 0600 (CONFIG_USB_RAW_GADGET), so
+# the renderer (runs as an unprivileged user, see breezy-renderer.service)
+# cannot open it to drive the DisplayLink gadget transport (raw_gadget.c)
+# without this rule. video is the group the renderer's systemd unit already
+# grants via SupplementaryGroups, so reuse it here instead of adding a new
+# group purely for this device node.
+KERNEL=="raw-gadget", SUBSYSTEM=="misc", MODE="0660", GROUP="video"

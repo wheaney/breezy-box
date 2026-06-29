@@ -6,6 +6,7 @@
 #include <linux/kfifo.h>
 #include <linux/spinlock.h>
 #include <linux/wait.h>
+#include <linux/workqueue.h>
 #include <linux/usb/composite.h>
 
 /*
@@ -23,8 +24,17 @@
  * covers the largest host URB and never trips dwc3's unaligned bounce/extra-TRB
  * path on a short final packet.
  */
-#define DL_NUM_REQS     8
-#define DL_BULK_BUFSIZE (64 * 1024)
+/*
+ * Match the known-good raw-gadget reference EXACTLY: a single in-flight bulk-OUT
+ * request of 16 KiB (its BULK_OUT_BUFFER_SIZE).  That userspace gadget drove
+ * this same Windows host to a working display on this very controller family,
+ * reading one request at a time.  Our earlier 8×64K / 2×64K concurrent arming
+ * hard-hangs BOTH dwc3 and sunxi/MUSB on the first bulk-OUT (completion never
+ * fires).  A 16 KiB request still receives the host's large (up to 64K) URBs
+ * across several maxpacket-aligned completions, terminated by the short packet.
+ */
+#define DL_NUM_REQS     1
+#define DL_BULK_BUFSIZE (16 * 1024)
 
 struct f_displaylink {
 	struct usb_function      func;
@@ -32,12 +42,25 @@ struct f_displaylink {
 	struct usb_request      *reqs[DL_NUM_REQS];
 	int                      n_reqs;
 	bool                     disabled;
+	/*
+	 * Bulk-OUT arming is deferred out of the set_alt callback into a workqueue
+	 * (see dl_arm_work).  Arming inside set_alt means the first usb_ep_queue
+	 * runs in the UDC's set-alt/setup context — atomic, often with the
+	 * controller lock held — which hard-hangs both dwc3 and sunxi on the first
+	 * OUT.  The known-good userspace FFS path (ZeroKVM) submits its first AIO
+	 * read as a separate, later step after the endpoint is enabled; arm_work
+	 * mirrors that by queueing from process context outside the set_alt stack.
+	 */
+	struct work_struct       arm_work;
+	bool                     armed;       /* bulk reqs currently queued */
 	spinlock_t               lock;
 	DECLARE_KFIFO_PTR(fifo, u8);
 	wait_queue_head_t        read_wait;
 	u8                       edid[128];
 	u8                       vendor_desc[16];
 	u8                       vendor_desc_len;
+	bool                     key_loaded;  /* Windows SET_KEY (0x12 OUT) seen */
+	u8                      *ctrl_ram;    /* 64K control-RAM for Windows peek/poke */
 	u64                      rx_bytes;    /* total bulk bytes pushed into fifo */
 	u64                      rx_dropped;  /* bulk bytes dropped (fifo full) */
 	u32                      rx_reqs;     /* completed bulk requests */

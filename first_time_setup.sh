@@ -10,14 +10,15 @@ fi
 
 tar -xf $USER_HOME/breezyUI-x86_64.tar.gz
 
-if [ -z "$XDG_DATA_HOME" ]; then
+if [ -z "${XDG_DATA_HOME:-}" ]; then
   XDG_DATA_HOME="$USER_HOME/.local/share"
 fi
 
-if [ -z "$XDG_BIN_HOME" ]; then
+if [ -z "${XDG_BIN_HOME:-}" ]; then
   XDG_BIN_HOME="$USER_HOME/.local/bin"
 fi
 
+mkdir -p "$XDG_BIN_HOME"
 mkdir -p "$XDG_DATA_HOME"
 cp -r breezy_ui/data/* "$XDG_DATA_HOME"
 cp -r breezy_ui/bin/* "$XDG_BIN_HOME"

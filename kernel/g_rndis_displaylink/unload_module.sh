@@ -4,7 +4,12 @@
 # normal configfs RNDIS gadget.  Run as root, with the USB host UNPLUGGED.
 #
 set -uo pipefail
+MOD_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 UDC="$(ls /sys/class/udc 2>/dev/null | head -1)"
+
+# shellcheck source=board_quirks.sh
+source "$MOD_DIR/board_quirks.sh"
+
 if [[ $EUID -ne 0 ]]; then echo "run as root (sudo $0)"; exit 1; fi
 
 state="$(cat /sys/class/udc/$UDC/state 2>/dev/null)"
@@ -16,6 +21,10 @@ fi
 echo "=== Removing module ==="
 rmmod g_rndis_displaylink 2>&1 || echo "(was not loaded?)"
 sleep 1
+
+echo "=== Board-specific restore (board_quirks.sh) ==="
+board_post_unload
+systemctl unmask breezy-gadget.service 2>/dev/null || true
 
 echo "=== Restoring configfs RNDIS gadget ==="
 systemctl start breezy-gadget.service 2>&1 || true

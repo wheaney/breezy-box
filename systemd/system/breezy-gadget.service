@@ -1,5 +1,5 @@
 [Unit]
-Description=Breezy Box OTG RNDIS gadget setup
+Description=Breezy Box DisplayLink FunctionFS gadget setup
 Documentation=https://github.com/wheaney/breezy-box
 # Run after the USB subsystem is up but before user sessions start.
 After=systemd-udevd.service
@@ -9,7 +9,7 @@ Before=multi-user.target
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/local/lib/breezy-box/breezy_gadget_setup.sh
-ExecStop=/bin/sh -c 'echo "" > /sys/kernel/config/usb_gadget/breezy-composite/UDC 2>/dev/null || true'
+ExecStop=/bin/sh -c 'echo "" > /sys/kernel/config/usb_gadget/breezy-displaylink/UDC 2>/dev/null || true; umount /dev/ffs-dl 2>/dev/null || true'
 StandardOutput=journal
 StandardError=journal
 

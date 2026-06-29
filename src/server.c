@@ -542,9 +542,13 @@ int handle_import_request(struct server_runtime *server, int fd)
 		status = ST_NODEV;
 	else {
 		pthread_mutex_lock(&runtime->import_mutex);
-		if (runtime->reconfiguring || runtime->imported) {
-			/* Busy while an EDID/dimension hot-reload is in flight; the
-			 * client retries and lands on the freshly rebuilt device. */
+		if (runtime->reconfiguring || runtime->imported || runtime->is_gadget_device) {
+			/* Busy while an EDID/dimension hot-reload is in flight, or the
+			 * slot is currently held by the gadget transport (host cable).
+			 * The client retries and lands elsewhere / when it frees up.
+			 * Checking is_gadget_device here (under the same lock the gadget
+			 * claim takes) is what makes the runtime claim race-free: the
+			 * lockless find_device_by_busid skip is only a best-effort filter. */
 			status = ST_DEV_BUSY;
 		} else {
 			runtime->imported = true;
@@ -908,6 +912,9 @@ int server_runtime_init_devices(struct server_runtime *server)
 		return -1;
 
 	atomic_init(&server->config_positions_changed, false);
+	atomic_init(&server->drm_mode_width, 0u);
+	atomic_init(&server->drm_mode_height, 0u);
+	atomic_init(&server->drm_mode_hz, 0u);
 	for (i = 0u; i < MAX_USBIP_DEVICES; ++i) {
 		atomic_init(&server->config_textures_dirty[i], false);
 		atomic_init(&server->config_slot_add_pending[i], false);
@@ -934,6 +941,118 @@ int server_runtime_init_devices(struct server_runtime *server)
 	}
 
 	return 0;
+}
+
+void server_publish_drm_mode(struct server_runtime *server,
+			     uint32_t width, uint32_t height, uint32_t hz)
+{
+	if (!server)
+		return;
+	atomic_store_explicit(&server->drm_mode_width, width, memory_order_relaxed);
+	atomic_store_explicit(&server->drm_mode_height, height, memory_order_relaxed);
+	atomic_store_explicit(&server->drm_mode_hz, hz, memory_order_relaxed);
+}
+
+/*
+ * Try to repurpose slot i for the gadget: succeeds only if the slot is active,
+ * not already a gadget slot, and has no live USB/IP import.  The flag flip and
+ * the import/reconfigure checks happen together under import_mutex, the same
+ * lock handle_import_request takes, so exactly one of {gadget claim, USB/IP
+ * import} wins a contested slot.
+ */
+static bool try_claim_slot_locked(struct server_runtime *server, size_t i)
+{
+	struct device_runtime *runtime = &server->devices[i];
+	bool claimed = false;
+
+	if (!server_slot_is_active(server, i))
+		return false;
+
+	pthread_mutex_lock(&runtime->import_mutex);
+	if (!runtime->imported && !runtime->reconfiguring && !runtime->is_gadget_device) {
+		runtime->is_gadget_device = true;
+		claimed = true;
+	}
+	pthread_mutex_unlock(&runtime->import_mutex);
+	return claimed;
+}
+
+size_t server_claim_gadget_slot(struct server_runtime *server,
+				size_t *slot_out,
+				bool *created_out)
+{
+	size_t i;
+	size_t slot;
+	uint32_t w, h, hz;
+
+	if (slot_out)
+		*slot_out = SIZE_MAX;
+	if (created_out)
+		*created_out = false;
+	if (!server)
+		return SIZE_MAX;
+
+	/* 1. Lowest-index active slot with no live USB/IP import — repurpose it. */
+	for (i = 0u; i < MAX_USBIP_DEVICES; ++i) {
+		if (try_claim_slot_locked(server, i)) {
+			if (slot_out)
+				*slot_out = i;
+			return i;
+		}
+	}
+
+	/* 2. Every active slot is taken (imported or already a gadget slot).  Build
+	 *    a fresh fallback slot sized to the glasses (DRM) mode, or 1080p@30. */
+	slot = server_find_free_slot(server);
+	if (slot == SIZE_MAX) {
+		fprintf(stderr,
+			"gadget: no free slot for a fallback display (all %u in use)\n",
+			(unsigned int)MAX_USBIP_DEVICES);
+		return SIZE_MAX;
+	}
+
+	w  = atomic_load_explicit(&server->drm_mode_width,  memory_order_relaxed);
+	h  = atomic_load_explicit(&server->drm_mode_height, memory_order_relaxed);
+	hz = atomic_load_explicit(&server->drm_mode_hz,     memory_order_relaxed);
+
+	configured_device_default(&server->opts.devices[slot], slot);
+	server->opts.devices[slot].decode_width  = w ? w : DEFAULT_DISPLAY_WIDTH;
+	server->opts.devices[slot].decode_height = h ? h : DEFAULT_DISPLAY_HEIGHT;
+	server->opts.devices[slot].refresh_hz    = DEFAULT_REFRESH_HZ; /* 30 Hz */
+	(void)hz; /* glasses refresh ignored: the gadget display runs at 30 Hz */
+	if (slot >= server->opts.device_count)
+		server->opts.device_count = slot + 1u;
+
+	if (server_device_init_slot(server, slot) != 0) {
+		fprintf(stderr, "gadget: failed to build fallback slot %zu\n", slot);
+		return SIZE_MAX;
+	}
+	server->devices[slot].is_gadget_device = true;
+	/* Hand GL-texture creation + activation to the render thread; it builds the
+	 * texture (GL is render-thread-only) then publishes the slot active. */
+	atomic_store(&server->config_slot_add_pending[slot], true);
+	if (slot_out)
+		*slot_out = slot;
+	if (created_out)
+		*created_out = true;
+	return slot;
+}
+
+void server_release_gadget_slot(struct server_runtime *server, size_t slot)
+{
+	struct device_runtime *runtime;
+
+	if (!server || slot >= MAX_USBIP_DEVICES)
+		return;
+	runtime = &server->devices[slot];
+
+	/* Clear under import_mutex so a concurrent handle_import_request sees a
+	 * consistent flag.  The slot stays active: the renderer keeps drawing it and
+	 * USB/IP may now re-import it.  A created fallback slot simply lingers
+	 * (active, unfed) and is reused by the next claim. */
+	pthread_mutex_lock(&runtime->import_mutex);
+	runtime->is_gadget_device = false;
+	pthread_mutex_unlock(&runtime->import_mutex);
 }
 
 void server_runtime_destroy(struct server_runtime *server)

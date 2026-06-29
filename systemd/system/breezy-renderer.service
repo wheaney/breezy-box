@@ -17,8 +17,7 @@
 [Unit]
 Description=Breezy Box KMS renderer (kiosk on tty1)
 Documentation=https://github.com/wheaney/breezy-box
-After=breezy-gadget.service systemd-user-sessions.service getty@tty1.service
-Wants=breezy-gadget.service
+After=systemd-user-sessions.service getty@tty1.service
 # Cap restarts so a stray-signal loop can't hot-spin (see Restart=always below).
 StartLimitIntervalSec=60
 StartLimitBurst=10

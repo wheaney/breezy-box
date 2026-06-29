@@ -105,6 +105,13 @@ struct server_runtime {
 	atomic_bool config_textures_dirty[MAX_USBIP_DEVICES];
 	atomic_bool config_slot_add_pending[MAX_USBIP_DEVICES];
 	atomic_bool config_slot_remove_pending[MAX_USBIP_DEVICES];
+
+	/* Current glasses (DRM) mode, published by the render thread after each
+	 * kms_init_drm.  Read by server_claim_gadget_slot to size a fallback gadget
+	 * display when every configured slot is taken.  0 until the first DRM init. */
+	atomic_uint drm_mode_width;
+	atomic_uint drm_mode_height;
+	atomic_uint drm_mode_hz;
 };
 
 /* Per-connection context passed to connection threads */
@@ -163,6 +170,39 @@ void server_runtime_destroy(struct server_runtime *server);
  * server_find_free_slot     first inactive, non-add-pending slot index, or SIZE_MAX.
  * server_find_active_slot_by_busid  index of the active slot serving busid, or SIZE_MAX.
  */
+/* Publish the current glasses (DRM) mode so a later gadget claim can size a
+ * fallback display to match.  Called by the render thread after kms_init_drm. */
+void server_publish_drm_mode(struct server_runtime *server,
+			     uint32_t width, uint32_t height, uint32_t hz);
+
+/*
+ * Claim a display slot to be driven by a gadget transport (FFS/raw) instead of
+ * USB/IP.  Called at host-connect time (not startup), so it coordinates with the
+ * live USB/IP import path under each slot's import_mutex.  Selection:
+ *   1. the LOWEST-index active slot that is not is_gadget_device and has no live
+ *      USB/IP import — repurpose it in place (keeps its EDID/geometry, stays
+ *      active with its GL texture; flagging is_gadget_device drops it from the
+ *      USB/IP devlist/import while the gadget holds it);
+ *   2. otherwise build a fresh slot sized to the published DRM mode (or 1080p@30
+ *      if none) and hand it to the render thread via config_slot_add_pending so
+ *      it builds the GL texture and activates it; *created_out is set true.
+ *
+ * On success returns the slot index (also in *slot_out) and sets *created_out.
+ * Returns SIZE_MAX on failure (e.g. every slot is imported and no free slot).
+ */
+size_t server_claim_gadget_slot(struct server_runtime *server,
+				size_t *slot_out,
+				bool *created_out);
+
+/*
+ * Release a slot previously claimed by server_claim_gadget_slot back to the
+ * USB/IP pool: clears is_gadget_device under import_mutex so imports are allowed
+ * again.  The slot stays active (the renderer keeps drawing it, USB/IP may
+ * re-import it); a created fallback slot lingers and is reused by a later claim.
+ * Caller must have already stopped feeding the slot's udl_runtime.
+ */
+void server_release_gadget_slot(struct server_runtime *server, size_t slot);
+
 int    server_device_init_slot(struct server_runtime *server, size_t i);
 void   server_device_destroy_slot(struct server_runtime *server, size_t i);
 void   server_activate_slot(struct server_runtime *server, size_t i);
