@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+sudo apt-get update
+sudo apt-get install -y build-essential python3-gi libevdev-dev libdrm-dev libxcb-dri2-0 libgbm-dev dkms libjson-c-dev kmod dnsmasq avahi-daemon avahi-utils libglib2.0-bin gsettings-desktop-schemas libgtk-4-dev gnome-themes-extra libadwaita-1-0 gir1.2-adw-1 nftables xvfb x11vnc novnc network-manager iputils-ping curl patchelf libcap2-bin openssl gzip util-linux linux-headers-amd64 libssl-dev libelf-dev 
+wget https://packages.microsoft.com/config/debian/13/packages-microsoft-prod.deb -O packages-microsoft-prod.deb
+sudo dpkg -i packages-microsoft-prod.deb
+rm packages-microsoft-prod.deb
+sudo apt-get update && sudo apt-get install -y dotnet-sdk-10.0
+
 USER_HOME=$(realpath ~)
 
 if [ ! -f $USER_HOME/breezyUI-x86_64.tar.gz ]; then
@@ -45,13 +52,6 @@ systemctl --user start xr-driver
 $XDG_BIN_HOME/xr_driver_cli -e -bd
 
 printf "request_features=productivity,productivity_pro\n" >> /dev/shm/xr_driver_control 2>/dev/null || true
-
-sudo apt-get update
-sudo apt-get install -y build-essential python3-gi libevdev-dev libdrm-dev libxcb-dri2-0 libgbm-dev dkms libjson-c-dev kmod dnsmasq avahi-daemon avahi-utils libglib2.0-bin gsettings-desktop-schemas libgtk-4-dev gnome-themes-extra libadwaita-1-0 gir1.2-adw-1 nftables xvfb x11vnc novnc network-manager iputils-ping curl patchelf libcap2-bin openssl gzip util-linux linux-headers-amd64 libssl-dev libelf-dev 
-wget https://packages.microsoft.com/config/debian/13/packages-microsoft-prod.deb -O packages-microsoft-prod.deb
-sudo dpkg -i packages-microsoft-prod.deb
-rm packages-microsoft-prod.deb
-sudo apt-get update && sudo apt-get install -y dotnet-sdk-10.0
 
 sudo modprobe pvrsrvkm
 
