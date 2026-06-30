@@ -8,6 +8,8 @@ sudo dpkg -i packages-microsoft-prod.deb
 rm packages-microsoft-prod.deb
 sudo apt-get update && sudo apt-get install -y dotnet-sdk-10.0
 
+sudo usermod -aG video,render,input $USER
+
 USER_HOME=$(realpath ~)
 
 if [ ! -f $USER_HOME/breezyUI-x86_64.tar.gz ]; then

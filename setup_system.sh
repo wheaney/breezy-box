@@ -326,7 +326,13 @@ ssh_session_iface() {
         [[ -z "$ppid" || "$ppid" == "$pid" ]] && return 1
         pid="$ppid"
     done
-    [[ "$comm" != sshd ]] && return 1   # no sshd ancestor — local console
+    # No sshd ancestor: this is a local console / TTY. Emit an explicit
+    # sentinel so the caller can tell "proven local" apart from "had an sshd
+    # ancestor but couldn't resolve its iface" (which must fail closed).
+    if [[ "$comm" != sshd ]]; then
+        echo "__local__"
+        return 0
+    fi
 
     # Get the file descriptors for this sshd pid and find the TCP socket inode
     # that is in ESTABLISHED state (tcp_state=01) by cross-referencing /proc/net/tcp.
@@ -338,14 +344,19 @@ ssh_session_iface() {
 
         # /proc/net/tcp columns: sl local_addr rem_addr state ... inode
         # state=01 = ESTABLISHED; rem_addr is client (hex little-endian).
-        client_hex="$(awk -v in="$inode" '$10==in && $4=="01" {print $3}' \
-                      /proc/net/tcp 2>/dev/null | head -n1)"
+        client_hex="$(awk -v want="$inode" '$10==want && $4=="01" {print $3}' \
+                      /proc/net/tcp /proc/net/tcp6 2>/dev/null | head -n1)"
         [[ -z "$client_hex" ]] && continue
 
         # Convert hex little-endian IP:PORT → dotted IP.
-        # Format: AABBCCDD:PPPP where AABBCCDD is the IP in little-endian hex.
+        # IPv4 (/proc/net/tcp):  AABBCCDD:PPPP  (8 hex digits, little-endian)
+        # IPv6 (/proc/net/tcp6): 32 hex digits; for an SSH client this is
+        #   normally an IPv4-mapped address whose v4 part is the last 8 digits,
+        #   also stored little-endian per 32-bit word — so the tail 8 digits
+        #   decode exactly like the v4 case above.
         local hex_ip hex_b1 hex_b2 hex_b3 hex_b4
         hex_ip="${client_hex%%:*}"
+        hex_ip="${hex_ip: -8}"          # last 8 hex digits (v4, or v4-mapped tail)
         hex_b4=$(( 16#${hex_ip:0:2} ))
         hex_b3=$(( 16#${hex_ip:2:2} ))
         hex_b2=$(( 16#${hex_ip:4:2} ))
@@ -364,10 +375,26 @@ ssh_session_iface() {
 GUARD_ETH_IFACE="$(detect_wired_eth_iface || true)"
 SSH_IFACE="$(ssh_session_iface || true)"
 
-if [[ -z "$SSH_IFACE" && -z "${SSH_CONNECTION:-}" ]]; then
+if [[ "$SSH_IFACE" == "__local__" && -z "${SSH_CONNECTION:-}" ]]; then
     skip_msg "not an SSH session (local console) — wired reconfig is safe"
 elif [[ -z "$SSH_IFACE" ]]; then
-    warn_msg "could not determine the SSH session's interface — proceeding (assuming not wired)"
+    # We could NOT determine the session's interface. This is the dangerous
+    # case: if we're actually on the wired port and guess "safe", the reconfig
+    # drops the link mid-run. Fail closed — abort and tell the user how to
+    # reconnect. (SSH_CONNECTION, if present, can't tell us the iface either.)
+    echo
+    echo "  ABORT: could not determine which interface this session is using."
+    echo "  The wired-network setup that follows would reconfigure the Ethernet"
+    echo "  port into a direct host link (192.168.77.2/30); if this session is"
+    echo "  arriving over that port, it would be DROPPED mid-run."
+    echo
+    echo "  Reconnect over Wi-Fi (or via breezy.local / the OTG USB link), or run"
+    echo "  from a local console, and run setup_system.sh again. If you are certain"
+    echo "  this session is not on the wired port, set ALLOW_WIRED_RECONFIG=1."
+    echo
+    [[ "${ALLOW_WIRED_RECONFIG:-}" == "1" ]] \
+        && warn_msg "ALLOW_WIRED_RECONFIG=1 — proceeding despite unknown interface" \
+        || exit 1
 elif [[ -n "$GUARD_ETH_IFACE" && "$SSH_IFACE" == "$GUARD_ETH_IFACE" ]]; then
     echo
     echo "  ABORT: this SSH session is arriving over the wired Ethernet port ($SSH_IFACE)."
@@ -1009,26 +1036,3 @@ else
         done_msg "installed default config: $CONFIG_DST (3× 1080p@30)"
     fi
 fi
-
-# ---------------------------------------------------------------------------
-echo
-echo "System setup complete."
-echo
-echo "Next steps if not done yet:"
-echo "  1. Create the app user:  useradd -m -s /bin/bash -c 'Breezy Box' $APP_USER"
-echo "     Add to groups:        sudo usermod -aG video,render,input $APP_USER"
-echo "  2. Fetch vendored deps and build (run as $APP_USER):"
-echo "     cd /home/$APP_USER/breezy-box && make deps && make"
-echo "     cp displaylink_kms_renderer breezy_web ~/.local/bin/"
-echo "     # the renderer's NativeAOT sibling must sit beside it (cap makes \$ORIGIN unusable):"
-echo "     cp modules/ZeroKVM/src/ZeroKvm.NativeBridge/bin/Release/*/linux-arm64/publish/ZeroKvm.NativeBridge.so ~/.local/bin/"
-echo "     # then re-run setup so it sets the absolute rpath + cap, and (A733) installs the PowerVR userspace"
-echo "  3. Trust the self-signed cert on each client:"
-echo "     scp root@breezy.local:/etc/breezy-box/tls/server.crt ."
-echo "     Then import server.crt into your browser / OS trust store."
-echo "     The UI is served at https://breezy.local"
-echo "  4. Reboot. On boot:"
-echo "     • breezy-gadget.service (root) sets up the OTG gadget;"
-echo "     • breezy-renderer.service runs as $APP_USER on tty1, takes DRM master,"
-echo "       and adopts the gadget;"
-echo "     • the app user's lingering session starts breezy.target (Xvfb/web/VNC)."
