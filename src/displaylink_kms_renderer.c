@@ -48,7 +48,6 @@
 #include "smooth_follow.h"
 #include "usb_gadget.h"
 #include "link_services.h"
-#include "ffs_gadget.h"  /* dead code: cannot answer GET_DESCRIPTOR(0x5f), see start-up comment below */
 #include "raw_gadget.h"
 
 /* Global stop flag — declared extern in kms_common.h */
@@ -378,7 +377,14 @@ static void kms_poll_device_config(struct kms_state *kms,
 	              && cfg.version == BREEZY_IMU_EXPECTED_VERSION
 	              && cfg.diagonal_fov_deg != 0.0f;
 
-	/* Count active display slots for the overlay regardless of glasses state. */
+	/*
+	 * Count active display slots for the overlay regardless of glasses state.
+	 * For gadget slots, "active" requires has_first_frame (a decoded frame has
+	 * actually arrived), not just gadget_host_connected (bare USB enumeration)
+	 * — otherwise the overlay would report a client as connected while the
+	 * panel is still showing nothing (see kms_draw's visible_idx gate, which
+	 * uses the same has_first_frame check before drawing the slot).
+	 */
 	{
 		size_t active_slots = 0u;
 		for (size_t i = 0u; i < MAX_USBIP_DEVICES; i++) {
@@ -388,7 +394,8 @@ static void kms_poll_device_config(struct kms_state *kms,
 			if (!server_slot_is_active(server, i))
 				continue;
 			slot_active = dev->is_gadget_device
-					  ? dev->gadget_host_connected
+					  ? (dev->gadget_host_connected &&
+					     kms->displays[i].has_first_frame)
 					  : dev->imported;
 			if (slot_active)
 				active_slots++;
@@ -1971,7 +1978,12 @@ static void kms_render_frame(struct kms_state *kms,
 	glDepthMask(GL_TRUE);
 
 	/*
-	 * Only render slots that have an active USB/IP import.
+	 * Only render slots that have an active USB/IP import *and* have actually
+	 * started streaming a decoded frame from the host.  A gadget slot goes
+	 * gadget_host_connected as soon as the OS enumerates the USB device, which
+	 * happens well before the OS decides to enable/drive that display (e.g.
+	 * GNOME's per-display enable toggle) — without the has_first_frame check
+	 * we'd light up the placeholder quad on bare enumeration alone.
 	 * Build a compact index array so the fallback arc spacing and the
 	 * overlay Y position are based on the visible count only.
 	 */
@@ -1984,7 +1996,7 @@ static void kms_render_frame(struct kms_state *kms,
 		bool active_slot = dev->is_gadget_device
 				       ? dev->gadget_host_connected
 				       : dev->imported;
-		if (active_slot)
+		if (active_slot && kms->displays[i].has_first_frame)
 			visible_idx[visible_count++] = i;
 	}
 
