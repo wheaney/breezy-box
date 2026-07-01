@@ -1,7 +1,6 @@
-#define _GNU_SOURCE   /* sched_setaffinity / CPU_SET */
+#define _GNU_SOURCE
 
 #include <errno.h>
-#include <sched.h>
 #include <math.h>
 #include <pthread.h>
 #include <signal.h>
@@ -2172,42 +2171,6 @@ static void kms_render_frame(struct kms_state *kms,
  * KMS page-flip render loop
  * ---------------------------------------------------------------- */
 
-/*
- * Give the render thread real-time scheduling so head-anchoring stays smooth
- * even while the decode threads saturate the other cores.  Best-effort: both
- * SCHED_FIFO and CPU affinity require CAP_SYS_NICE (granted to the renderer
- * unit via AmbientCapabilities=CAP_SYS_NICE).  If we lack it we log and carry
- * on at normal priority rather than refusing to render.
- */
-static void kms_boost_render_thread(void)
-{
-	pthread_t self = pthread_self();
-	struct sched_param sp;
-
-	memset(&sp, 0, sizeof sp);
-	/* Mid-range RT priority: above SCHED_OTHER (decode), well below kernel
-	 * threads/IRQ handlers so we never starve the system. */
-	sp.sched_priority = 20;
-	if (pthread_setschedparam(self, SCHED_FIFO, &sp) != 0)
-		fprintf(stderr,
-			"kms: SCHED_FIFO boost unavailable (%s) — running at normal "
-			"priority; grant CAP_SYS_NICE for smoother anchoring\n",
-			strerror(errno));
-	else
-		fprintf(stderr, "kms: render thread boosted to SCHED_FIFO prio %d\n",
-			sp.sched_priority);
-
-	/* Pin to CPU 0 so the decode threads (left on the other cores) can't
-	 * preempt the render thread's core.  Also best-effort. */
-	{
-		cpu_set_t set;
-		CPU_ZERO(&set);
-		CPU_SET(0, &set);
-		if (sched_setaffinity(0, sizeof set, &set) != 0)
-			fprintf(stderr, "kms: render-thread CPU pin failed (%s)\n",
-				strerror(errno));
-	}
-}
 
 static int kms_run(struct kms_state *kms, struct server_runtime *server)
 {
@@ -2279,9 +2242,6 @@ static int kms_run(struct kms_state *kms, struct server_runtime *server)
 		        strerror(errno));
 		return -1;
 	}
-
-	/* This is the render thread; boost it so anchoring never jitters. */
-	kms_boost_render_thread();
 
 	uint64_t last_frame_ms = 0;
 

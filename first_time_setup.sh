@@ -2,7 +2,7 @@
 set -euo pipefail
 
 sudo apt-get update
-sudo apt-get install -y build-essential m4 bison flex python3-gi libevdev-dev libdrm-dev libxcb-dri2-0 libgbm-dev dkms libjson-c-dev kmod dnsmasq avahi-daemon avahi-utils libglib2.0-bin gsettings-desktop-schemas libgtk-4-dev gnome-themes-extra libadwaita-1-0 gir1.2-adw-1 nftables xvfb x11vnc novnc network-manager iputils-ping curl patchelf libcap2-bin openssl gzip util-linux libssl-dev libelf-dev
+sudo apt-get install -y build-essential m4 bison flex python3-gi libevdev-dev libdrm-dev libxcb-dri2-0 libgbm-dev dkms libjson-c-dev kmod dnsmasq avahi-daemon avahi-utils libglib2.0-bin gsettings-desktop-schemas libgtk-4-dev gnome-themes-extra libadwaita-1-0 gir1.2-adw-1 nftables xvfb x11vnc novnc network-manager iputils-ping curl patchelf openssl gzip util-linux libssl-dev libelf-dev
 wget https://packages.microsoft.com/config/debian/13/packages-microsoft-prod.deb -O packages-microsoft-prod.deb
 sudo dpkg -i packages-microsoft-prod.deb
 rm packages-microsoft-prod.deb
@@ -87,5 +87,7 @@ if grep -qs 'img,gpu' /sys/bus/platform/devices/*/uevent 2>/dev/null; then
     echo "installed PowerVR userspace + firmware ($PVR_PKG) — reboot (or restart the renderer) so pvrsrvkm loads rgx.fw.* on next GPU bring-up"
   fi
 fi
+
+sudo ./disable_nonessential_services.sh
 
 ./rebuild.sh

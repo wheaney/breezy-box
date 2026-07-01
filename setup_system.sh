@@ -131,7 +131,6 @@ require_cmd ping       iputils-ping      # connectivity check fallback
 require_cmd openssl    openssl           # self-signed TLS cert for breezy-web
 require_cmd nft        nftables          # :80/:443 -> :8081/:8443 redirects
 require_cmd patchelf   patchelf          # absolute rpath on the renderer binary
-require_cmd setcap     libcap2-bin       # cap_sys_nice for the SCHED_FIFO thread
 require_cmd zcat       gzip              # decompress the PowerVR Packages.gz index
 
 # Runtime services with no convenient single-command probe: check the binary the
@@ -715,37 +714,6 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-section "Realtime scheduling for the render thread (SCHED_FIFO)"
-
-# The renderer boosts its GL thread to SCHED_FIFO (see §4 + breezy-renderer).
-# On kernels with CONFIG_RT_GROUP_SCHED=y under cgroup v2 (the A733 BSP),
-# realtime is denied to every non-root cgroup and cgroup v2 exposes no knob to
-# grant RT bandwidth — so even `chrt -f` as root fails and the file cap is moot.
-# Disabling RT *throttling* globally bypasses the per-group enforcement.
-#
-# GUARDED: applied ONLY when a live probe shows RT is actually blocked.  Boards
-# where setcap alone works (e.g. RK3399, CONFIG_RT_GROUP_SCHED=n) keep their RT
-# throttle intact.  -1 removes throttling system-wide — acceptable for a
-# dedicated appliance with one bounded, CPU-0-pinned RT thread.  The proper fix
-# is a kernel built with CONFIG_RT_GROUP_SCHED=n.  See §4.
-RT_SYSCTL="/etc/sysctl.d/10-breezy-rt.conf"
-if chrt -f 1 true 2>/dev/null; then
-    skip_msg "SCHED_FIFO already available — leaving RT throttle intact"
-elif [[ "$(cat /proc/sys/kernel/sched_rt_runtime_us 2>/dev/null)" == "-1" ]]; then
-    skip_msg "RT throttle already disabled (sched_rt_runtime_us=-1)"
-else
-    echo "kernel.sched_rt_runtime_us = -1" > "$RT_SYSCTL"
-    sysctl -w kernel.sched_rt_runtime_us=-1 >/dev/null 2>&1 || true
-    if chrt -f 1 true 2>/dev/null; then
-        done_msg "RT was blocked (RT_GROUP_SCHED) — disabled RT throttle via $RT_SYSCTL"
-    else
-        rm -f "$RT_SYSCTL"
-        warn_msg "RT still unavailable after sched_rt_runtime_us=-1 — render thread stays at"
-        warn_msg "  normal priority; needs a kernel built with CONFIG_RT_GROUP_SCHED=n"
-    fi
-fi
-
-# ---------------------------------------------------------------------------
 section "breezy-renderer kiosk system service (DRM master on tty1)"
 
 # The KMS renderer must take DRM master, which only the active session on seat0
@@ -844,49 +812,28 @@ else
     fi
     rm -f "$RENDERER_SVC_TMP"
 
-    # Grant CAP_SYS_NICE on the renderer BINARY (not via systemd
-    # AmbientCapabilities, which — combined with User=+PAMName=login — changes
-    # PAM credential ordering and costs the renderer its seat/DRM master).  The
-    # renderer needs CAP_SYS_NICE to put its GL render thread on SCHED_FIFO:
-    # unprivileged RT is refused on this kernel even with LimitRTPRIO set
-    # ("SCHED_FIFO boost unavailable: Operation not permitted").  A file
-    # capability is independent of the systemd credential path, so it grants the
-    # cap without perturbing the seat.  Must be re-applied whenever the binary
-    # is recopied — hence it runs here, every setup.
     RENDERER_BIN="/home/$APP_USER/.local/bin/displaylink_kms_renderer"
     RENDERER_DIR="$(dirname "$RENDERER_BIN")"
     if [[ -x "$RENDERER_BIN" ]]; then
-        # Absolute rpath BEFORE setcap.  The cap makes the binary AT_SECURE, so
-        # ld.so ignores $ORIGIN/LD_LIBRARY_PATH — it then can't find its NativeAOT
-        # sibling ZeroKvm.NativeBridge.so, nor (on PowerVR) the PVR Mesa in
-        # /usr/local/lib.  An ABSOLUTE rpath covering both fixes it.  patchelf
-        # rewrites the file and WIPES the file cap, so this must run before setcap.
-        # See docs/hardware/radxa-cubie-a7s.md §4 + §7.
+        # Absolute rpath so ld.so can find ZeroKvm.NativeBridge.so alongside
+        # the binary and (on PowerVR boards) the PVR Mesa in /usr/local/lib.
+        # /usr/local/lib is harmless (empty) on non-PVR boards.
+        # See docs/hardware/radxa-cubie-a7s.md §7.
         if [[ ! -e "$RENDERER_DIR/ZeroKvm.NativeBridge.so" ]]; then
-            warn_msg "ZeroKvm.NativeBridge.so missing from $RENDERER_DIR — renderer won't start under the cap"
+            warn_msg "ZeroKvm.NativeBridge.so missing from $RENDERER_DIR — renderer won't find it at runtime"
             warn_msg "  copy it from the build tree: .../ZeroKvm.NativeBridge/bin/Release/*/linux-arm64/publish/"
         fi
-        WANT_RPATH="$RENDERER_DIR:/usr/local/lib"   # /usr/local/lib is harmless (empty) on non-PVR boards
+        WANT_RPATH="$RENDERER_DIR:/usr/local/lib"
         # patchelf is guaranteed present by the preflight check.
         if [[ "$(patchelf --print-rpath "$RENDERER_BIN" 2>/dev/null || true)" != "$WANT_RPATH" ]]; then
             patchelf --force-rpath --set-rpath "$WANT_RPATH" "$RENDERER_BIN" \
-                && done_msg "set renderer rpath $WANT_RPATH (ZeroKvm + PVR Mesa under cap)" \
+                && done_msg "set renderer rpath $WANT_RPATH (ZeroKvm + PVR Mesa)" \
                 || warn_msg "patchelf --set-rpath failed on $RENDERER_BIN"
         else
             skip_msg "renderer rpath already $WANT_RPATH"
         fi
-
-        # setcap is guaranteed present by the preflight check.  Capture stderr:
-        # the common failure is $HOME on a nosuid mount or a filesystem without
-        # xattr support, and the reason matters.
-        if setcap_err="$(setcap cap_sys_nice+ep "$RENDERER_BIN" 2>&1)"; then
-            done_msg "granted cap_sys_nice to $RENDERER_BIN (SCHED_FIFO render thread)"
-        else
-            warn_msg "setcap on $RENDERER_BIN failed (${setcap_err:-unknown}) — render thread stays at normal priority"
-            warn_msg "  if the fs lacks xattr/is nosuid, install the binary to /usr/local/bin instead"
-        fi
     else
-        warn_msg "renderer binary not found at $RENDERER_BIN — build+copy it, then re-run setup to grant cap_sys_nice"
+        warn_msg "renderer binary not found at $RENDERER_BIN — build+copy it, then re-run setup"
     fi
 
     if systemctl is-enabled --quiet breezy-renderer.service 2>/dev/null; then

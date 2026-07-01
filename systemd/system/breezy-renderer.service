@@ -35,18 +35,6 @@ StandardOutput=journal
 StandardError=journal
 # Groups needed for DRM/GBM, GPU render, and reading input/IMU devices.
 SupplementaryGroups=video render input
-# The renderer puts its render thread on SCHED_FIFO so head-anchoring stays
-# smooth while decode threads load the other cores.  RT scheduling needs
-# CAP_SYS_NICE: in practice LimitRTPRIO alone is NOT enough — this kernel
-# refuses unprivileged SCHED_FIFO even with the rlimit raised ("Operation not
-# permitted").  We grant CAP_SYS_NICE on the BINARY via setcap (done in
-# setup_system.sh), NOT via AmbientCapabilities here: AmbientCapabilities
-# combined with User= + PAMName=login changes the PAM credential ordering and
-# stops logind from seating this session on seat0, costing us DRM master
-# (drmSetMaster: Permission denied).  LimitRTPRIO stays as belt-and-suspenders
-# (and a backstop if the file cap is ever missing).  If the boost still can't
-# be set the renderer logs and continues at normal priority.
-LimitRTPRIO=40
 ExecStart=/home/__APP_USER__/.local/bin/displaylink_kms_renderer
 # Always restart, even on a clean (SIGTERM) exit, so a stray VT signal can't
 # leave the screen black.  The start-limit (in [Unit]) prevents a hot loop.
