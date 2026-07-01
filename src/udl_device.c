@@ -1322,7 +1322,7 @@ static size_t build_config_descriptor(const struct device_runtime *runtime,
 	block.config.bNumInterfaces = 1u;
 	block.config.bConfigurationValue = 1u;
 	block.config.bmAttributes = USB_CONFIG_ATT_ONE;
-	block.config.bMaxPower = 125u;
+	block.config.bMaxPower = 250u;  /* 500 mA — USB 2.0 HS maximum */
 
 	block.interface.bLength = USB_DT_INTERFACE_SIZE;
 	block.interface.bDescriptorType = USB_DT_INTERFACE;
@@ -1543,15 +1543,35 @@ static int prepare_vendor_request(struct device_runtime *runtime,
 	if (request_type == (USB_DIR_OUT | USB_TYPE_VENDOR | USB_RECIP_DEVICE) &&
 	    request == UDL_VENDOR_REQUEST_MEMORY_POKE &&
 	    value == 0u) {
-		if (length != 1u || payload_length != 1u) {
-			fprintf(stderr, "Unexpected control RAM poke payload length %zu\n", payload_length);
+		/*
+		 * A control RAM poke writes payload_length consecutive bytes
+		 * starting at `index`.  The Linux udl driver only ever pokes a
+		 * single byte, but Windows' DisplayLink driver sends multi-byte
+		 * pokes (observed: 3 and 13 bytes at idx=0x4000) during its
+		 * init handshake.  Reject only genuinely malformed requests
+		 * (length mismatch or zero-length); accept any positive run
+		 * that fits in control RAM, mirroring real hardware which has a
+		 * contiguous register file here.
+		 */
+		if (length == 0u || payload_length == 0u || length != payload_length) {
+			fprintf(stderr,
+				"Unexpected control RAM poke: length=%u payload_length=%zu\n",
+				(unsigned int)length, payload_length);
 			return -1;
 		}
-		udl_control_ram_write_byte(runtime, index, payload[0]);
+		if ((size_t)index + payload_length > UDL_CONTROL_RAM_SIZE) {
+			fprintf(stderr,
+				"Control RAM poke out of range: addr=0x%04x len=%zu\n",
+				(unsigned int)index, payload_length);
+			return -1;
+		}
+		for (size_t i = 0u; i < payload_length; i++)
+			udl_control_ram_write_byte(runtime,
+						   (uint16_t)(index + i), payload[i]);
 		if (runtime->opts.verbose) {
 			fprintf(stderr,
-				"Control RAM poke: addr=0x%04x value=0x%02x\n",
-				(unsigned int)index,
+				"Control RAM poke: addr=0x%04x len=%zu first=0x%02x\n",
+				(unsigned int)index, payload_length,
 				(unsigned int)payload[0]);
 		}
 		result->action = CONTROL_ACTION_ACK;
@@ -1734,12 +1754,17 @@ static int prepare_vendor_request(struct device_runtime *runtime,
 		if (reply_length > sizeof(result->data))
 			reply_length = sizeof(result->data);
 
-		memset(result->data, 0, reply_length);
+		/*
+		 * The response is: 1 status byte + up to wLength EDID bytes.
+		 * Total response size is copy_length + 1, which may exceed wLength
+		 * (that's correct — the host asked for wLength data bytes, and we
+		 * return wLength data bytes PLUS the leading status byte).
+		 */
 		result->data[0] = 0x00; /* status: success */
 		if ((size_t)byte_index < sizeof(runtime->edid)) {
 			copy_length = sizeof(runtime->edid) - (size_t)byte_index;
-			if (copy_length > reply_length - 1u) {
-				copy_length = reply_length - 1u;
+			if (copy_length > reply_length) {
+				copy_length = reply_length;
 			}
 		}
 		if (copy_length > 0u) {
@@ -1747,7 +1772,7 @@ static int prepare_vendor_request(struct device_runtime *runtime,
 			       runtime->edid + byte_index,
 			       copy_length);
 		}
-		result->actual_length = reply_length;
+		result->actual_length = copy_length + 1u;
 		result->action = CONTROL_ACTION_DATA_IN;
 		if (runtime->opts.verbose) {
 			fprintf(stderr,

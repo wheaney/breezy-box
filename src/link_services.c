@@ -3,16 +3,11 @@
 
 #include "link_services.h"
 
-#include <arpa/inet.h>
-#include <dirent.h>
 #include <errno.h>
-#include <ifaddrs.h>
-#include <net/if.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
 #include <time.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -23,7 +18,6 @@
  * path strings so two link_services instances on different interfaces don't
  * clobber each other's files. */
 
-static void kill_matching_publishers(const char *fqdn);
 static void kill_pidfile(const char *path);
 
 /* Run a command to completion; returns 0 on exit status 0, -1 otherwise. */
@@ -104,135 +98,6 @@ static int spawn_publish_address(const char *pidfile,
     return spawn_cmd(pidfile, argv);
 }
 
-static bool iface_has_wireless_dir(const char *ifname)
-{
-    char path[128];
-    struct stat st;
-
-    if (!ifname || ifname[0] == '\0')
-        return false;
-    snprintf(path, sizeof(path), "/sys/class/net/%s/wireless", ifname);
-    return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
-}
-
-static int detect_non_link_ipv4(const char *exclude_iface, char *out, size_t cap)
-{
-    struct ifaddrs *ifaddr = NULL;
-    struct ifaddrs *ifa;
-    char fallback[LS_IP_MAX] = "";
-
-    if (!out || cap == 0)
-        return -1;
-    out[0] = '\0';
-
-    if (getifaddrs(&ifaddr) != 0)
-        return -1;
-
-    for (ifa = ifaddr; ifa; ifa = ifa->ifa_next) {
-        const struct sockaddr_in *sin;
-        char addrbuf[INET_ADDRSTRLEN];
-        uint32_t addr;
-
-        if (!ifa->ifa_name || !ifa->ifa_addr)
-            continue;
-        if (ifa->ifa_addr->sa_family != AF_INET)
-            continue;
-        if ((ifa->ifa_flags & IFF_UP) == 0)
-            continue;
-        if ((ifa->ifa_flags & IFF_LOOPBACK) != 0)
-            continue;
-        if (exclude_iface && strcmp(ifa->ifa_name, exclude_iface) == 0)
-            continue;
-
-        sin = (const struct sockaddr_in *)ifa->ifa_addr;
-        addr = ntohl(sin->sin_addr.s_addr);
-        if ((addr & 0xffff0000u) == 0xa9fe0000u)
-            continue;
-        if (!inet_ntop(AF_INET, &sin->sin_addr, addrbuf, sizeof(addrbuf)))
-            continue;
-
-        if (iface_has_wireless_dir(ifa->ifa_name)) {
-            snprintf(out, cap, "%s", addrbuf);
-            freeifaddrs(ifaddr);
-            return 0;
-        }
-        if (fallback[0] == '\0')
-            snprintf(fallback, sizeof(fallback), "%s", addrbuf);
-    }
-
-    freeifaddrs(ifaddr);
-    if (fallback[0] == '\0')
-        return -1;
-
-    snprintf(out, cap, "%s", fallback);
-    return 0;
-}
-
-static int read_proc_cmdline(pid_t pid, char *buf, size_t cap)
-{
-    char path[64];
-    FILE *f;
-    size_t n;
-
-    if (cap == 0)
-        return -1;
-    snprintf(path, sizeof(path), "/proc/%ld/cmdline", (long)pid);
-    f = fopen(path, "rb");
-    if (!f)
-        return -1;
-    n = fread(buf, 1, cap - 1, f);
-    fclose(f);
-    if (n == 0)
-        return -1;
-    buf[n] = '\0';
-    return 0;
-}
-
-static void kill_matching_publishers(const char *fqdn)
-{
-    DIR *d;
-    struct dirent *e;
-
-    if (!fqdn || fqdn[0] == '\0')
-        return;
-
-    d = opendir("/proc");
-    if (!d)
-        return;
-
-    while ((e = readdir(d)) != NULL) {
-        char *argv0;
-        char *argv1;
-        char *argv2;
-        char cmdline[512];
-        char *end;
-        long pid_l;
-        pid_t pid;
-
-        pid_l = strtol(e->d_name, &end, 10);
-        if (*e->d_name == '\0' || *end != '\0' || pid_l <= 1)
-            continue;
-        pid = (pid_t)pid_l;
-        if (read_proc_cmdline(pid, cmdline, sizeof(cmdline)) != 0)
-            continue;
-
-        argv0 = cmdline;
-        argv1 = argv0 + strlen(argv0) + 1;
-        if (argv1 >= cmdline + sizeof(cmdline))
-            continue;
-        argv2 = argv1 + strlen(argv1) + 1;
-        if (strcmp(argv0, "avahi-publish-address") != 0)
-            continue;
-        if (strcmp(argv1, fqdn) != 0 &&
-            (argv2 >= cmdline + sizeof(cmdline) || strcmp(argv2, fqdn) != 0))
-            continue;
-
-        (void)kill(pid, SIGTERM);
-    }
-
-    closedir(d);
-}
-
 /* Kill a process recorded in a pid-file and remove the file (idempotent). */
 static void kill_pidfile(const char *path)
 {
@@ -262,7 +127,6 @@ void link_services_config_defaults(struct link_services_config *cfg)
     snprintf(cfg->iface,     sizeof(cfg->iface),     "usb0");
     snprintf(cfg->link_ip,   sizeof(cfg->link_ip),   "192.168.7.2");
     snprintf(cfg->link_name, sizeof(cfg->link_name), "breezy");
-    snprintf(cfg->wlan_name, sizeof(cfg->wlan_name), "breezywlan");
     /* host_ip intentionally empty: networkd's DHCPServer (usb0.network) serves
      * the host address, so we don't need to spawn a dnsmasq instance here. */
 }
@@ -326,25 +190,27 @@ static int start_dhcp(const struct link_services_config *cfg,
 }
 
 /*
- * Publish the mDNS names via the system avahi daemon as explicit address
- * aliases:
- *   - link_name is pinned to link_ip so breezy.local resolves to the correct
- *     IP on the interface the host queries from.  Multiple instances (one per
- *     interface) may publish the same FQDN with different IPs; mDNS is
- *     link-local so each host sees only the record on its own segment.
- *   - wlan_name is pinned to the first non-link IPv4 address (prefer a
- *     wireless interface) so it resolves to the Wi-Fi/LAN path.
+ * Publish the link mDNS name via the system avahi daemon as an explicit address
+ * alias: link_name is pinned to link_ip so breezy.local resolves to the correct
+ * IP on the interface the host queries from.  Multiple instances (one per
+ * interface) may publish the same FQDN with different IPs; mDNS is link-local
+ * so each host sees only the record on its own segment.
+ *
+ * The Wi-Fi/LAN name (breezywlan.local) is published separately by the
+ * breezy-wlan-mdns systemd service (publish_wlan_mdns.sh), which polls for the
+ * wlan address and re-pins on DHCP changes — something this one-shot path
+ * cannot do (at startup wlan0 has no lease yet).
+ *
  * Returns 0 if the responder is available, -1 only when avahi itself cannot be
  * started.
  *
- * NOTE: kill_matching_publishers() is intentionally NOT called for the link
- * name.  When two interfaces share the same FQDN (e.g. both publish
- * "breezy.local"), a FQDN-wide kill would tear down the other interface's
- * publisher.  Per-interface pid-files (link_pidfile / wlan_pidfile) are
- * sufficient to clean up stale publishers from previous runs.
+ * NOTE: stale publishers are cleaned up only via the per-interface link_pidfile,
+ * never by a FQDN-wide kill.  When two interfaces share the same FQDN (e.g. the
+ * OTG and direct-Ethernet paths both publish "breezy.local"), a FQDN-wide kill
+ * would tear down the other interface's publisher.
  */
 static int start_mdns(const struct link_services_config *cfg,
-                      const char *link_pidfile, const char *wlan_pidfile,
+                      const char *link_pidfile,
                       struct link_services_state *state)
 {
     /* Best-effort: start the system avahi-daemon if it isn't running.
@@ -353,30 +219,6 @@ static int start_mdns(const struct link_services_config *cfg,
      * (which setup_system.sh ensures via "systemctl enable avahi-daemon"). */
     { const char *const a[] = {"systemctl", "start", "avahi-daemon", NULL};
       run_cmd(a); }
-
-    if (cfg->wlan_name[0] != '\0') {
-        char fqdn[LS_NAME_MAX + 8];
-        char wlan_ip[LS_IP_MAX];
-
-        snprintf(fqdn, sizeof(fqdn), "%s.local", cfg->wlan_name);
-        kill_pidfile(wlan_pidfile);
-        kill_matching_publishers(fqdn);
-
-        if (detect_non_link_ipv4(cfg->iface, wlan_ip, sizeof(wlan_ip)) == 0) {
-            if (spawn_publish_address(wlan_pidfile, fqdn, wlan_ip) == 0) {
-                if (state)
-                    state->wlan_name_set = true;
-            } else {
-                fprintf(stderr,
-                    "link_services: could not pin %s to %s via avahi\n",
-                    fqdn, wlan_ip);
-            }
-        } else {
-            fprintf(stderr,
-                "link_services: could not find a non-link IPv4 address for %s.local\n",
-                cfg->wlan_name);
-        }
-    }
 
     /* Re-pin the link name, clearing only THIS interface's previous publisher. */
     if (cfg->link_name[0] != '\0' && cfg->link_ip[0] != '\0') {
@@ -403,7 +245,6 @@ int link_services_start(const struct link_services_config *cfg,
     char dnsmasq_pid[LS_PIDFILE_MAX];
     char dnsmasq_leases[LS_PIDFILE_MAX];
     char mdns_link_pid[LS_PIDFILE_MAX];
-    char mdns_wlan_pid[LS_PIDFILE_MAX];
 
     if (state)
         memset(state, 0, sizeof(*state));
@@ -414,12 +255,10 @@ int link_services_start(const struct link_services_config *cfg,
     snprintf(dnsmasq_pid,    sizeof(dnsmasq_pid),    "/run/breezy-dnsmasq-%s.pid",    cfg->iface);
     snprintf(dnsmasq_leases, sizeof(dnsmasq_leases), "/run/breezy-dnsmasq-%s.leases", cfg->iface);
     snprintf(mdns_link_pid,  sizeof(mdns_link_pid),  "/run/breezy-avahi-link-%s.pid", cfg->iface);
-    snprintf(mdns_wlan_pid,  sizeof(mdns_wlan_pid),  "/run/breezy-avahi-wlan-%s.pid", cfg->iface);
 
     if (state) {
         snprintf(state->dnsmasq_pidfile,  sizeof(state->dnsmasq_pidfile),  "%s", dnsmasq_pid);
         snprintf(state->mdns_link_pidfile, sizeof(state->mdns_link_pidfile), "%s", mdns_link_pid);
-        snprintf(state->mdns_wlan_pidfile, sizeof(state->mdns_wlan_pidfile), "%s", mdns_wlan_pid);
     }
 
     if (cfg->host_ip[0] != '\0') {
@@ -435,16 +274,11 @@ int link_services_start(const struct link_services_config *cfg,
         }
     }
 
-    bool want_mdns = cfg->link_name[0] != '\0' || cfg->wlan_name[0] != '\0';
-    if (want_mdns) {
-        if (start_mdns(cfg, mdns_link_pid, mdns_wlan_pid, state) == 0) {
+    if (cfg->link_name[0] != '\0') {
+        if (start_mdns(cfg, mdns_link_pid, state) == 0) {
             if (state && state->link_name_pinned) {
                 printf("link_services: publishing %s.local for the link address %s via mDNS\n",
                        cfg->link_name, cfg->link_ip);
-            }
-            if (state && state->wlan_name_set) {
-                printf("link_services: publishing %s.local for the non-link address via mDNS\n",
-                       cfg->wlan_name);
             }
         } else {
             fprintf(stderr,
@@ -464,7 +298,5 @@ void link_services_stop(struct link_services_state *state)
         kill_pidfile(state->dnsmasq_pidfile);
     if (state->mdns_link_pidfile[0])
         kill_pidfile(state->mdns_link_pidfile);
-    if (state->mdns_wlan_pidfile[0])
-        kill_pidfile(state->mdns_wlan_pidfile);
     memset(state, 0, sizeof(*state));
 }

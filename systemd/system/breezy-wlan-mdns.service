@@ -1,0 +1,21 @@
+# Keeps breezywlan.local pinned to the box's current Wi-Fi/LAN address.
+#
+# The renderer publishes breezywlan.local only once at startup, before wlan0
+# has a DHCP lease, so it never actually comes up (and never re-pins on a lease
+# change).  This long-running helper fixes that independently of the renderer,
+# so the name is a reliable SSH target regardless of which DHCP address the box
+# currently holds.  See publish_wlan_mdns.sh for the full rationale.
+[Unit]
+Description=Breezy Box wlan mDNS name keeper (breezywlan.local)
+After=network.target avahi-daemon.service
+Wants=avahi-daemon.service
+
+[Service]
+Type=simple
+# Installed by setup_system.sh to /usr/local/lib/breezy-box/.
+ExecStart=/usr/local/lib/breezy-box/publish_wlan_mdns.sh
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,13 @@
+# Prevent USB host bus autosuspend on the Cubie A7S.
+#
+# The xhci USB host bus (usb1) carries the XR glasses and has autosuspend
+# enabled with a 0ms delay.  Logind holds it awake via seat0 only while an
+# active seat session exists (i.e. while breezy-renderer.service is running).
+# When the renderer is stopped, logind releases the seat, the bus immediately
+# autosuspends, and the glasses hub gets EPROTO errors / disconnect loops.
+#
+# Setting control=on disables autosuspend permanently so the glasses remain
+# stable regardless of whether the renderer is running.
+SUBSYSTEM=="usb", KERNEL=="usb1", ATTR{power/control}="on"
+SUBSYSTEM=="usb", KERNEL=="usb2", ATTR{power/control}="on"
+SUBSYSTEM=="usb", KERNEL=="usb3", ATTR{power/control}="on"

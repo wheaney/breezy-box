@@ -30,7 +30,9 @@
 
 #define DEFAULT_BULK_OUT_ADDRESS        UDL_PRIMARY_BULK_OUT_EP
 #define EP0_IO_BUFFER_SIZE              512u
-#define BULK_OUT_IO_BUFFER_SIZE         (16u * 1024u)
+/* raw_gadget's USB_RAW_IOCTL_EP_READ rejects io->length > PAGE_SIZE (4096).
+ * Large DL bulk transfers are simply split across multiple reads. */
+#define BULK_OUT_IO_BUFFER_SIZE         4096u
 #define UDC_SOFT_RECONNECT_SETTLE_USEC  250000u
 
 /*
@@ -370,8 +372,18 @@ static int enable_bulk_out_endpoint(struct raw_gadget *gadget)
 		atomic_load_explicit(&gadget->device, memory_order_acquire);
 	int handle;
 
-	if (gadget->bulk_out_handle >= 0)
-		return 0;
+	/* Always disable first if we think it's enabled: a USB bus reset
+	 * (e.g. Windows re-enumerating mid-handshake) invalidates the kernel-
+	 * side endpoint state without surfacing a USB_RAW_EVENT_RESET to us,
+	 * leaving a stale handle that causes EINVAL on the first EP_READ.
+	 * Disabling before re-enabling is idempotent on a fresh session and
+	 * restores a clean state after a silent bus reset. */
+	if (gadget->bulk_out_handle >= 0) {
+		int stale = gadget->bulk_out_handle;
+		gadget->bulk_out_handle = -1;
+		/* Ignore error — endpoint may already be disabled by a bus reset */
+		(void)raw_ep_disable(gadget->fd, stale);
+	}
 	if (!gadget->bulk_out_address_valid && choose_bulk_out_address(gadget) != 0)
 		return -1;
 
@@ -608,7 +620,7 @@ static int handle_control_event(struct raw_gadget *gadget,
 		if (gadget->current_configuration != 0u) {
 			if (enable_bulk_out_endpoint(gadget) != 0)
 				return -1;
-			if (raw_vbus_draw(gadget->fd, 125u) < 0) {
+			if (raw_vbus_draw(gadget->fd, 250u) < 0) {
 				perror("ioctl USB_RAW_IOCTL_VBUS_DRAW");
 				return -1;
 			}
@@ -623,15 +635,39 @@ static int handle_control_event(struct raw_gadget *gadget,
 		}
 		struct usb_raw_control_io ack = { .inner = { .ep = 0u, .length = 0u } };
 		if (raw_ep0_read(gadget->fd, &ack) < 0) {
-			perror("ioctl USB_RAW_IOCTL_EP0_READ (set-config ack)");
-			return -1;
+			/*
+			 * A failed status-stage read here (commonly -EPROTO) means the
+			 * host already moved past this transfer's status phase before
+			 * we got to it -- e.g. Windows issuing a fast SET_CONFIGURATION
+			 * immediately followed by more SETUPs.  This is a race on the
+			 * wire, not a fatal gadget error: killing the whole event loop
+			 * over it tears down enumeration entirely (Windows then shows
+			 * "This device cannot start (Code 10)").  Log and continue; the
+			 * next SETUP will be fetched normally on the next loop iteration.
+			 */
+			if (gadget->verbose)
+				perror("ioctl USB_RAW_IOCTL_EP0_READ (set-config ack)");
 		}
 		return 0;
 	}
 
 	if (udl_device_handle_control(dev, setup,
-				      payload, payload_length, &result) != 0)
-		return -1;
+				      payload, payload_length, &result) != 0) {
+		/*
+		 * The device handler couldn't service this request (unknown or
+		 * malformed vendor request).  STALL the control transfer rather
+		 * than returning fatally: a STALL cleanly terminates the EP0
+		 * transfer and clears the UDC/raw_gadget pending state, so the
+		 * NEXT request is serviced normally.  Returning -1 here instead
+		 * tears down the whole event loop AND leaves ep0_{in,out}_pending
+		 * latched in raw_gadget, after which every subsequent SETUP is
+		 * rejected with -EBUSY and enumeration wedges permanently (this
+		 * is the cascade that followed Windows' multi-byte RAM poke).
+		 */
+		if (raw_ep0_stall(gadget->fd) < 0 && gadget->verbose)
+			perror("ioctl USB_RAW_IOCTL_EP0_STALL (unhandled request)");
+		return 0;
+	}
 
 	switch (result.action) {
 	case CONTROL_ACTION_STALL:
@@ -675,8 +711,10 @@ static int handle_control_event(struct raw_gadget *gadget,
 		if (!host_to_device || wLength == 0u) {
 			struct usb_raw_control_io ack = { .inner = { .ep = 0u, .length = 0u } };
 			if (raw_ep0_read(gadget->fd, &ack) < 0) {
-				perror("ioctl USB_RAW_IOCTL_EP0_READ (ack)");
-				return -1;
+				/* See the matching comment on the SET_CONFIGURATION ack
+				 * above: a raced status-stage read is not fatal. */
+				if (gadget->verbose)
+					perror("ioctl USB_RAW_IOCTL_EP0_READ (ack)");
 			}
 		}
 		return 0;
@@ -689,7 +727,19 @@ static int run_event_loop(struct raw_gadget *gadget)
 {
 	while (!raw_gadget_stop_requested(gadget)) {
 		struct usb_raw_control_event event;
-		int rc = raw_event_fetch(gadget->fd, &event);
+		struct timespec _t0, _t1;
+		int rc;
+
+		clock_gettime(CLOCK_MONOTONIC, &_t0);
+		rc = raw_event_fetch(gadget->fd, &event);
+		clock_gettime(CLOCK_MONOTONIC, &_t1);
+		{
+			long _ms = (_t1.tv_sec - _t0.tv_sec) * 1000L +
+				(_t1.tv_nsec - _t0.tv_nsec) / 1000000L;
+			fprintf(stderr,
+				"raw-gadget: EVENT_FETCH returned rc=%d type=%d after %ldms wait\n",
+				rc, rc >= 0 ? (int)event.inner.type : -1, _ms);
+		}
 
 		if (rc < 0) {
 			if (errno == EINTR)
@@ -859,24 +909,34 @@ void raw_gadget_stop(struct raw_gadget *gadget)
 
 	atomic_store(&gadget->stop_requested, true);
 
-	/* Unblock the event loop's EVENT_FETCH and the drain thread's EP_READ by
-	 * cancelling; both check stop_requested on wake. */
+	if (gadget->fd >= 0) {
+		/*
+		 * Close the fd FIRST so any blocking ioctl in the event thread
+		 * (EVENT_FETCH, EP0_WRITE, EP_READ) returns immediately with an
+		 * error.  This lets the threads exit through their normal error
+		 * path rather than being cancelled mid-syscall — cancelling
+		 * mid-ioctl leaves the UDC EP0 state machine wedged, causing
+		 * ECONNRESET on the next session.
+		 *
+		 * Soft-disconnect is done AFTER the join so the host sees a
+		 * clean detach even though the fd is already gone; it writes to
+		 * sysfs (not the gadget fd) so it still works.
+		 */
+		close(gadget->fd);
+		gadget->fd = -1;
+	}
+
+	/* Threads unblock on fd close; join without cancel. */
 	if (gadget->event_thread_created) {
-		(void)pthread_cancel(gadget->event_thread);
 		(void)pthread_join(gadget->event_thread, NULL);
 		gadget->event_thread_created = false;
 	}
 	stop_bulk_out_drain_thread(gadget);
-	/* Threads are stopped; if a host was still connected, hand the slot back
-	 * to the USB/IP pool. */
 	raw_gadget_release_slot(gadget);
 
-	if (gadget->fd >= 0) {
-		reset_configuration_state(gadget);
-		(void)set_udc_soft_connect(gadget->udc_device, "disconnect",
-					   gadget->verbose, true);
-		sleep_microseconds(UDC_SOFT_RECONNECT_SETTLE_USEC);
-		close(gadget->fd);
-		gadget->fd = -1;
-	}
+	/* Soft-disconnect after threads have exited so the host sees a clean
+	 * detach.  Best-effort — requires root for sysfs write, fails silently
+	 * otherwise, but the fd close above already ended the gadget session. */
+	(void)set_udc_soft_connect(gadget->udc_device, "disconnect",
+				   gadget->verbose, true);
 }

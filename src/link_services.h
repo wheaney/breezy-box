@@ -8,22 +8,19 @@
  *
  *   - DHCP  (dnsmasq): hands the host an IPv4 address on the link so it can
  *     reach the gadget without the user configuring an IP by hand.
- *   - mDNS  (avahi):   advertises friendly .local names so the host can connect
- *     by name instead of an IP.  Two distinct names are published so the direct
- *     link and any other interface (e.g. Wi-Fi) can be told apart:
+ *   - mDNS  (avahi):   advertises a friendly .local name so the host can connect
+ *     by name instead of an IP:
  *
  *       link_name (e.g. "breezy")     -> breezy.local, a static record PINNED to
  *                                        the gadget's own link address, so it
- *                                        ALWAYS resolves to the USB link and
- *                                        never to the Wi-Fi address.
- *       wlan_name (e.g. "breezywlan") -> a second static record pinned to the
- *                                        first non-link IPv4 address (prefer a
- *                                        wireless interface when present), so
- *                                        the Wi-Fi/LAN path stays distinct
- *                                        from the direct USB link.
+ *                                        ALWAYS resolves to the USB/direct link
+ *                                        and never to the Wi-Fi address.
  *
- *     Both names are published as explicit address aliases so the USB-link and
- *     Wi-Fi/LAN paths stay distinguishable by name.
+ *     The Wi-Fi/LAN name (breezywlan.local) is published separately by the
+ *     breezy-wlan-mdns systemd service (publish_wlan_mdns.sh), not here: it must
+ *     poll for the wlan address and re-pin on DHCP lease changes, which this
+ *     one-shot orchestration cannot do.  Wi-Fi is also optional (setup_system
+ *     --no-wlan), so it does not belong on the per-link path the gadget brings up.
  *
  * Both are the standard system daemons; this module only orchestrates them, so
  * it has no KMS/rendering dependencies and can be reused by any app that brings
@@ -47,9 +44,6 @@ struct link_services_config {
     char link_name[LS_NAME_MAX];   /* name pinned to link_ip; "breezy" -> breezy.local
                                       always resolves to the USB link.  Requires link_ip;
                                       empty = skip the pinned link name */
-    char wlan_name[LS_NAME_MAX];   /* name pinned to the first non-link IPv4 address
-                                      (prefer a wireless iface); "breezywlan" ->
-                                      breezywlan.local; empty = skip the non-link name */
     unsigned mtu;                  /* if non-zero, push this interface MTU to the host
                                       via DHCP option 26 so a jumbo link MTU takes
                                       effect on both ends without manual host setup */
@@ -57,16 +51,14 @@ struct link_services_config {
 
 struct link_services_state {
     bool dhcp_running;
-    bool wlan_name_set;
     bool link_name_pinned;
     /* pid-file paths derived from cfg->iface at start time; used by stop() */
     char dnsmasq_pidfile[LS_PIDFILE_MAX];
     char mdns_link_pidfile[LS_PIDFILE_MAX];
-    char mdns_wlan_pidfile[LS_PIDFILE_MAX];
 };
 
 /* iface=usb0, host_ip=192.168.7.1, lease=1h, link_ip=192.168.7.2,
- * link_name=breezy, wlan_name=breezywlan */
+ * link_name=breezy */
 void link_services_config_defaults(struct link_services_config *cfg);
 
 /*

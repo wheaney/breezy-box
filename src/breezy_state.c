@@ -203,16 +203,19 @@ void breezy_state_set_addresses(struct breezy_state *bs,
 		if (link_cfg->link_name[0])
 			snprintf(bs->link_mdns, sizeof(bs->link_mdns),
 				 "%s.local", link_cfg->link_name);
-
-		if (link_cfg->wlan_name[0])
-			snprintf(bs->wlan_mdns, sizeof(bs->wlan_mdns),
-				 "%s.local", link_cfg->wlan_name);
 	}
 
 	/* Attempt an initial wlan IP detection.
 	 * Failure is fine — we'll retry on each update call. */
 	detect_wlan_ip(bs->otg_iface[0] ? bs->otg_iface : NULL,
 		       bs->wlan_ip, sizeof(bs->wlan_ip));
+
+	/* breezywlan.local is published by the breezy-wlan-mdns service (not by
+	 * link_services), so its name is fixed.  Only advertise it in the overlay
+	 * when a Wi-Fi address actually exists — on a --no-wlan box there is no
+	 * wlan IP and the name resolves to nothing, so we leave wlan_mdns empty. */
+	if (bs->wlan_ip[0])
+		snprintf(bs->wlan_mdns, sizeof(bs->wlan_mdns), "breezywlan.local");
 }
 
 void breezy_state_set_eth_link(struct breezy_state *bs,
@@ -256,6 +259,14 @@ bool breezy_state_update(struct breezy_state *bs,
 	} else {
 		bs->wlan_ip[0] = '\0';
 	}
+
+	/* Keep the (fixed) breezywlan.local name in lockstep with whether a Wi-Fi
+	 * address exists, so the overlay only advertises it when it resolves.  The
+	 * record itself is owned by the breezy-wlan-mdns service. */
+	if (bs->wlan_ip[0] && !bs->wlan_mdns[0])
+		snprintf(bs->wlan_mdns, sizeof(bs->wlan_mdns), "breezywlan.local");
+	else if (!bs->wlan_ip[0])
+		bs->wlan_mdns[0] = '\0';
 
 	/*
 	 * Probe each direct-link path independently so the overlay can show the

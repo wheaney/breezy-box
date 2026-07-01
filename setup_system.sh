@@ -602,6 +602,26 @@ else
     echo "  warn: $RAW_GADGET_UDEV_RULE_SRC not found, skipping raw-gadget udev rule install"
 fi
 
+# Prevent USB host bus autosuspend.  Logind holds usb1 awake via seat0 only
+# while a seat session is active (breezy-renderer.service PAMName=login).
+# When the service stops, logind releases the seat and the bus immediately
+# autosuspends (autosuspend_delay_ms=0), causing XR glasses hub EPROTO errors.
+# Setting control=on disables autosuspend on all host buses permanently.
+USB_POWER_UDEV_RULE_SRC="$SCRIPT_DIR/udev/99-breezy-usb-power.rules"
+USB_POWER_UDEV_RULE_DST="/etc/udev/rules.d/99-breezy-usb-power.rules"
+if [[ -f "$USB_POWER_UDEV_RULE_SRC" ]]; then
+    if ! cmp -s "$USB_POWER_UDEV_RULE_SRC" "$USB_POWER_UDEV_RULE_DST" 2>/dev/null; then
+        install -m 0644 "$USB_POWER_UDEV_RULE_SRC" "$USB_POWER_UDEV_RULE_DST"
+        udevadm control --reload-rules
+        udevadm trigger --subsystem-match=usb --attr-match=power/control=auto 2>/dev/null || true
+        done_msg "installed $USB_POWER_UDEV_RULE_DST"
+    else
+        skip_msg "$USB_POWER_UDEV_RULE_DST already up to date"
+    fi
+else
+    echo "  warn: $USB_POWER_UDEV_RULE_SRC not found, skipping USB power udev rule install"
+fi
+
 # ---------------------------------------------------------------------------
 section "breezy-gadget-reset system service (OTG PHY reset, transport-agnostic)"
 
@@ -645,6 +665,53 @@ if [[ -f "$RESET_SCRIPT_SRC" ]]; then
     systemctl daemon-reload
 else
     echo "  warn: $RESET_SCRIPT_SRC not found, skipping OTG reset service install"
+fi
+
+# ---------------------------------------------------------------------------
+section "breezy-wlan-mdns system service (breezywlan.local name keeper)"
+
+# publish_wlan_mdns.sh keeps breezywlan.local pinned to the box's current Wi-Fi
+# address, re-pinning on DHCP changes — so SSH-by-name works regardless of which
+# lease the box holds.  The renderer's link_services only publishes the direct
+# link name (breezy.local); it can't do the wlan name (at boot wlan0 has no
+# lease yet, and it never re-pins).  See publish_wlan_mdns.sh for the rationale.
+#
+# Wi-Fi is optional (--no-wlan): we still INSTALL the files unconditionally (so
+# the keeper is ready if Wi-Fi is added later), but only ENABLE the service when
+# Wi-Fi setup wasn't skipped.  Even if enabled on a box that never gets Wi-Fi
+# the keeper just idles (it polls, finds no wlan address, publishes nothing).
+WLAN_MDNS_SCRIPT_SRC="$SCRIPT_DIR/publish_wlan_mdns.sh"
+WLAN_MDNS_SCRIPT_DST="/usr/local/lib/breezy-box/publish_wlan_mdns.sh"
+WLAN_MDNS_SERVICE_SRC="$SCRIPT_DIR/systemd/system/breezy-wlan-mdns.service"
+WLAN_MDNS_SERVICE_DST="/etc/systemd/system/breezy-wlan-mdns.service"
+
+if [[ -f "$WLAN_MDNS_SCRIPT_SRC" ]]; then
+    mkdir -p "$(dirname "$WLAN_MDNS_SCRIPT_DST")"
+    if ! cmp -s "$WLAN_MDNS_SCRIPT_SRC" "$WLAN_MDNS_SCRIPT_DST" 2>/dev/null; then
+        install -m 0755 "$WLAN_MDNS_SCRIPT_SRC" "$WLAN_MDNS_SCRIPT_DST"
+        done_msg "installed $WLAN_MDNS_SCRIPT_DST"
+    else
+        skip_msg "$WLAN_MDNS_SCRIPT_DST already up to date"
+    fi
+
+    if ! cmp -s "$WLAN_MDNS_SERVICE_SRC" "$WLAN_MDNS_SERVICE_DST" 2>/dev/null; then
+        install -m 0644 "$WLAN_MDNS_SERVICE_SRC" "$WLAN_MDNS_SERVICE_DST"
+        done_msg "installed $WLAN_MDNS_SERVICE_DST"
+    else
+        skip_msg "$WLAN_MDNS_SERVICE_DST already up to date"
+    fi
+
+    systemctl daemon-reload
+
+    if [[ "$NO_WLAN" -eq 1 ]]; then
+        skip_msg "breezy-wlan-mdns not enabled (--no-wlan); files installed for later use"
+    else
+        systemctl enable --now breezy-wlan-mdns.service 2>/dev/null \
+            && done_msg "enabled and started breezy-wlan-mdns.service (breezywlan.local)" \
+            || echo "  warn: failed to enable breezy-wlan-mdns.service"
+    fi
+else
+    echo "  warn: $WLAN_MDNS_SCRIPT_SRC not found, skipping breezy-wlan-mdns service install"
 fi
 
 # ---------------------------------------------------------------------------
