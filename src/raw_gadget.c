@@ -572,14 +572,15 @@ static int handle_control_event(struct raw_gadget *gadget,
 	memset(&io, 0, sizeof(io));
 	io.inner.ep = 0u;
 
-	fprintf(stderr,
-		"raw-gadget: SETUP rt=0x%02x req=0x%02x val=0x%04x idx=0x%04x len=%u dev=%s\n",
-		(unsigned int)setup->bRequestType,
-		(unsigned int)setup->bRequest,
-		(unsigned int)(uint16_t)setup->wValue,
-		(unsigned int)(uint16_t)setup->wIndex,
-		(unsigned int)wLength,
-		dev ? "yes" : "no");
+	if (gadget->verbose)
+		fprintf(stderr,
+			"raw-gadget: SETUP rt=0x%02x req=0x%02x val=0x%04x idx=0x%04x len=%u dev=%s\n",
+			(unsigned int)setup->bRequestType,
+			(unsigned int)setup->bRequest,
+			(unsigned int)(uint16_t)setup->wValue,
+			(unsigned int)(uint16_t)setup->wIndex,
+			(unsigned int)wLength,
+			dev ? "yes" : "no");
 
 	/* Collect an OUT data stage up front so vendor handlers (e.g. SET_KEY)
 	 * see the payload, mirroring the USB/IP submit which carries it inline. */
@@ -727,18 +728,20 @@ static int run_event_loop(struct raw_gadget *gadget)
 {
 	while (!raw_gadget_stop_requested(gadget)) {
 		struct usb_raw_control_event event;
-		struct timespec _t0, _t1;
 		int rc;
 
-		clock_gettime(CLOCK_MONOTONIC, &_t0);
-		rc = raw_event_fetch(gadget->fd, &event);
-		clock_gettime(CLOCK_MONOTONIC, &_t1);
-		{
+		if (gadget->verbose) {
+			struct timespec _t0, _t1;
+			clock_gettime(CLOCK_MONOTONIC, &_t0);
+			rc = raw_event_fetch(gadget->fd, &event);
+			clock_gettime(CLOCK_MONOTONIC, &_t1);
 			long _ms = (_t1.tv_sec - _t0.tv_sec) * 1000L +
 				(_t1.tv_nsec - _t0.tv_nsec) / 1000000L;
 			fprintf(stderr,
 				"raw-gadget: EVENT_FETCH returned rc=%d type=%d after %ldms wait\n",
 				rc, rc >= 0 ? (int)event.inner.type : -1, _ms);
+		} else {
+			rc = raw_event_fetch(gadget->fd, &event);
 		}
 
 		if (rc < 0) {
