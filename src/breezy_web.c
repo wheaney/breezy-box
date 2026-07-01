@@ -886,6 +886,8 @@ int main(int argc, char *argv[])
 	signal(SIGINT,  on_signal);
 	signal(SIGTERM, on_signal);
 
+	mg_log_set(MG_LL_ERROR);
+
 	struct mg_mgr mgr;
 	mg_mgr_init(&mgr);
 

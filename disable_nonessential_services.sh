@@ -152,10 +152,12 @@ KNOWN_IGNORE=(
     logrotate.service
     man-db.service
     modprobe@.service
+    netplan-ovs-cleanup.service
     nm-priv-helper.service
     pam_namespace.service
     quotaon-root.service
     quotaon@.service
+    rc-local.service
     rescue.service
     serial-getty@.service
     system-update-cleanup.service
@@ -200,6 +202,7 @@ KNOWN_IGNORE=(
     systemd-quotacheck@.service
     systemd-random-seed.service
     systemd-reboot.service
+    systemd-remount-fs.service
     systemd-rfkill.service
     systemd-soft-reboot.service
     systemd-storagetm.service
