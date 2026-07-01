@@ -20,4 +20,4 @@ install -m 755 breezy_web "$BIN_DIR/"
 install -m 755 modules/ZeroKVM/src/ZeroKvm.NativeBridge/bin/Release/net10.0/linux-arm64/publish/ZeroKvm.NativeBridge.so "$BIN_DIR/"
 
 echo "=== Running setup ==="
-sudo ./setup_system.sh
+sudo ALLOW_WIRED_RECONIG="$ALLOW_WIRED_RECONIG" ./setup_system.sh

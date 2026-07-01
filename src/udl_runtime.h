@@ -45,6 +45,7 @@ struct udl_runtime {
 	bool show_window;
 	bool verbose;
 	bool have_decoder_snapshot;
+	bool have_pixel_damage;
 	bool viewer_thread_created;
 	bool decode_thread_created;
 	bool gadget_thread_created;

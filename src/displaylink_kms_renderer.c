@@ -1412,7 +1412,7 @@ static void kms_update_display_textures(struct kms_state *kms,
 			continue;
 
 		if (!disp->has_first_frame) {
-			if (!udl->have_decoder_snapshot)
+			if (!udl->have_pixel_damage)
 				continue;
 			disp->has_first_frame = true;
 		}

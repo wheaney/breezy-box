@@ -721,6 +721,8 @@ int udl_runtime_feed(struct udl_runtime *runtime, const uint8_t *data, size_t le
 	 * before the pixels have landed. */
 	udl_runtime_blit_scanout(runtime, &visible_damage);
 	udl_runtime_record_damage(runtime, &visible_damage);
+	if (visible_damage.touched)
+		runtime->have_pixel_damage = true;
 
 	if (runtime->decode_stats_enabled) {
 		uint64_t now = udl_now_ns();
