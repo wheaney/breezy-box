@@ -19,7 +19,7 @@
  *   breezy_state_set_addresses(&bs, &link_cfg, gadget_netdev);
  *
  *   // each poll cycle (no GL context required):
- *   bool changed = breezy_state_update(&bs, xr_driver_up, glasses_active,
+ *   bool changed = breezy_state_update(&bs, glasses_active,
  *                                       imported_count, device_count, verbose);
  *
  *   // renderer uploads the texture when changed or after reconnect:
@@ -62,6 +62,8 @@ struct breezy_state {
 	bool host_connected;    /* host present on any path            */
 	bool otg_connected;     /* host confirmed on OTG via arping    */
 	bool eth_connected;     /* host confirmed on wired Ethernet via carrier */
+	bool xr_driver_up;          /* XR driver heartbeat fresh */
+	bool xr_driver_calibrating; /* calibration_state=CALIBRATING in driver state */
 
 	bool arping_result;     /* last OTG arping result, persists across calls */
 };
@@ -90,13 +92,15 @@ void breezy_state_set_eth_link(struct breezy_state *bs,
  * Re-evaluate state and return true if mode or connectivity changed.
  * No GL context needed — pure CPU work (network probing, sysfs reads).
  *
- *   xr_driver_up    — true when the XR driver is producing fresh IMU data
  *   glasses_active  — true when IMU config is valid and glasses are connected
  *   imported_count  — number of device slots with an active USB/IP import
  *   device_count    — total number of configured device slots
+ *
+ * XR driver liveness is polled internally every 15 s from
+ * /dev/shm/xr_driver_state (heartbeat field); the caller does not need to
+ * supply it.
  */
 bool breezy_state_update(struct breezy_state *bs,
-			  bool xr_driver_up,
 			  bool glasses_active,
 			  size_t imported_count,
 			  size_t device_count,

@@ -370,7 +370,6 @@ static void kms_poll_device_config(struct kms_state *kms,
 	bool have_config = breezy_imu_get_config(&cfg);
 	bool have_pose   = breezy_imu_try_get_pose(&pose);
 
-	bool xr_driver_up = have_config || have_pose;
 	bool active = have_config && have_pose
 	              && cfg.enabled
 	              && cfg.version == BREEZY_IMU_EXPECTED_VERSION
@@ -399,7 +398,7 @@ static void kms_poll_device_config(struct kms_state *kms,
 			if (slot_active)
 				active_slots++;
 		}
-		bool changed = breezy_state_update(kms->state, xr_driver_up, active,
+		bool changed = breezy_state_update(kms->state, active,
 						   active_slots, server->opts.device_count,
 						   server->opts.verbose);
 		if (changed || !kms->overlay_tex.initialized) {

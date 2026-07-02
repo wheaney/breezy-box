@@ -604,9 +604,23 @@ static int handle_control_event(struct raw_gadget *gadget,
 	 * only starts once a slot is claimed.
 	 */
 	if (!dev) {
-		if (!host_to_device || wLength == 0u) {
-			struct usb_raw_control_io ack = { .inner = { .ep = 0u, .length = 0u } };
+		struct usb_raw_control_io ack = { .inner = { .ep = 0u, .length = 0u } };
 
+		/*
+		 * The transfer's pending flag was latched by direction in the
+		 * kernel's gadget_setup(): an IN request with a data stage sets
+		 * ep0_in_pending (cleared by EP0_WRITE); everything else sets
+		 * ep0_out_pending (cleared by EP0_READ).  Acknowledge with a
+		 * zero-length transfer in the MATCHING direction — using the
+		 * wrong one fails the kernel's direction check with -EBUSY (the
+		 * "pre-claim ack: Device or resource busy" we used to see).  An
+		 * OUT request carrying a payload was already drained above, so
+		 * only its zero-length status remains (an IN status = EP0_WRITE).
+		 */
+		if (!host_to_device && wLength > 0u) {
+			if (raw_ep0_write(gadget->fd, &ack) < 0 && gadget->verbose)
+				perror("ioctl USB_RAW_IOCTL_EP0_WRITE (pre-claim ack)");
+		} else {
 			if (raw_ep0_read(gadget->fd, &ack) < 0 && gadget->verbose)
 				perror("ioctl USB_RAW_IOCTL_EP0_READ (pre-claim ack)");
 		}
@@ -760,11 +774,23 @@ static int run_event_loop(struct raw_gadget *gadget)
 			fprintf(stderr, "raw-gadget: connect (UDC bound, awaiting enumeration)\n");
 			break;
 		case USB_RAW_EVENT_RESET:
+			/*
+			 * A bus reset is part of normal enumeration: the host
+			 * resets the bus and then continues probing on the SAME
+			 * connection (macOS resets several times before/around
+			 * SET_ADDRESS).  Tear down only the configuration/endpoint
+			 * state (drain thread, config number) — do NOT release the
+			 * slot, or every following SETUP arrives with no device
+			 * claimed (dev=no) and enumeration can never complete.
+			 * The slot is released on DISCONNECT (cable/host gone).
+			 */
+			if (gadget->verbose)
+				fprintf(stderr, "raw-gadget: reset\n");
+			reset_configuration_state(gadget);
+			break;
 		case USB_RAW_EVENT_DISCONNECT:
 			if (gadget->verbose)
-				fprintf(stderr, "raw-gadget: %s\n",
-					event.inner.type == USB_RAW_EVENT_RESET
-						? "reset" : "disconnect");
+				fprintf(stderr, "raw-gadget: disconnect\n");
 			reset_configuration_state(gadget);
 			raw_gadget_release_slot(gadget);
 			break;

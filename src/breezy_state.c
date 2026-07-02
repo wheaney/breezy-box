@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 /* ----------------------------------------------------------------
@@ -20,25 +21,39 @@
  * ---------------------------------------------------------------- */
 
 /*
- * Returns true when the XR driver is actively calibrating the glasses IMU.
- * Reads /dev/shm/xr_driver_state and looks for calibration_state=CALIBRATING.
+ * Parse /dev/shm/xr_driver_state once and return the fields we care about.
+ * The driver's manage_state_thread_func rewrites the file every ~1 s.
  */
-static bool xr_driver_is_calibrating(void)
+static void xr_driver_read_state(long *out_heartbeat, bool *out_calibrating)
 {
+	*out_heartbeat  = 0;
+	*out_calibrating = false;
+
 	FILE *f = fopen("/dev/shm/xr_driver_state", "r");
 	if (!f)
-		return false;
+		return;
 
 	char line[256];
-	bool calibrating = false;
 	while (fgets(line, sizeof(line), f)) {
-		if (strncmp(line, "calibration_state=", 18) == 0) {
-			calibrating = strncmp(line + 18, "CALIBRATING", 11) == 0;
-			break;
+		if (strncmp(line, "heartbeat=", 10) == 0) {
+			*out_heartbeat = strtol(line + 10, NULL, 10);
+		} else if (strncmp(line, "calibration_state=", 18) == 0) {
+			*out_calibrating = strncmp(line + 18, "CALIBRATING", 11) == 0;
 		}
 	}
 	fclose(f);
-	return calibrating;
+}
+
+static void poll_xr_driver_state(struct breezy_state *bs)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_REALTIME, &ts);
+
+	long heartbeat;
+	bool calibrating;
+	xr_driver_read_state(&heartbeat, &calibrating);
+	bs->xr_driver_up      = (heartbeat != 0) && (ts.tv_sec - heartbeat) <= 3;
+	bs->xr_driver_calibrating = calibrating;
 }
 
 /* ----------------------------------------------------------------
@@ -239,7 +254,6 @@ void breezy_state_set_eth_link(struct breezy_state *bs,
 }
 
 bool breezy_state_update(struct breezy_state *bs,
-			  bool xr_driver_up,
 			  bool glasses_active,
 			  size_t imported_count,
 			  size_t device_count,
@@ -249,6 +263,8 @@ bool breezy_state_update(struct breezy_state *bs,
 
 	if (!bs)
 		return false;
+
+	poll_xr_driver_state(bs);
 
 	/* Re-poll wlan IP in case it changed (Wi-Fi assigned after startup). */
 	char new_wlan_ip[BS_ADDR_MAX];
@@ -290,12 +306,12 @@ bool breezy_state_update(struct breezy_state *bs,
 		       "eth_iface=%s eth=%d xr_driver=%d glasses=%d imported=%zu mode=%d\n",
 		       bs->otg_iface, bs->host_ip, (int)otg_connected,
 		       bs->eth_iface, (int)eth_connected,
-		       (int)xr_driver_up, (int)glasses_active, imported_count, (int)bs->mode);
+		       (int)bs->xr_driver_up, (int)glasses_active, imported_count, (int)bs->mode);
 
-	bool is_calibrating = glasses_active && xr_driver_is_calibrating();
+	bool is_calibrating = glasses_active && bs->xr_driver_calibrating;
 
 	enum breezy_state_mode next;
-	if (!xr_driver_up)
+	if (!bs->xr_driver_up)
 		next = BREEZY_STATE_XR_DRIVER_DOWN;
 	else if (!glasses_active)
 		next = BREEZY_STATE_NO_GLASSES;
